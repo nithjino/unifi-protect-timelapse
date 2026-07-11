@@ -5,15 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "timelapse"
 version = "0.1.0"
-description = "Command-line UniFi Protect timelapse exporter"
+description = "CLI and desktop UniFi Protect timelapse exporter"
 requires-python = ">=3.11"
 dependencies = [
+    "PySide6-Essentials>=6.10.1",
     "python-dotenv>=1.1.0",
     "uiprotect>=15.4.3",
 ]
 
 [project.scripts]
 timelapse = "timelapse.cli:main"
+timelapse-gui = "timelapse.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["timelapse*"]
@@ -22,6 +24,7 @@ include = ["timelapse*"]
 dev = [
     "pyright>=1.1.410",
     "pytest>=9.0.3",
+    "pytest-qt>=4.5.0",
     "ruff",
 ]
 
@@ -75,6 +78,8 @@ venvPath = "."
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+qt_api = "pyside6"
+qt_log_level_fail = "CRITICAL"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["ANN201", "D", "PLR2004", "S101", "SLF001"]

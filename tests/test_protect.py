@@ -1,12 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from timelapse import TimelapseError
 from timelapse.config import Config
-from timelapse.protect import create_client, parse_connection
+from timelapse.protect import CameraInfo, create_client, load_cameras, parse_connection
+
+if TYPE_CHECKING:
+    from uiprotect import ProtectApiClient
+
+
+class _CameraClient:
+    def __init__(self, cameras: list[object]) -> None:
+        self.cameras = cameras
+
+    async def get_cameras_public(self) -> list[object]:
+        return self.cameras
 
 
 @pytest.mark.parametrize(
@@ -50,3 +64,22 @@ def test_create_client_supports_public_and_private_authentication() -> None:
     client = create_client(config, parse_connection(config.instance_url))
 
     assert client.is_public_only is False
+
+
+def test_load_cameras_returns_sorted_detached_camera_info() -> None:
+    client = cast(
+        "ProtectApiClient",
+        _CameraClient(
+            [
+                SimpleNamespace(id="camera-2", name="Zebra", state="CONNECTED", model="G5"),
+                SimpleNamespace(id="camera-1", name="alpha", state=None, model="G4"),
+            ]
+        ),
+    )
+
+    cameras = asyncio.run(load_cameras(client))
+
+    assert cameras == [
+        CameraInfo(id="camera-1", name="alpha", state=None, model="G4"),
+        CameraInfo(id="camera-2", name="Zebra", state="CONNECTED", model="G5"),
+    ]

@@ -25,6 +25,16 @@ class ProtectConnection:
     export_path: str
 
 
+@dataclass(frozen=True)
+class CameraInfo:
+    """Camera data detached from the client that loaded it."""
+
+    id: str
+    name: str
+    state: str | None
+    model: str | None
+
+
 def parse_connection(instance_url: str) -> ProtectConnection:
     """Validate a Protect URL and derive its export endpoint."""
     parsed = urlparse(instance_url)
@@ -71,10 +81,18 @@ def create_client(config: Config, connection: ProtectConnection) -> ProtectApiCl
     )
 
 
-async def load_cameras(client: ProtectApiClient) -> list[PublicCamera]:
-    """Load cameras in display-name order."""
-    cameras = await client.get_cameras_public()
-    return sorted(cameras, key=lambda camera: camera_name(camera).lower())
+async def load_cameras(client: ProtectApiClient) -> list[CameraInfo]:
+    """Load detached camera details in display-name order."""
+    cameras = [
+        CameraInfo(
+            id=camera_id(camera),
+            name=camera_name(camera),
+            state=string_attr(camera.state),
+            model=string_attr(camera.model),
+        )
+        for camera in await client.get_cameras_public()
+    ]
+    return sorted(cameras, key=lambda camera: (camera.name.casefold(), camera.id))
 
 
 def string_attr(value: object | None) -> str | None:
@@ -82,12 +100,12 @@ def string_attr(value: object | None) -> str | None:
     return None if value is None else str(value)
 
 
-def camera_name(camera: PublicCamera) -> str:
+def camera_name(camera: CameraInfo | PublicCamera) -> str:
     """Return a human-readable camera name."""
     return string_attr(camera.name) or string_attr(camera.id) or "camera"
 
 
-def camera_id(camera: PublicCamera) -> str:
+def camera_id(camera: CameraInfo | PublicCamera) -> str:
     """Return the required camera identifier."""
     value = string_attr(camera.id)
     if not value:

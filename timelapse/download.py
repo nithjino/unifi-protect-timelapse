@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import re
-import sys
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING
 
 from timelapse import TimelapseError
 from timelapse.config import SPEED_TO_FPS, Config
-from timelapse.protect import ProtectConnection, camera_id, camera_name
+from timelapse.protect import CameraInfo, ProtectConnection, camera_id, camera_name
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from aiohttp import ClientResponse
     from uiprotect import ProtectApiClient
-    from uiprotect.data import PublicCamera
 
 MEBIBYTE = 1024 * 1024
 CHUNK_SIZE = MEBIBYTE
@@ -26,13 +26,28 @@ MAX_ERROR_BODY_BYTES = 8 * 1024
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.1
 HTTP_OK = 200
 HTTP_MULTIPLE_CHOICES = 300
+MAX_CAMERA_FILENAME_CHARACTERS = 48
 
 
-def default_output_path(config: Config, camera: PublicCamera) -> Path:
+@dataclass(frozen=True)
+class DownloadProgress:
+    """A point-in-time snapshot of a streaming download."""
+
+    downloaded_bytes: int
+    total_bytes: int | None
+    bytes_per_second: float
+    elapsed_seconds: float
+
+
+ProgressCallback = Callable[[DownloadProgress], None]
+
+
+def default_output_path(config: Config, camera: CameraInfo) -> Path:
     """Build a safe, descriptive output filename."""
     start = config.start.strftime("%Y%m%d_%H%M%S")
     end = config.end.strftime("%Y%m%d_%H%M%S")
-    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", camera_name(camera)).strip("._-") or "camera"
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", camera_name(camera)).strip("._-") or "camera"
+    safe_name = safe_name[:MAX_CAMERA_FILENAME_CHARACTERS].rstrip("._-") or "camera"
     return Path(f"timelapse_{safe_name}_{start}_{end}_{config.speed}.mp4")
 
 
@@ -40,8 +55,9 @@ async def download_timelapse(
     config: Config,
     connection: ProtectConnection,
     client: ProtectApiClient,
-    camera: PublicCamera,
+    camera: CameraInfo,
     output: Path,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
     """Stream a Protect timelapse export to an atomic temporary file."""
     params = {
@@ -55,7 +71,6 @@ async def download_timelapse(
     client.set_header("Accept", "video/mp4,application/octet-stream,*/*")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    _write_stdout(f"Requesting {config.speed} timelapse export for {camera_name(camera)}...\n")
     response = await client.request(
         "get",
         connection.export_path,
@@ -83,6 +98,9 @@ async def download_timelapse(
             )
             raise TimelapseError(message)
 
+        download_started_at = monotonic()
+        _emit_progress(progress_callback, 0, total_bytes, download_started_at, download_started_at)
+
         with tempfile.NamedTemporaryFile(
             mode="wb",
             dir=output.parent,
@@ -92,7 +110,7 @@ async def download_timelapse(
         ) as file:
             temp_output = Path(file.name)
             downloaded = 0
-            last_progress_update = 0.0
+            last_progress_update = download_started_at
             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                 next_downloaded = downloaded + len(chunk)
                 if max_bytes and next_downloaded > max_bytes:
@@ -102,11 +120,14 @@ async def download_timelapse(
                 downloaded = next_downloaded
                 now = monotonic()
                 if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL_SECONDS:
-                    _print_progress(downloaded, total_bytes)
+                    _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, now)
                     last_progress_update = now
 
-        _print_progress(downloaded, total_bytes)
+        if output.exists():  # noqa: ASYNC240 - local metadata check immediately before the atomic replace
+            message = f"refusing to overwrite existing output file: {output}"
+            raise TimelapseError(message)
         temp_output.replace(output)
+        _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, monotonic())
     except OSError as exc:
         message = f"could not write {output}: {exc}"
         raise TimelapseError(message) from exc
@@ -114,7 +135,6 @@ async def download_timelapse(
         response.release()
         if temp_output is not None:
             temp_output.unlink(missing_ok=True)
-        _write_stdout("\n")
 
 
 def _js_time(value: datetime) -> int:
@@ -133,14 +153,22 @@ def _sanitize_terminal_text(value: str) -> str:
     return value.encode("unicode_escape", errors="backslashreplace").decode("ascii")
 
 
-def _print_progress(downloaded: int, total: int | None) -> None:
-    if total:
-        percent = min(downloaded / total * 100, 100.0)
-        _write_stdout(f"\rDownloaded {downloaded / MEBIBYTE:.1f} MiB ({percent:.1f}%)")
-    else:
-        _write_stdout(f"\rDownloaded {downloaded / MEBIBYTE:.1f} MiB")
-
-
-def _write_stdout(message: str) -> None:
-    sys.stdout.write(message)
-    sys.stdout.flush()
+def _emit_progress(
+    callback: ProgressCallback | None,
+    downloaded_bytes: int,
+    total_bytes: int | None,
+    started_at: float,
+    now: float,
+) -> None:
+    if callback is None:
+        return
+    elapsed_seconds = max(now - started_at, 0.0)
+    bytes_per_second = downloaded_bytes / elapsed_seconds if elapsed_seconds else 0.0
+    callback(
+        DownloadProgress(
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+            bytes_per_second=bytes_per_second,
+            elapsed_seconds=elapsed_seconds,
+        )
+    )
