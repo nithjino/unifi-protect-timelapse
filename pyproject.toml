@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "timelapse"
+version = "0.1.0"
+description = "Command-line UniFi Protect timelapse exporter"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.1.0",
+    "uiprotect>=15.4.3",
+]
+
+[project.scripts]
+timelapse = "timelapse:main"
+
+[tool.setuptools]
+py-modules = ["timelapse"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.410",
+    "pytest>=9.0.3",
+    "ruff",
+]
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".git-rewrite",
+    ".venv",
+    ".vscode",
+    ".idea"
+]
+
+line-length = 120
+indent-width = 4
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "BLE001",
+    "COM812",
+    "D203",
+    "D213",
+    "D413",
+    "EXE002",
+    "FIX002",
+    "PLR0913",
+    "TD002",
+    "TD003"
+]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.mccabe]
+max-complexity = 25
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+docstring-code-line-length = "dynamic"
+
+[tool.pyright]
+include = ["timelapse.py", "tests"]
+typeCheckingMode = "standard"
+pythonVersion = "3.14"
+venv = ".venv"
+venvPath = "."
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["ANN201", "D", "PLR2004", "S101", "SLF001"]

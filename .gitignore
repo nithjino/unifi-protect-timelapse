@@ -1,0 +1,7 @@
+.env
+.venv/
+*.part
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+timelapse.egg-info
