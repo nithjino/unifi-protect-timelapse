@@ -74,6 +74,49 @@ def test_date_editors_offer_calendar_popups(main_window: gui_module._MainWindow)
     assert main_window._end_edit.calendarPopup() is True
 
 
+def test_logs_button_slides_drawer_and_displays_logs(
+    main_window: gui_module._MainWindow,
+    qtbot: QtBot,
+) -> None:
+    main_window.show()
+    gui_module._LOGGER.info("visible test log")
+
+    qtbot.mouseClick(main_window._logs_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: main_window._log_drawer.maximumHeight() == gui_module._LOG_DRAWER_HEIGHT)
+
+    assert main_window._log_drawer.isVisible() is True
+    assert "visible test log" in main_window._log_output.toPlainText()
+
+    qtbot.mouseClick(main_window._logs_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(main_window._log_drawer.isHidden)
+
+
+def test_activity_indicator_tracks_background_work(
+    main_window: gui_module._MainWindow,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    worker = gui_module._DownloadWorker(config, camera, tmp_path / "output.mp4", main_window)
+    entry = main_window._add_download_row(1, camera, tmp_path / "output.mp4", worker)
+
+    assert main_window._activity_widget.isHidden() is True
+
+    main_window._workers[worker] = entry
+    main_window._update_activity_indicator()
+    assert main_window._activity_widget.isHidden() is False
+    assert main_window._activity_bar.minimum() == 0
+    assert main_window._activity_bar.maximum() == 0
+
+    main_window._workers.clear()
+    main_window._update_activity_indicator()
+    assert main_window._activity_widget.isHidden() is True
+
+
 def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _REQUIRED_ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)

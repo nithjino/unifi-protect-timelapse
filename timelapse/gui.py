@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import sys
@@ -17,7 +18,19 @@ from time import monotonic
 from typing import ClassVar
 
 from dotenv import load_dotenv
-from PySide6.QtCore import QDateTime, QSettings, Qt, QThread, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import (
+    QDateTime,
+    QEasingCurve,
+    QObject,
+    QPropertyAnimation,
+    QSettings,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,6 +51,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMainWindow,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QTableWidget,
@@ -88,6 +102,9 @@ _VERIFY_SSL_TOOLTIP = (
 _BYTE_UNIT = 1024.0
 _PROGRESS_SCALE = 1000
 _STALE_SPEED_SECONDS = 2.0
+_LOG_ANIMATION_DURATION_MS = 180
+_LOG_DRAWER_HEIGHT = 220
+_MAX_LOG_LINES = 2000
 _MINIMUM_DATE = QDateTime.fromString("2000-01-01T00:00:00", Qt.DateFormat.ISODate)
 _TABLE_HEADERS = ("Job", "Camera", "Status", "Progress", "Downloaded", "Expected", "Speed", "Output", "Action")
 _COLUMN_JOB = 0
@@ -99,6 +116,8 @@ _COLUMN_EXPECTED = 5
 _COLUMN_SPEED = 6
 _COLUMN_OUTPUT = 7
 _COLUMN_ACTION = 8
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.setLevel(logging.INFO)
 
 
 @dataclass(frozen=True)
@@ -147,6 +166,23 @@ class _DownloadEntry:
     last_progress_at: float | None = None
     cancelling: bool = False
     terminal: bool = False
+
+
+class _LogEmitter(QObject):
+    message_ready: ClassVar[Signal] = Signal(str)
+
+
+class _QtLogHandler(logging.Handler):
+    def __init__(self, emitter: _LogEmitter) -> None:
+        super().__init__(logging.INFO)
+        self._emitter = emitter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        """Forward a formatted log record to the GUI thread."""
+        try:
+            self._emitter.message_ready.emit(self.format(record))
+        except Exception:
+            self.handleError(record)
 
 
 def _environment_settings(dotenv_path: Path) -> _ConnectionSettings:
@@ -545,6 +581,7 @@ class _MainWindow(QMainWindow):
         self._reserved_paths: set[str] = set()
         self._next_job_number = 1
         self._closing = False
+        self._log_handler_attached = False
         self.setWindowTitle("UniFi Protect Timelapse")
         self.resize(1180, 720)
         self.setMinimumSize(940, 600)
@@ -554,8 +591,11 @@ class _MainWindow(QMainWindow):
         self._speed_timer.setInterval(1000)
         self._speed_timer.timeout.connect(self._clear_stalled_speeds)
         self._speed_timer.start()
+        self._install_log_handler()
         self._update_connection_label()
         self._update_camera_summary()
+        self._update_activity_indicator()
+        _LOGGER.info("Application ready")
 
     def _build_menu(self) -> None:
         application_menu = self.menuBar().addMenu("&Application")
@@ -573,8 +613,91 @@ class _MainWindow(QMainWindow):
         layout.addWidget(self._connection_group())
         layout.addWidget(self._options_group())
         layout.addWidget(self._downloads_group(), stretch=1)
+        layout.addWidget(self._logs_drawer())
         self.setCentralWidget(container)
         self.statusBar().showMessage("Ready")
+        self._activity_widget = QWidget()
+        activity_layout = QHBoxLayout(self._activity_widget)
+        activity_layout.setContentsMargins(4, 0, 4, 0)
+        activity_layout.setSpacing(6)
+        activity_label = QLabel("Working")
+        activity_layout.addWidget(activity_label)
+        self._activity_bar = QProgressBar()
+        self._activity_bar.setRange(0, 0)
+        self._activity_bar.setTextVisible(False)
+        self._activity_bar.setFixedSize(80, 14)
+        self._activity_bar.setToolTip("Background work is active. This animation stops if the interface freezes.")
+        activity_layout.addWidget(self._activity_bar)
+        self.statusBar().addPermanentWidget(self._activity_widget)
+        self._logs_button = QPushButton("Logs")
+        self._logs_button.setCheckable(True)
+        self._logs_button.setToolTip("Show or hide application logs.")
+        self._logs_button.toggled.connect(self._toggle_logs)
+        self.statusBar().addPermanentWidget(self._logs_button)
+
+    def _logs_drawer(self) -> QGroupBox:
+        drawer = QGroupBox("Application Logs")
+        layout = QVBoxLayout(drawer)
+        controls = QHBoxLayout()
+        controls.addStretch(1)
+        clear_button = QPushButton("Clear")
+        clear_button.clicked.connect(self._clear_logs)
+        controls.addWidget(clear_button)
+        layout.addLayout(controls)
+        self._log_output = QPlainTextEdit()
+        self._log_output.setReadOnly(True)
+        self._log_output.setMaximumBlockCount(_MAX_LOG_LINES)
+        self._log_output.setPlaceholderText("Application activity and errors will appear here.")
+        layout.addWidget(self._log_output)
+        drawer.setMaximumHeight(0)
+        drawer.setVisible(False)
+        self._log_drawer = drawer
+        self._log_animation = QPropertyAnimation(drawer, b"maximumHeight", self)
+        self._log_animation.setDuration(_LOG_ANIMATION_DURATION_MS)
+        self._log_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        self._log_animation.finished.connect(self._finish_log_animation)
+        return drawer
+
+    def _install_log_handler(self) -> None:
+        self._log_emitter = _LogEmitter(self)
+        self._log_emitter.message_ready.connect(self._append_log)
+        self._log_handler = _QtLogHandler(self._log_emitter)
+        self._log_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
+        )
+        logging.getLogger().addHandler(self._log_handler)
+        self._log_handler_attached = True
+
+    def _remove_log_handler(self) -> None:
+        if self._log_handler_attached:
+            logging.getLogger().removeHandler(self._log_handler)
+            self._log_handler_attached = False
+
+    @Slot(str)
+    def _append_log(self, message: str) -> None:
+        self._log_output.appendPlainText(message)
+
+    @Slot()
+    def _clear_logs(self) -> None:
+        self._log_output.clear()
+
+    @Slot(bool)
+    def _toggle_logs(self, checked: object) -> None:
+        visible = bool(checked)
+        self._log_animation.stop()
+        if visible:
+            self._log_drawer.setVisible(True)
+        self._log_animation.setStartValue(self._log_drawer.maximumHeight())
+        self._log_animation.setEndValue(_LOG_DRAWER_HEIGHT if visible else 0)
+        self._log_animation.start()
+
+    @Slot()
+    def _finish_log_animation(self) -> None:
+        if not self._logs_button.isChecked():
+            self._log_drawer.setVisible(False)
+
+    def _update_activity_indicator(self) -> None:
+        self._activity_widget.setVisible(self._camera_loader is not None or bool(self._workers))
 
     def _connection_group(self) -> QGroupBox:
         group = QGroupBox("Protect Connection")
@@ -691,6 +814,7 @@ class _MainWindow(QMainWindow):
         self._update_connection_label()
         self._update_camera_summary()
         self.statusBar().showMessage("Connection settings saved", 5000)
+        _LOGGER.info("Protect connection settings saved")
 
     def _update_connection_label(self) -> None:
         self._connection_label.setText(self._settings.instance_url)
@@ -717,6 +841,8 @@ class _MainWindow(QMainWindow):
         self._select_cameras_button.setEnabled(False)
         self._refresh_cameras_button.setEnabled(False)
         self.statusBar().showMessage("Loading cameras…")
+        self._update_activity_indicator()
+        _LOGGER.info("Loading cameras")
         loader.start()
 
     @Slot(object)
@@ -733,6 +859,7 @@ class _MainWindow(QMainWindow):
             QMessageBox.information(self, "No Cameras", "No cameras were returned by UniFi Protect.")
             return
         self.statusBar().showMessage(f"Loaded {len(self._cameras)} cameras", 5000)
+        _LOGGER.info("Loaded %d cameras", len(self._cameras))
         if self._open_camera_dialog_after_load:
             self._show_camera_selection()
 
@@ -741,6 +868,7 @@ class _MainWindow(QMainWindow):
         if not self._closing:
             QMessageBox.critical(self, "Could Not Load Cameras", message)
             self.statusBar().showMessage("Camera loading failed", 5000)
+            _LOGGER.error("Camera loading failed: %s", message)
 
     def _camera_loader_finished(self, loader: _CameraLoader) -> None:
         if self._camera_loader is loader:
@@ -748,6 +876,7 @@ class _MainWindow(QMainWindow):
         loader.deleteLater()
         self._select_cameras_button.setEnabled(True)
         self._refresh_cameras_button.setEnabled(True)
+        self._update_activity_indicator()
         self._finish_close_if_ready()
 
     def _show_camera_selection(self) -> None:
@@ -756,6 +885,7 @@ class _MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._selected_cameras = dialog.selected_cameras()
             self._update_camera_summary()
+            _LOGGER.info("Selected %d cameras", len(self._selected_cameras))
 
     def _update_camera_summary(self) -> None:
         count = len(self._selected_cameras)
@@ -798,7 +928,10 @@ class _MainWindow(QMainWindow):
             worker.download_cancelled.connect(partial(self._download_cancelled, entry))
             worker.finished.connect(partial(self._download_worker_finished, worker))
             worker.start()
+            _LOGGER.info("Started camera download: %s -> %s", camera.name, output)
+        self._update_activity_indicator()
         self.statusBar().showMessage(f"Started job {job_number} with {len(self._selected_cameras)} downloads")
+        _LOGGER.info("Started job %d with %d downloads", job_number, len(self._selected_cameras))
 
     def _reserve_output_path(self, preferred: Path) -> Path:
         candidate = preferred.resolve()
@@ -853,6 +986,7 @@ class _MainWindow(QMainWindow):
         entry.cancelling = True
         entry.action_button.setEnabled(False)
         self._set_table_text(entry.row, _COLUMN_STATUS, "Cancelling…")
+        _LOGGER.info("Cancelling camera download: %s", entry.camera_name)
         worker.cancel()
 
     def _download_progress(self, entry: _DownloadEntry, payload: object) -> None:
@@ -898,6 +1032,7 @@ class _MainWindow(QMainWindow):
         entry.progress_bar.setValue(_PROGRESS_SCALE)
         entry.progress_bar.setFormat("100%")
         self._replace_action_with_show_folder(entry)
+        _LOGGER.info("Completed camera download: %s -> %s", entry.camera_name, entry.output)
 
     def _download_failed(self, entry: _DownloadEntry, message: str) -> None:
         entry.terminal = True
@@ -906,6 +1041,7 @@ class _MainWindow(QMainWindow):
         self._set_table_text(entry.row, _COLUMN_SPEED, "—")
         entry.action_button.setText("Failed")
         entry.action_button.setEnabled(False)
+        _LOGGER.error("Camera download failed for %s: %s", entry.camera_name, message)
 
     def _download_cancelled(self, entry: _DownloadEntry) -> None:
         entry.terminal = True
@@ -914,6 +1050,7 @@ class _MainWindow(QMainWindow):
         self._set_table_text(entry.row, _COLUMN_SPEED, "—")
         entry.action_button.setText("Cancelled")
         entry.action_button.setEnabled(False)
+        _LOGGER.info("Camera download cancelled: %s", entry.camera_name)
 
     def _replace_action_with_show_folder(self, entry: _DownloadEntry) -> None:
         old_widget = self._downloads.cellWidget(entry.row, _COLUMN_ACTION)
@@ -934,6 +1071,7 @@ class _MainWindow(QMainWindow):
         active_count = len(self._workers)
         message = "Ready" if active_count == 0 else f"{active_count} downloads active"
         self.statusBar().showMessage(message)
+        self._update_activity_indicator()
         self._finish_close_if_ready()
 
     def _set_table_text(self, row: int, column: int, text: str, *, tooltip: str | None = None) -> None:
@@ -954,6 +1092,8 @@ class _MainWindow(QMainWindow):
         has_background_work = self._camera_loader is not None or bool(self._workers)
         if not has_background_work:
             self._preferences.setValue("output_directory", self._output_edit.text())
+            _LOGGER.info("Application closed")
+            self._remove_log_handler()
             event.accept()
             return
         if self._closing:
@@ -972,6 +1112,7 @@ class _MainWindow(QMainWindow):
         self._closing = True
         self._start_button.setEnabled(False)
         self.statusBar().showMessage("Cancelling active work…")
+        _LOGGER.info("Application close requested; cancelling active work")
         if self._camera_loader is not None:
             self._camera_loader.cancel()
         for worker in tuple(self._workers):
