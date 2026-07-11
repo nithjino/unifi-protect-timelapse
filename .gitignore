@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 timelapse.egg-info
+.DS_Store
