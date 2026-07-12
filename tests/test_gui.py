@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import stat
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
-from dotenv import dotenv_values
 from PySide6.QtCore import Qt
 
 import timelapse.gui as gui_module
@@ -39,6 +37,17 @@ class _MemorySettings:
         self._values[key] = value
 
 
+class _MemoryProfileStore(gui_module._ProfileStore):
+    def __init__(self, state: gui_module._ProfileState | None = None) -> None:
+        self.state = state or gui_module._ProfileState((), None)
+
+    def load(self) -> gui_module._ProfileState:
+        return self.state
+
+    def save(self, state: gui_module._ProfileState) -> None:
+        self.state = state
+
+
 def _connection_settings() -> gui_module._ConnectionSettings:
     return gui_module._ConnectionSettings(
         instance_url="https://protect.local/proxy/protect/integration/v1",
@@ -55,10 +64,9 @@ def _connection_settings() -> gui_module._ConnectionSettings:
 def main_window(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> gui_module._MainWindow:
     monkeypatch.setattr(gui_module, "QSettings", _MemorySettings)
-    window = gui_module._MainWindow(_connection_settings(), tmp_path / ".env")
+    window = gui_module._MainWindow(_connection_settings())
     qtbot.add_widget(window)
     return window
 
@@ -74,7 +82,7 @@ def test_date_editors_offer_calendar_popups(main_window: gui_module._MainWindow)
     assert main_window._end_edit.calendarPopup() is True
 
 
-def test_logs_button_slides_drawer_and_displays_logs(
+def test_logs_button_opens_separate_window_and_displays_logs(
     main_window: gui_module._MainWindow,
     qtbot: QtBot,
 ) -> None:
@@ -82,13 +90,12 @@ def test_logs_button_slides_drawer_and_displays_logs(
     gui_module._LOGGER.info("visible test log")
 
     qtbot.mouseClick(main_window._logs_button, Qt.MouseButton.LeftButton)
-    qtbot.waitUntil(lambda: main_window._log_drawer.maximumHeight() == gui_module._LOG_DRAWER_HEIGHT)
+    qtbot.waitUntil(main_window._logs_window.isVisible)
 
-    assert main_window._log_drawer.isVisible() is True
-    assert "visible test log" in main_window._log_output.toPlainText()
+    assert "visible test log" in main_window._logs_window.output.toPlainText()
 
-    qtbot.mouseClick(main_window._logs_button, Qt.MouseButton.LeftButton)
-    qtbot.waitUntil(main_window._log_drawer.isHidden)
+    main_window._logs_window.close()
+    qtbot.waitUntil(main_window._logs_window.isHidden)
 
 
 def test_activity_indicator_tracks_background_work(
@@ -144,6 +151,18 @@ def test_application_icon_path_supports_source_and_bundled_apps(
     assert gui_module._application_icon_path() == tmp_path / "timelapse_assets" / "timelapse.png"
 
 
+def test_qt_gui_is_limited_to_windows_and_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gui_module.os, "name", "posix")
+    monkeypatch.setattr(gui_module.sys, "platform", "darwin")
+    assert gui_module._is_supported_gui_platform() is False
+
+    monkeypatch.setattr(gui_module.sys, "platform", "linux")
+    assert gui_module._is_supported_gui_platform() is True
+
+    monkeypatch.setattr(gui_module.os, "name", "nt")
+    assert gui_module._is_supported_gui_platform() is True
+
+
 def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _REQUIRED_ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
@@ -159,45 +178,100 @@ def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, t
     assert gui_module._settings_need_prompt(settings) is True
 
 
+def test_legacy_dotenv_migrates_to_secure_profile_and_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in _REQUIRED_ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(gui_module.sys, "frozen", True, raising=False)
+    dotenv_path = tmp_path / ".env"
+    dotenv_path.write_text(
+        """UNIFI_PROTECT_URL="https://protect.local/proxy/protect/integration/v1"
+UNIFI_PROTECT_TOKEN="token"
+UNIFI_PROTECT_USERNAME="user"
+UNIFI_PROTECT_PASSWORD="password"
+UNIFI_PROTECT_VERIFY_SSL=false
+""",
+        encoding="utf-8",
+    )
+    store = _MemoryProfileStore()
+
+    state, exit_code = gui_module._initial_profiles(dotenv_path, store)
+
+    assert exit_code == 0
+    assert state is not None
+    assert state.selected_profile is not None
+    assert state.selected_profile.settings.verify_ssl is False
+    assert store.state == state
+    assert not dotenv_path.exists()
+
+
 def test_invalid_verify_ssl_value_does_not_disable_verification(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("UNIFI_PROTECT_VERIFY_SSL", "flase")
 
     assert gui_module._environment_bool("UNIFI_PROTECT_VERIFY_SSL", default=True) is True
 
 
-def test_write_dotenv_is_private_and_round_trips_quoted_secrets(
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    token = "token with spaces, #hash, 'single', \"double\", and \\slash\nnext line"  # noqa: S105
-    password = "pa'ss \\word # value\r\nsecond line"  # noqa: S105
-    settings = gui_module._ConnectionSettings(
-        instance_url="https://protect.local/proxy/protect/integration/v1",
-        token=token,
-        username="local user #1",
-        password=password,
+def test_profile_store_keeps_secrets_out_of_qsettings(monkeypatch: pytest.MonkeyPatch) -> None:
+    preferences = _MemorySettings()
+    secrets: dict[tuple[str, str], str] = {}
+    monkeypatch.setattr(
+        gui_module.keyring,
+        "set_password",
+        lambda service, account, value: secrets.__setitem__((service, account), value),
+    )
+    monkeypatch.setattr(gui_module.keyring, "get_password", lambda service, account: secrets.get((service, account)))
+    monkeypatch.setattr(gui_module.keyring, "delete_password", lambda service, account: secrets.pop((service, account)))
+    first = gui_module._ConnectionProfile("one", "Home", _connection_settings())
+    second_settings = gui_module._ConnectionSettings(
+        instance_url="https://office.local/proxy/protect/integration/v1",
+        token="office-token",  # noqa: S106
+        username="office-user",
+        password="office-password",  # noqa: S106
         verify_ssl=False,
         request_timeout_seconds=0,
         max_download_mib=10240,
     )
-    dotenv_path = tmp_path / ".env"
+    second = gui_module._ConnectionProfile("two", "", second_settings)
+    store = gui_module._ProfileStore(preferences)
 
-    gui_module._write_dotenv(dotenv_path, settings)
+    store.save(gui_module._ProfileState((first, second), second.profile_id))
+    loaded = store.load()
 
-    values = dotenv_values(dotenv_path)
-    assert stat.S_IMODE(dotenv_path.stat().st_mode) == 0o600
-    assert values["UNIFI_PROTECT_URL"] == settings.instance_url
-    assert values["UNIFI_PROTECT_TOKEN"] == token
-    assert values["UNIFI_PROTECT_USERNAME"] == settings.username
-    assert values["UNIFI_PROTECT_PASSWORD"] == password
-    assert values["UNIFI_PROTECT_VERIFY_SSL"] == "false"
-    assert token not in repr(settings)
-    assert password not in repr(settings)
-    captured = capsys.readouterr()
-    assert token not in captured.out
-    assert token not in captured.err
-    assert password not in captured.out
-    assert password not in captured.err
+    assert loaded.profiles == (first, second.normalized())
+    assert loaded.selected_profile_id == second.profile_id
+    assert first.settings.token not in repr(preferences._values)
+    assert second.settings.password not in repr(preferences._values)
+
+
+def test_profile_name_defaults_to_protect_url() -> None:
+    profile = gui_module._ConnectionProfile("profile", "   ", _connection_settings()).normalized()
+
+    assert profile.display_name == profile.settings.instance_url
+
+
+def test_profile_dropdown_switches_active_connection(qtbot: QtBot) -> None:
+    first = gui_module._ConnectionProfile("one", "Home", _connection_settings())
+    second_settings = gui_module._ConnectionSettings(
+        instance_url="https://office.local/proxy/protect/integration/v1",
+        token="office-token",  # noqa: S106
+        username="office-user",
+        password="office-password",  # noqa: S106
+        verify_ssl=True,
+        request_timeout_seconds=0,
+        max_download_mib=10240,
+    )
+    second = gui_module._ConnectionProfile("two", "Office", second_settings)
+    store = _MemoryProfileStore(gui_module._ProfileState((first, second), first.profile_id))
+    window = gui_module._MainWindow(store.state, profile_store=store)
+    qtbot.add_widget(window)
+
+    window._profile_combo.setCurrentIndex(1)
+
+    assert window._settings == second_settings
+    assert store.state.selected_profile_id == second.profile_id
+    assert window._connection_label.text() == second_settings.instance_url
 
 
 def test_camera_dialog_returns_multiple_checked_cameras(qtbot: QtBot) -> None:
@@ -311,3 +385,83 @@ def test_stalled_download_speed_falls_to_zero(
     main_window._workers.clear()
 
     assert _table_text(main_window, entry.row, gui_module._COLUMN_SPEED) == "0 bytes/s"
+
+
+def test_bulk_download_controls_preserve_active_rows(
+    main_window: gui_module._MainWindow,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    finished_worker = gui_module._DownloadWorker(config, camera, tmp_path / "finished.mp4", main_window)
+    active_worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
+    finished = main_window._add_download_row(1, camera, tmp_path / "finished.mp4", finished_worker)
+    active = main_window._add_download_row(2, camera, tmp_path / "active.mp4", active_worker)
+    finished.terminal = True
+    finished.completed = True
+    main_window._workers[active_worker] = active
+    main_window._update_bulk_buttons()
+
+    assert main_window._clear_all_button.isEnabled() is True
+    assert main_window._cancel_all_button.isEnabled() is True
+
+    main_window._clear_finished_jobs()
+    assert main_window._downloads.rowCount() == 1
+    assert main_window._entries == [active]
+
+    main_window._cancel_all_jobs()
+    assert active.cancelling is True
+    assert main_window._cancel_all_button.isEnabled() is False
+    main_window._workers.clear()
+
+
+def test_cancelled_job_can_restart_and_be_removed(
+    main_window: gui_module._MainWindow,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    worker = gui_module._DownloadWorker(config, camera, tmp_path / "cancelled.mp4", main_window)
+    entry = main_window._add_download_row(1, camera, tmp_path / "cancelled.mp4", worker)
+    main_window._workers[worker] = entry
+
+    main_window._download_cancelled(entry)
+    main_window._download_worker_finished(worker)
+
+    assert entry.action_button.text() == "Restart"
+    assert entry.action_button.isEnabled() is True
+    main_window._remove_entry(entry)
+    assert main_window._downloads.rowCount() == 0
+
+
+def test_double_click_completed_job_opens_video(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    output = tmp_path / "completed.mp4"
+    output.write_bytes(b"video")
+    worker = gui_module._DownloadWorker(config, camera, output, main_window)
+    entry = main_window._add_download_row(1, camera, output, worker)
+    entry.terminal = True
+    entry.completed = True
+    opened: list[str] = []
+    monkeypatch.setattr(gui_module.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+
+    main_window._open_completed_video(entry.row, gui_module._COLUMN_CAMERA)
+
+    assert opened == [str(output)]

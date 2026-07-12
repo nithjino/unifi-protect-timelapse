@@ -42,6 +42,7 @@ $PyInstallerArgs = @(
     "--collect-submodules", "uiprotect.data",
     "--collect-submodules", "uiprotect.devices",
     "--collect-submodules", "uiprotect.events",
+    "--hidden-import", "keyring.backends.Windows",
     "--add-data", "${RuntimeIcon};timelapse_assets",
     "--icon", $IconPath
 )

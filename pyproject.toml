@@ -9,7 +9,9 @@ description = "CLI and desktop UniFi Protect timelapse exporter"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6-Essentials>=6.10.1",
+    "keyring>=25.6.0",
     "python-dotenv>=1.1.0",
+    "secretstorage>=3.3.3; sys_platform == 'linux'",
     "uiprotect>=15.4.3",
 ]
 

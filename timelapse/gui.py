@@ -1,13 +1,13 @@
-"""Native desktop interface for the UniFi Protect timelapse exporter."""
+"""Windows and Linux Qt interface for the UniFi Protect timelapse exporter."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
-import re
 import sys
-import tempfile
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -15,14 +15,15 @@ from functools import partial
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
+import keyring
 from dotenv import load_dotenv
+from keyring.errors import KeyringError
 from PySide6.QtCore import (
     QDateTime,
-    QEasingCurve,
     QObject,
-    QPropertyAnimation,
+    QPoint,
     QSettings,
     QStandardPaths,
     Qt,
@@ -51,10 +52,12 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -67,23 +70,9 @@ from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo, parse_connection
 from timelapse.service import export_timelapse, list_available_cameras
 
-_ENVIRONMENT_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
-_DOTENV_TEMPLATE = """# Local runtime configuration for the UniFi Protect timelapse exporter.
-UNIFI_PROTECT_URL=
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
-# Token is needed to get a list of cameras.
-UNIFI_PROTECT_TOKEN=
-
-# Use a dedicated local Protect user with permission to view/export recordings.
-# These credentials are needed to generate and download the timelapse.
-UNIFI_PROTECT_USERNAME=
-UNIFI_PROTECT_PASSWORD=
-UNIFI_PROTECT_VERIFY_SSL=true
-
-# Optional runtime limits. Set either value to 0 to disable that limit.
-TIMELAPSE_REQUEST_TIMEOUT_SECONDS=0
-TIMELAPSE_MAX_DOWNLOAD_MIB=10240
-"""
 _URL_TOOLTIP = (
     "The UniFi Protect Integration API address used to connect to your Protect console, for example "
     "https://protect.local/proxy/protect/integration/v1."
@@ -103,10 +92,11 @@ _VERIFY_SSL_TOOLTIP = (
 _BYTE_UNIT = 1024.0
 _PROGRESS_SCALE = 1000
 _STALE_SPEED_SECONDS = 2.0
-_LOG_ANIMATION_DURATION_MS = 180
-_LOG_DRAWER_HEIGHT = 220
 _MAX_LOG_LINES = 2000
 _APPLICATION_DIRECTORY_NAME = "TimeLapse"
+_PROFILE_SERVICE = "io.timelapse.desktop.connection-profile"
+_PROFILE_IDS_KEY = "connection_profile_ids"
+_SELECTED_PROFILE_KEY = "selected_connection_profile_id"
 _ICON_BUNDLE_DIRECTORY = "timelapse_assets"
 _ICON_FILENAME = "timelapse.png"
 _MINIMUM_DATE = QDateTime.fromString("2000-01-01T00:00:00", Qt.DateFormat.ISODate)
@@ -158,18 +148,173 @@ class _ConnectionSettings:
             max_download_mib=self.max_download_mib,
         )
 
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "instance_url": self.instance_url,
+            "token": self.token,
+            "username": self.username,
+            "password": self.password,
+            "verify_ssl": self.verify_ssl,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "max_download_mib": self.max_download_mib,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> _ConnectionSettings:
+        if not isinstance(value, dict):
+            message = "profile connection settings are not an object"
+            raise TypeError(message)
+        return cls(
+            instance_url=str(value.get("instance_url", "")),
+            token=str(value.get("token", "")),
+            username=str(value.get("username", "")),
+            password=str(value.get("password", "")),
+            verify_ssl=bool(value.get("verify_ssl", True)),
+            request_timeout_seconds=_nonnegative_value(
+                value.get("request_timeout_seconds"), DEFAULT_REQUEST_TIMEOUT_SECONDS
+            ),
+            max_download_mib=_nonnegative_value(value.get("max_download_mib"), DEFAULT_MAX_DOWNLOAD_MIB),
+        )
+
+
+@dataclass(frozen=True)
+class _ConnectionProfile:
+    profile_id: str
+    name: str
+    settings: _ConnectionSettings
+
+    @property
+    def display_name(self) -> str:
+        return self.name.strip() or self.settings.instance_url.strip().rstrip("/")
+
+    def normalized(self) -> _ConnectionProfile:
+        settings = _ConnectionSettings(
+            instance_url=self.settings.instance_url.strip().rstrip("/"),
+            token=self.settings.token.strip(),
+            username=self.settings.username.strip(),
+            password=self.settings.password,
+            verify_ssl=self.settings.verify_ssl,
+            request_timeout_seconds=self.settings.request_timeout_seconds,
+            max_download_mib=self.settings.max_download_mib,
+        )
+        return _ConnectionProfile(self.profile_id, self.name.strip() or settings.instance_url, settings)
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {"id": self.profile_id, "name": self.display_name, "settings": self.settings.to_dict()},
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def from_json(cls, value: str) -> _ConnectionProfile:
+        payload = json.loads(value)
+        if not isinstance(payload, dict):
+            message = "stored profile is not an object"
+            raise TypeError(message)
+        profile_id = payload.get("id")
+        name = payload.get("name")
+        if not isinstance(profile_id, str) or not isinstance(name, str):
+            message = "stored profile is missing its identifier or name"
+            raise TypeError(message)
+        return cls(profile_id, name, _ConnectionSettings.from_dict(payload.get("settings"))).normalized()
+
+
+@dataclass(frozen=True)
+class _ProfileState:
+    profiles: tuple[_ConnectionProfile, ...]
+    selected_profile_id: str | None
+
+    @property
+    def selected_profile(self) -> _ConnectionProfile | None:
+        return next((profile for profile in self.profiles if profile.profile_id == self.selected_profile_id), None)
+
+
+class _ProfileStoreError(RuntimeError):
+    pass
+
+
+def _profile_from_keyring(payload: str, expected_id: str) -> _ConnectionProfile:
+    profile = _ConnectionProfile.from_json(payload)
+    if profile.profile_id != expected_id:
+        message = "stored profile identifier does not match its credential-store account"
+        raise ValueError(message)
+    return profile
+
+
+class _ProfileStore:
+    def __init__(self, preferences: QSettings | None = None) -> None:
+        self._preferences = preferences or QSettings("TimeLapse", "UniFi Protect Timelapse")
+
+    def load(self) -> _ProfileState:
+        profile_ids = self._stored_profile_ids()
+        profiles: list[_ConnectionProfile] = []
+        try:
+            for profile_id in profile_ids:
+                payload = keyring.get_password(_PROFILE_SERVICE, profile_id)
+                if payload is not None:
+                    profiles.append(_profile_from_keyring(payload, profile_id))
+        except (KeyringError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            message = (
+                f"Could not read connection profiles from the operating system credential store: {_exception_text(exc)}"
+            )
+            raise _ProfileStoreError(message) from exc
+        selected = self._preferences.value(_SELECTED_PROFILE_KEY)
+        selected_id = (
+            selected if isinstance(selected, str) and any(p.profile_id == selected for p in profiles) else None
+        )
+        if selected_id is None and profiles:
+            selected_id = profiles[0].profile_id
+        return _ProfileState(tuple(profiles), selected_id)
+
+    def save(self, state: _ProfileState) -> None:
+        normalized_profiles = tuple(profile.normalized() for profile in state.profiles)
+        new_ids = [profile.profile_id for profile in normalized_profiles]
+        old_ids = self._stored_profile_ids()
+        try:
+            for profile in normalized_profiles:
+                keyring.set_password(_PROFILE_SERVICE, profile.profile_id, profile.to_json())
+            for removed_id in set(old_ids) - set(new_ids):
+                with suppress(KeyringError):
+                    keyring.delete_password(_PROFILE_SERVICE, removed_id)
+        except KeyringError as exc:
+            message = (
+                f"Could not save connection profiles in the operating system credential store: {_exception_text(exc)}"
+            )
+            raise _ProfileStoreError(message) from exc
+        selected_id = (
+            state.selected_profile_id if state.selected_profile_id in new_ids else (new_ids[0] if new_ids else "")
+        )
+        self._preferences.setValue(_PROFILE_IDS_KEY, new_ids)
+        self._preferences.setValue(_SELECTED_PROFILE_KEY, selected_id)
+
+    def _stored_profile_ids(self) -> list[str]:
+        value = self._preferences.value(_PROFILE_IDS_KEY)
+        if isinstance(value, str):
+            return [value] if value else []
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, str) and item]
+        return []
+
 
 @dataclass
 class _DownloadEntry:
     row: int
+    job_number: int
     output: Path
-    camera_name: str
+    camera: CameraInfo
+    config: Config
+    worker: _DownloadWorker
     progress_bar: QProgressBar
     action_button: QPushButton
     downloaded_bytes: int = 0
     last_progress_at: float | None = None
     cancelling: bool = False
     terminal: bool = False
+    completed: bool = False
+
+    @property
+    def camera_name(self) -> str:
+        return self.camera.name
 
 
 class _LogEmitter(QObject):
@@ -189,6 +334,31 @@ class _QtLogHandler(logging.Handler):
             self.handleError(record)
 
 
+class _LogsWindow(QWidget):
+    def __init__(self) -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.setWindowTitle("Application Logs")
+        self.resize(760, 420)
+        self.setMinimumSize(560, 280)
+        layout = QVBoxLayout(self)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("Application Logs"))
+        controls.addStretch(1)
+        self.clear_button = QPushButton("Clear")
+        controls.addWidget(self.clear_button)
+        layout.addLayout(controls)
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        self.output.setMaximumBlockCount(_MAX_LOG_LINES)
+        self.output.setPlaceholderText("Application activity and errors will appear here.")
+        layout.addWidget(self.output)
+
+    def show_and_activate(self) -> None:
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+
 def _is_bundled() -> bool:
     return bool(getattr(sys, "frozen", False))
 
@@ -201,8 +371,6 @@ def _application_icon_path() -> Path:
 
 
 def _application_data_directory() -> Path:
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / _APPLICATION_DIRECTORY_NAME
     if os.name == "nt":
         app_data = os.environ.get("APPDATA")
         base_directory = Path(app_data) if app_data else Path.home() / "AppData" / "Roaming"
@@ -268,6 +436,10 @@ def _environment_nonnegative_int(name: str, default: int) -> int:
     return parsed if parsed >= 0 else default
 
 
+def _nonnegative_value(value: object, default: int) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else default
+
+
 def _settings_need_prompt(settings: _ConnectionSettings) -> bool:
     if settings.missing_fields():
         return True
@@ -276,60 +448,6 @@ def _settings_need_prompt(settings: _ConnectionSettings) -> bool:
     except TimelapseError:
         return True
     return False
-
-
-def _dotenv_quote(value: str) -> str:
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "\\r").replace("\n", "\\n")
-    return f'"{escaped}"'
-
-
-def _updated_dotenv(existing: str, settings: _ConnectionSettings) -> str:
-    replacements = {
-        "UNIFI_PROTECT_URL": settings.instance_url,
-        "UNIFI_PROTECT_TOKEN": settings.token,
-        "UNIFI_PROTECT_USERNAME": settings.username,
-        "UNIFI_PROTECT_PASSWORD": settings.password,
-        "UNIFI_PROTECT_VERIFY_SSL": "true" if settings.verify_ssl else "false",
-    }
-    lines = existing.splitlines()
-    replaced: set[str] = set()
-    for index, line in enumerate(lines):
-        match = _ENVIRONMENT_ASSIGNMENT.match(line)
-        if match is None or match.group(1) not in replacements:
-            continue
-        name = match.group(1)
-        lines[index] = f"{name}={_dotenv_quote(replacements[name])}"
-        replaced.add(name)
-
-    if lines and lines[-1]:
-        lines.append("")
-    for name, value in replacements.items():
-        if name not in replaced:
-            lines.append(f"{name}={_dotenv_quote(value)}")
-    return "\n".join(lines).rstrip() + "\n"
-
-
-def _write_dotenv(dotenv_path: Path, settings: _ConnectionSettings) -> None:
-    existing = dotenv_path.read_text(encoding="utf-8") if dotenv_path.is_file() else _DOTENV_TEMPLATE
-    contents = _updated_dotenv(existing, settings)
-    dotenv_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=dotenv_path.parent,
-            prefix=f".{dotenv_path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary_file:
-            temporary_file.write(contents)
-            temporary_path = Path(temporary_file.name)
-        temporary_path.chmod(0o600)
-        temporary_path.replace(dotenv_path)
-    finally:
-        if temporary_path is not None:
-            temporary_path.unlink(missing_ok=True)
 
 
 def _format_bytes(byte_count: int) -> str:
@@ -353,20 +471,26 @@ def _exception_text(exc: BaseException) -> str:
 class _CredentialsDialog(QDialog):
     def __init__(
         self,
-        settings: _ConnectionSettings,
-        dotenv_path: Path,
+        profile: _ConnectionProfile,
         *,
         first_run: bool,
+        new_profile: bool,
         parent: QWidget | None,
     ) -> None:
         super().__init__(parent)
-        self._existing_settings = settings
-        self._result: _ConnectionSettings | None = None
-        self.setWindowTitle("Set Up UniFi Protect" if first_run else "Protect Connection")
+        self._existing_profile = profile
+        self._result: _ConnectionProfile | None = None
+        if first_run:
+            title = "Set Up UniFi Protect"
+        elif new_profile:
+            title = "New Connection Profile"
+        else:
+            title = "Edit Connection Profile"
+        self.setWindowTitle(title)
         self.setMinimumWidth(560)
-        self._build_interface(dotenv_path, first_run=first_run)
+        self._build_interface(first_run=first_run)
 
-    def _build_interface(self, dotenv_path: Path, *, first_run: bool) -> None:
+    def _build_interface(self, *, first_run: bool) -> None:
         layout = QVBoxLayout(self)
         introduction = QLabel(
             "Enter the connection details needed to list cameras and export recordings."
@@ -377,25 +501,27 @@ class _CredentialsDialog(QDialog):
         layout.addWidget(introduction)
 
         form = QFormLayout()
-        self._url_edit = self._line_edit(self._existing_settings.instance_url, _URL_TOOLTIP)
-        self._token_edit = self._line_edit(self._existing_settings.token, _TOKEN_TOOLTIP, secret=True)
-        self._username_edit = self._line_edit(self._existing_settings.username, _USERNAME_TOOLTIP)
-        self._password_edit = self._line_edit(self._existing_settings.password, _PASSWORD_TOOLTIP, secret=True)
+        settings = self._existing_profile.settings
+        self._name_edit = self._line_edit(self._existing_profile.name, "Name shown in the profile menu.")
+        self._name_edit.setPlaceholderText("Defaults to Protect URL")
+        self._url_edit = self._line_edit(settings.instance_url, _URL_TOOLTIP)
+        self._token_edit = self._line_edit(settings.token, _TOKEN_TOOLTIP, secret=True)
+        self._username_edit = self._line_edit(settings.username, _USERNAME_TOOLTIP)
+        self._password_edit = self._line_edit(settings.password, _PASSWORD_TOOLTIP, secret=True)
+        self._add_field(form, "Profile name:", self._name_edit, "Name shown in the profile menu.")
         self._add_field(form, "Protect URL:", self._url_edit, _URL_TOOLTIP)
         self._add_field(form, "API token:", self._token_edit, _TOKEN_TOOLTIP)
         self._add_field(form, "Local username:", self._username_edit, _USERNAME_TOOLTIP)
         self._add_field(form, "Local password:", self._password_edit, _PASSWORD_TOOLTIP)
         self._verify_ssl = QCheckBox("Verify the server's TLS certificate")
-        self._verify_ssl.setChecked(self._existing_settings.verify_ssl)
+        self._verify_ssl.setChecked(settings.verify_ssl)
         self._verify_ssl.setToolTip(_VERIFY_SSL_TOOLTIP)
         self._add_field(form, "Security:", self._verify_ssl, _VERIFY_SSL_TOOLTIP)
         layout.addLayout(form)
 
-        storage_note = QLabel(
-            f"These values will be stored in {dotenv_path} as plaintext with owner-only file permissions."
-        )
+        storage_note = QLabel("Stored securely in the operating system credential store.")
         storage_note.setWordWrap(True)
-        storage_note.setToolTip("The .env file is local and excluded from Git, but it still contains sensitive values.")
+        storage_note.setToolTip("Uses Windows Credential Manager or the Linux desktop Secret Service.")
         layout.addWidget(storage_note)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -419,30 +545,34 @@ class _CredentialsDialog(QDialog):
 
     @Slot()
     def _accept_settings(self) -> None:
-        candidate = _ConnectionSettings(
+        settings = _ConnectionSettings(
             instance_url=self._url_edit.text().strip().rstrip("/"),
             token=self._token_edit.text().strip(),
             username=self._username_edit.text().strip(),
             password=self._password_edit.text(),
             verify_ssl=self._verify_ssl.isChecked(),
-            request_timeout_seconds=self._existing_settings.request_timeout_seconds,
-            max_download_mib=self._existing_settings.max_download_mib,
+            request_timeout_seconds=self._existing_profile.settings.request_timeout_seconds,
+            max_download_mib=self._existing_profile.settings.max_download_mib,
         )
-        missing = candidate.missing_fields()
+        missing = settings.missing_fields()
         if missing:
             QMessageBox.warning(self, "Missing Connection Details", f"Please provide: {', '.join(missing)}.")
             return
         try:
-            parse_connection(candidate.instance_url)
+            parse_connection(settings.instance_url)
         except TimelapseError as exc:
             QMessageBox.warning(self, "Invalid Protect URL", str(exc))
             return
-        self._result = candidate
+        self._result = _ConnectionProfile(
+            self._existing_profile.profile_id,
+            self._name_edit.text(),
+            settings,
+        ).normalized()
         super().accept()
 
-    def selected_settings(self) -> _ConnectionSettings:
+    def selected_profile(self) -> _ConnectionProfile:
         if self._result is None:
-            message = "connection settings were requested before the dialog was accepted"
+            message = "connection profile was requested before the dialog was accepted"
             raise RuntimeError(message)
         return self._result
 
@@ -594,6 +724,10 @@ class _DownloadWorker(QThread):
             loop.close()
             asyncio.set_event_loop(None)
 
+    @property
+    def config(self) -> Config:
+        return self._config
+
     def _report_progress(self, progress: DownloadProgress) -> None:
         self.progress_changed.emit(progress)
 
@@ -609,23 +743,39 @@ class _DownloadWorker(QThread):
 
 
 class _MainWindow(QMainWindow):
-    def __init__(self, settings: _ConnectionSettings, dotenv_path: Path) -> None:
+    def __init__(
+        self,
+        profile_state: _ProfileState | _ConnectionSettings,
+        profile_store: _ProfileStore | None = None,
+    ) -> None:
         super().__init__()
-        self._settings = settings
-        self._dotenv_path = dotenv_path
         self._preferences = QSettings("TimeLapse", "UniFi Protect Timelapse")
+        if isinstance(profile_state, _ConnectionSettings):
+            profile = _ConnectionProfile("test-profile", profile_state.instance_url, profile_state).normalized()
+            profile_state = _ProfileState((profile,), profile.profile_id)
+        self._profiles = list(profile_state.profiles)
+        self._selected_profile_id = profile_state.selected_profile_id
+        selected_profile = profile_state.selected_profile or (self._profiles[0] if self._profiles else None)
+        if selected_profile is None:
+            message = "the main window requires at least one connection profile"
+            raise ValueError(message)
+        self._selected_profile_id = selected_profile.profile_id
+        self._settings = selected_profile.settings
+        self._profile_store = profile_store
         self._cameras: list[CameraInfo] = []
         self._selected_cameras: list[CameraInfo] = []
         self._camera_loader: _CameraLoader | None = None
         self._open_camera_dialog_after_load = False
         self._workers: dict[_DownloadWorker, _DownloadEntry] = {}
+        self._entries: list[_DownloadEntry] = []
         self._reserved_paths: set[str] = set()
         self._next_job_number = 1
         self._closing = False
         self._log_handler_attached = False
         self.setWindowTitle("UniFi Protect Timelapse")
-        self.resize(1180, 720)
-        self.setMinimumSize(940, 600)
+        self.resize(1180, 680)
+        self.setMinimumSize(1100, 560)
+        self._install_styles()
         self._build_menu()
         self._build_interface()
         self._speed_timer = QTimer(self)
@@ -633,16 +783,19 @@ class _MainWindow(QMainWindow):
         self._speed_timer.timeout.connect(self._clear_stalled_speeds)
         self._speed_timer.start()
         self._install_log_handler()
-        self._update_connection_label()
+        self._update_profile_controls()
         self._update_camera_summary()
         self._update_activity_indicator()
         _LOGGER.info("Application ready")
 
     def _build_menu(self) -> None:
-        application_menu = self.menuBar().addMenu("&Application")
-        connection_action = QAction("Protect Connection…", self)
-        connection_action.triggered.connect(self._edit_connection)
-        application_menu.addAction(connection_action)
+        application_menu = self.menuBar().addMenu("&File")
+        new_profile_action = QAction("New Connection Profile…", self)
+        new_profile_action.triggered.connect(self._new_profile)
+        application_menu.addAction(new_profile_action)
+        edit_profile_action = QAction("Edit Connection Profile…", self)
+        edit_profile_action.triggered.connect(self._edit_connection)
+        application_menu.addAction(edit_profile_action)
         application_menu.addSeparator()
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self.close)
@@ -651,10 +804,10 @@ class _MainWindow(QMainWindow):
     def _build_interface(self) -> None:
         container = QWidget()
         layout = QVBoxLayout(container)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         layout.addWidget(self._connection_group())
         layout.addWidget(self._options_group())
-        layout.addWidget(self._downloads_group(), stretch=1)
-        layout.addWidget(self._logs_drawer())
+        layout.addWidget(self._downloads_group())
         self.setCentralWidget(container)
         self.statusBar().showMessage("Ready")
         self._activity_widget = QWidget()
@@ -671,33 +824,23 @@ class _MainWindow(QMainWindow):
         activity_layout.addWidget(self._activity_bar)
         self.statusBar().addPermanentWidget(self._activity_widget)
         self._logs_button = QPushButton("Logs")
-        self._logs_button.setCheckable(True)
-        self._logs_button.setToolTip("Show or hide application logs.")
-        self._logs_button.toggled.connect(self._toggle_logs)
+        self._logs_button.setToolTip("Open application logs in a separate window.")
+        self._logs_button.clicked.connect(self._show_logs)
         self.statusBar().addPermanentWidget(self._logs_button)
 
-    def _logs_drawer(self) -> QGroupBox:
-        drawer = QGroupBox("Application Logs")
-        layout = QVBoxLayout(drawer)
-        controls = QHBoxLayout()
-        controls.addStretch(1)
-        clear_button = QPushButton("Clear")
-        clear_button.clicked.connect(self._clear_logs)
-        controls.addWidget(clear_button)
-        layout.addLayout(controls)
-        self._log_output = QPlainTextEdit()
-        self._log_output.setReadOnly(True)
-        self._log_output.setMaximumBlockCount(_MAX_LOG_LINES)
-        self._log_output.setPlaceholderText("Application activity and errors will appear here.")
-        layout.addWidget(self._log_output)
-        drawer.setMaximumHeight(0)
-        drawer.setVisible(False)
-        self._log_drawer = drawer
-        self._log_animation = QPropertyAnimation(drawer, b"maximumHeight", self)
-        self._log_animation.setDuration(_LOG_ANIMATION_DURATION_MS)
-        self._log_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self._log_animation.finished.connect(self._finish_log_animation)
-        return drawer
+        self._logs_window = _LogsWindow()
+        self._logs_window.clear_button.clicked.connect(self._clear_logs)
+
+    def _install_styles(self) -> None:
+        self.setStyleSheet(
+            "QPushButton[primary='true'] { background: palette(highlight); color: palette(highlighted-text); "
+            "border: 1px solid palette(highlight); border-radius: 5px; padding: 5px 12px; }"
+            "QPushButton[primary='true']:disabled { background: palette(midlight); color: palette(disabled, text); "
+            "border-color: palette(mid); }"
+            "QGroupBox { border: 1px solid palette(mid); border-radius: 10px; margin-top: 9px; "
+            "padding: 12px 10px 10px; }"
+            "QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; font-weight: 600; }"
+        )
 
     def _install_log_handler(self) -> None:
         self._log_emitter = _LogEmitter(self)
@@ -716,56 +859,61 @@ class _MainWindow(QMainWindow):
 
     @Slot(str)
     def _append_log(self, message: str) -> None:
-        self._log_output.appendPlainText(message)
+        self._logs_window.output.appendPlainText(message)
 
     @Slot()
     def _clear_logs(self) -> None:
-        self._log_output.clear()
-
-    @Slot(bool)
-    def _toggle_logs(self, checked: object) -> None:
-        visible = bool(checked)
-        self._log_animation.stop()
-        if visible:
-            self._log_drawer.setVisible(True)
-        self._log_animation.setStartValue(self._log_drawer.maximumHeight())
-        self._log_animation.setEndValue(_LOG_DRAWER_HEIGHT if visible else 0)
-        self._log_animation.start()
+        self._logs_window.output.clear()
 
     @Slot()
-    def _finish_log_animation(self) -> None:
-        if not self._logs_button.isChecked():
-            self._log_drawer.setVisible(False)
+    def _show_logs(self) -> None:
+        self._logs_window.show_and_activate()
 
     def _update_activity_indicator(self) -> None:
         self._activity_widget.setVisible(self._camera_loader is not None or bool(self._workers))
 
     def _connection_group(self) -> QGroupBox:
-        group = QGroupBox("Protect Connection")
-        layout = QHBoxLayout(group)
+        group = QGroupBox("Connection")
+        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        layout = QVBoxLayout(group)
+        controls = QHBoxLayout()
+        self._profile_combo = QComboBox()
+        self._profile_combo.setMinimumWidth(220)
+        self._profile_combo.currentIndexChanged.connect(self._profile_selected)
+        controls.addWidget(self._profile_combo)
+        controls.addStretch(1)
+        new_button = QPushButton("New")
+        new_button.clicked.connect(self._new_profile)
+        controls.addWidget(new_button)
+        self._edit_profile_button = QPushButton("Edit")
+        self._edit_profile_button.clicked.connect(self._edit_connection)
+        controls.addWidget(self._edit_profile_button)
+        layout.addLayout(controls)
         self._connection_label = QLabel()
         self._connection_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self._connection_label, stretch=1)
-        edit_button = QPushButton("Edit Connection…")
-        edit_button.clicked.connect(self._edit_connection)
-        layout.addWidget(edit_button)
+        layout.addWidget(self._connection_label)
         return group
 
     def _options_group(self) -> QGroupBox:
         group = QGroupBox("New Timelapse")
-        form = QFormLayout(group)
+        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        outer = QHBoxLayout(group)
+        date_form = QFormLayout()
 
         now = QDateTime.currentDateTime()
         self._start_edit = self._date_time_editor(now.addDays(-1))
         self._end_edit = self._date_time_editor(now)
-        form.addRow("Start:", self._start_edit)
-        form.addRow("End:", self._end_edit)
+        date_form.addRow("Start:", self._start_edit)
+        date_form.addRow("End:", self._end_edit)
 
         self._speed_combo = QComboBox()
         self._speed_combo.addItems(list(SPEED_TO_FPS))
         self._speed_combo.setCurrentText("600x")
         self._speed_combo.setToolTip("Higher values create a faster timelapse.")
-        form.addRow("Speed:", self._speed_combo)
+        date_form.addRow("Speed:", self._speed_combo)
+        outer.addLayout(date_form)
+
+        details_form = QFormLayout()
 
         output_row = QWidget()
         output_layout = QHBoxLayout(output_row)
@@ -776,25 +924,31 @@ class _MainWindow(QMainWindow):
         browse_button = QPushButton("Choose…")
         browse_button.clicked.connect(self._choose_output_directory)
         output_layout.addWidget(browse_button)
-        form.addRow("Save to:", output_row)
+        details_form.addRow("Save to:", output_row)
 
         camera_row = QWidget()
         camera_layout = QHBoxLayout(camera_row)
         camera_layout.setContentsMargins(0, 0, 0, 0)
         self._camera_summary = QLabel()
-        camera_layout.addWidget(self._camera_summary, stretch=1)
-        self._select_cameras_button = QPushButton("Select Cameras…")
+        self._camera_summary.setMinimumWidth(150)
+        camera_layout.addWidget(self._camera_summary)
+        self._select_cameras_button = QPushButton("Select…")
         self._select_cameras_button.clicked.connect(self._request_camera_selection)
         camera_layout.addWidget(self._select_cameras_button)
-        self._refresh_cameras_button = QPushButton("Refresh")
+        self._refresh_cameras_button = QPushButton("↻")
+        self._refresh_cameras_button.setToolTip("Refresh cameras")
         self._refresh_cameras_button.clicked.connect(partial(self._load_cameras, open_dialog=True))
         camera_layout.addWidget(self._refresh_cameras_button)
-        form.addRow("Cameras:", camera_row)
+        camera_layout.addStretch(1)
+        details_form.addRow("Cameras:", camera_row)
 
         self._start_button = QPushButton("Start Downloads")
+        self._start_button.setProperty("primary", "true")
+        self._start_button.setMaximumWidth(180)
         self._start_button.setEnabled(False)
         self._start_button.clicked.connect(self._queue_downloads)
-        form.addRow("", self._start_button)
+        details_form.addRow("", self._start_button)
+        outer.addLayout(details_form, stretch=1)
         return group
 
     @staticmethod
@@ -809,20 +963,48 @@ class _MainWindow(QMainWindow):
     def _downloads_group(self) -> QGroupBox:
         group = QGroupBox("Downloads")
         layout = QVBoxLayout(group)
+        controls = QHBoxLayout()
+        self._clear_all_button = QPushButton("Clear All")
+        self._clear_all_button.setProperty("primary", "true")
+        self._clear_all_button.clicked.connect(self._clear_finished_jobs)
+        controls.addWidget(self._clear_all_button)
+        self._cancel_all_button = QPushButton("Cancel All")
+        self._cancel_all_button.setProperty("primary", "true")
+        self._cancel_all_button.clicked.connect(self._cancel_all_jobs)
+        controls.addWidget(self._cancel_all_button)
+        controls.addStretch(1)
+        layout.addLayout(controls)
+        self._empty_downloads = QLabel("No downloads yet\nSelect cameras and start a timelapse to track it here.")
+        self._empty_downloads.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_downloads.setMinimumHeight(58)
+        layout.addWidget(self._empty_downloads)
         self._downloads = QTableWidget(0, len(_TABLE_HEADERS))
+        self._downloads.setMinimumHeight(220)
         self._downloads.setHorizontalHeaderLabels(_TABLE_HEADERS)
         self._downloads.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._downloads.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self._downloads.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._downloads.setAlternatingRowColors(True)
         self._downloads.setSortingEnabled(False)
+        self._downloads.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._downloads.customContextMenuRequested.connect(self._show_job_context_menu)
+        self._downloads.cellDoubleClicked.connect(self._open_completed_video)
         self._downloads.verticalHeader().setVisible(False)
         header = self._downloads.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(_COLUMN_PROGRESS, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(_COLUMN_OUTPUT, QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self._downloads)
+        self._downloads_group_widget = group
+        self._sync_download_view()
+        self._update_bulk_buttons()
         return group
+
+    def _sync_download_view(self) -> None:
+        has_jobs = bool(self._entries)
+        self._empty_downloads.setVisible(not has_jobs)
+        self._downloads.setVisible(has_jobs)
+        self._downloads_group_widget.setMaximumHeight(16_777_215 if has_jobs else 145)
 
     def _saved_output_directory(self) -> str:
         saved = self._preferences.value("output_directory")
@@ -840,24 +1022,111 @@ class _MainWindow(QMainWindow):
         if self._camera_loader is not None:
             QMessageBox.information(self, "Loading Cameras", "Wait for the current camera refresh to finish.")
             return
-        dialog = _CredentialsDialog(self._settings, self._dotenv_path, first_run=False, parent=self)
+        profile = self._current_profile()
+        dialog = _CredentialsDialog(profile, first_run=False, new_profile=False, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        updated = dialog.selected_settings()
-        try:
-            _write_dotenv(self._dotenv_path, updated)
-        except OSError as exc:
-            QMessageBox.critical(self, "Could Not Save .env", _exception_text(exc))
+        updated = dialog.selected_profile()
+        previous_profiles = self._profiles
+        self._profiles = [updated if item.profile_id == updated.profile_id else item for item in self._profiles]
+        self._selected_profile_id = updated.profile_id
+        if not self._save_profiles():
+            self._profiles = previous_profiles
             return
-        self._settings = updated
+        self._settings = updated.settings
         self._cameras.clear()
         self._selected_cameras.clear()
-        self._update_connection_label()
+        self._update_profile_controls()
         self._update_camera_summary()
-        self.statusBar().showMessage("Connection settings saved", 5000)
-        _LOGGER.info("Protect connection settings saved")
+        self.statusBar().showMessage(f"Saved {updated.display_name}", 5000)
+        _LOGGER.info("Saved connection profile: %s", updated.display_name)
 
-    def _update_connection_label(self) -> None:
+    @Slot()
+    def _new_profile(self) -> None:
+        if self._camera_loader is not None:
+            QMessageBox.information(self, "Loading Cameras", "Wait for the current camera refresh to finish.")
+            return
+        blank = _ConnectionSettings(
+            instance_url="",
+            token="",
+            username="",
+            password="",
+            verify_ssl=True,
+            request_timeout_seconds=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            max_download_mib=DEFAULT_MAX_DOWNLOAD_MIB,
+        )
+        profile = _ConnectionProfile(str(uuid.uuid4()), "", blank)
+        dialog = _CredentialsDialog(profile, first_run=False, new_profile=True, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        created = dialog.selected_profile()
+        self._profiles.append(created)
+        self._selected_profile_id = created.profile_id
+        if not self._save_profiles():
+            self._profiles.remove(created)
+            return
+        self._settings = created.settings
+        self._cameras.clear()
+        self._selected_cameras.clear()
+        self._update_profile_controls()
+        self._update_camera_summary()
+        self.statusBar().showMessage(f"Saved {created.display_name}", 5000)
+        _LOGGER.info("Saved connection profile: %s", created.display_name)
+
+    @Slot(int)
+    def _profile_selected(self, index: int) -> None:
+        profile_id = self._profile_combo.itemData(index)
+        if not isinstance(profile_id, str) or profile_id == self._selected_profile_id:
+            return
+        if self._camera_loader is not None:
+            QMessageBox.information(self, "Loading Cameras", "Wait for the current camera refresh to finish.")
+            self._update_profile_controls()
+            return
+        profile = next((item for item in self._profiles if item.profile_id == profile_id), None)
+        if profile is None:
+            return
+        previous_id = self._selected_profile_id
+        self._selected_profile_id = profile_id
+        if not self._save_profiles():
+            self._selected_profile_id = previous_id
+            self._update_profile_controls()
+            return
+        self._settings = profile.settings
+        self._cameras.clear()
+        self._selected_cameras.clear()
+        self._update_profile_controls()
+        self._update_camera_summary()
+        self.statusBar().showMessage(f"Selected {profile.display_name}", 5000)
+        _LOGGER.info("Selected connection profile: %s", profile.display_name)
+
+    def _current_profile(self) -> _ConnectionProfile:
+        profile = next((item for item in self._profiles if item.profile_id == self._selected_profile_id), None)
+        if profile is None:
+            message = "the selected connection profile no longer exists"
+            raise RuntimeError(message)
+        return profile
+
+    def _save_profiles(self) -> bool:
+        if self._profile_store is None:
+            return True
+        try:
+            self._profile_store.save(_ProfileState(tuple(self._profiles), self._selected_profile_id))
+        except _ProfileStoreError as exc:
+            QMessageBox.critical(self, "Could Not Save Profiles", str(exc))
+            return False
+        return True
+
+    def _update_profile_controls(self) -> None:
+        previous_state = self._profile_combo.blockSignals(True)  # noqa: FBT003
+        self._profile_combo.clear()
+        selected_index = 0
+        for index, profile in enumerate(self._profiles):
+            self._profile_combo.addItem(profile.display_name, profile.profile_id)
+            if profile.profile_id == self._selected_profile_id:
+                selected_index = index
+        self._profile_combo.setCurrentIndex(selected_index)
+        self._profile_combo.blockSignals(previous_state)
+        self._edit_profile_button.setEnabled(bool(self._profiles))
         self._connection_label.setText(self._settings.instance_url)
         self._connection_label.setToolTip(_URL_TOOLTIP)
 
@@ -961,14 +1230,8 @@ class _MainWindow(QMainWindow):
             preferred = output_directory / default_output_path(config, camera).name
             output = self._reserve_output_path(preferred)
             worker = _DownloadWorker(config, camera, output, self)
-            entry = self._add_download_row(job_number, camera, output, worker)
-            self._workers[worker] = entry
-            worker.progress_changed.connect(partial(self._download_progress, entry))
-            worker.download_succeeded.connect(partial(self._download_succeeded, entry))
-            worker.download_failed.connect(partial(self._download_failed, entry))
-            worker.download_cancelled.connect(partial(self._download_cancelled, entry))
-            worker.finished.connect(partial(self._download_worker_finished, worker))
-            worker.start()
+            entry = self._add_download_row(job_number, camera, output, worker, config=config)
+            self._start_download_worker(entry, worker)
             _LOGGER.info("Started camera download: %s -> %s", camera.name, output)
         self._update_activity_indicator()
         self.statusBar().showMessage(f"Started job {job_number} with {len(self._selected_cameras)} downloads")
@@ -993,6 +1256,8 @@ class _MainWindow(QMainWindow):
         camera: CameraInfo,
         output: Path,
         worker: _DownloadWorker,
+        *,
+        config: Config | None = None,
     ) -> _DownloadEntry:
         row = self._downloads.rowCount()
         self._downloads.insertRow(row)
@@ -1018,7 +1283,32 @@ class _MainWindow(QMainWindow):
         cancel_button = QPushButton("Cancel")
         cancel_button.clicked.connect(partial(self._cancel_download, worker))
         self._downloads.setCellWidget(row, _COLUMN_ACTION, cancel_button)
-        return _DownloadEntry(row, output, camera.name, progress_bar, cancel_button)
+        entry = _DownloadEntry(
+            row=row,
+            job_number=job_number,
+            output=output,
+            camera=camera,
+            config=config or worker.config,
+            worker=worker,
+            progress_bar=progress_bar,
+            action_button=cancel_button,
+        )
+        self._entries.append(entry)
+        self._sync_download_view()
+        self._update_bulk_buttons()
+        return entry
+
+    def _start_download_worker(self, entry: _DownloadEntry, worker: _DownloadWorker) -> None:
+        entry.worker = worker
+        self._workers[worker] = entry
+        worker.progress_changed.connect(partial(self._download_progress, entry))
+        worker.download_succeeded.connect(partial(self._download_succeeded, entry))
+        worker.download_failed.connect(partial(self._download_failed, entry))
+        worker.download_cancelled.connect(partial(self._download_cancelled, entry))
+        worker.finished.connect(partial(self._download_worker_finished, worker))
+        worker.start()
+        self._update_activity_indicator()
+        self._update_bulk_buttons()
 
     def _cancel_download(self, worker: _DownloadWorker) -> None:
         entry = self._workers.get(worker)
@@ -1029,6 +1319,87 @@ class _MainWindow(QMainWindow):
         self._set_table_text(entry.row, _COLUMN_STATUS, "Cancelling…")
         _LOGGER.info("Cancelling camera download: %s", entry.camera_name)
         worker.cancel()
+        self._update_bulk_buttons()
+
+    @Slot()
+    def _cancel_all_jobs(self) -> None:
+        cancellable = [worker for worker, entry in self._workers.items() if not entry.terminal and not entry.cancelling]
+        for worker in cancellable:
+            self._cancel_download(worker)
+        if cancellable:
+            self.statusBar().showMessage(f"Cancelling {len(cancellable)} downloads…")
+
+    @Slot()
+    def _clear_finished_jobs(self) -> None:
+        removable = [entry for entry in self._entries if self._is_removable(entry)]
+        for entry in sorted(removable, key=lambda item: item.row, reverse=True):
+            self._remove_entry(entry)
+        if removable:
+            self.statusBar().showMessage(f"Cleared {len(removable)} finished downloads", 5000)
+            _LOGGER.info("Cleared %d finished downloads", len(removable))
+
+    def _update_bulk_buttons(self) -> None:
+        self._clear_all_button.setEnabled(any(self._is_removable(entry) for entry in self._entries))
+        self._cancel_all_button.setEnabled(
+            any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
+        )
+
+    def _is_removable(self, entry: _DownloadEntry) -> bool:
+        return entry.terminal and entry.worker not in self._workers
+
+    @Slot(QPoint)
+    def _show_job_context_menu(self, position: QPoint) -> None:
+        index = self._downloads.indexAt(position)
+        entry = self._entry_for_row(index.row())
+        if entry is None:
+            return
+        menu = QMenu(self)
+        if entry.completed:
+            open_action = menu.addAction("Open Video")
+            open_action.triggered.connect(partial(self._open_entry_video, entry))
+            show_action = menu.addAction("Show Folder")
+            show_action.triggered.connect(partial(self._show_output_folder, entry.output))
+        elif entry.terminal:
+            restart_action = menu.addAction("Restart")
+            restart_action.setEnabled(entry.worker not in self._workers)
+            restart_action.triggered.connect(partial(self._restart_download, entry))
+        else:
+            cancel_action = menu.addAction("Cancel")
+            cancel_action.setEnabled(not entry.cancelling)
+            cancel_action.triggered.connect(partial(self._cancel_download, entry.worker))
+        menu.addSeparator()
+        remove_action = menu.addAction("Remove from List")
+        remove_action.setEnabled(self._is_removable(entry))
+        remove_action.triggered.connect(partial(self._remove_entry, entry))
+        menu.exec(self._downloads.viewport().mapToGlobal(position))
+
+    @Slot(int, int)
+    def _open_completed_video(self, row: int, _column: int) -> None:
+        entry = self._entry_for_row(row)
+        if entry is not None and entry.completed:
+            self._open_entry_video(entry)
+
+    def _open_entry_video(self, entry: _DownloadEntry) -> None:
+        if not entry.output.is_file():
+            QMessageBox.warning(self, "Video Not Found", f"The completed video could not be found at {entry.output}.")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(entry.output)))
+
+    def _entry_for_row(self, row: int) -> _DownloadEntry | None:
+        return next((entry for entry in self._entries if entry.row == row), None)
+
+    def _remove_entry(self, entry: _DownloadEntry) -> None:
+        if not self._is_removable(entry):
+            return
+        removed_row = entry.row
+        self._downloads.removeRow(removed_row)
+        self._entries.remove(entry)
+        for remaining in self._entries:
+            if remaining.row > removed_row:
+                remaining.row -= 1
+        self._sync_download_view()
+        self._update_bulk_buttons()
+        self.statusBar().showMessage(f"Removed {entry.camera_name} from the download list", 5000)
 
     def _download_progress(self, entry: _DownloadEntry, payload: object) -> None:
         if entry.terminal or not isinstance(payload, DownloadProgress):
@@ -1065,6 +1436,7 @@ class _MainWindow(QMainWindow):
 
     def _download_succeeded(self, entry: _DownloadEntry, _output_text: str) -> None:
         entry.terminal = True
+        entry.completed = True
         self._set_table_text(entry.row, _COLUMN_STATUS, "Completed")
         with suppress(OSError):
             entry.downloaded_bytes = entry.output.stat().st_size
@@ -1072,47 +1444,89 @@ class _MainWindow(QMainWindow):
         entry.progress_bar.setRange(0, _PROGRESS_SCALE)
         entry.progress_bar.setValue(_PROGRESS_SCALE)
         entry.progress_bar.setFormat("100%")
-        self._replace_action_with_show_folder(entry)
+        self._set_action_button(entry, "Show", partial(self._show_output_folder, entry.output))
+        self._update_bulk_buttons()
         _LOGGER.info("Completed camera download: %s -> %s", entry.camera_name, entry.output)
 
     def _download_failed(self, entry: _DownloadEntry, message: str) -> None:
         entry.terminal = True
+        entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
         self._set_table_text(entry.row, _COLUMN_STATUS, "Failed", tooltip=message)
         self._set_table_text(entry.row, _COLUMN_SPEED, "—")
-        entry.action_button.setText("Failed")
-        entry.action_button.setEnabled(False)
+        self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
+        self._update_bulk_buttons()
         _LOGGER.error("Camera download failed for %s: %s", entry.camera_name, message)
 
     def _download_cancelled(self, entry: _DownloadEntry) -> None:
         entry.terminal = True
+        entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
         self._set_table_text(entry.row, _COLUMN_STATUS, "Cancelled")
         self._set_table_text(entry.row, _COLUMN_SPEED, "—")
-        entry.action_button.setText("Cancelled")
-        entry.action_button.setEnabled(False)
+        self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
+        self._update_bulk_buttons()
         _LOGGER.info("Camera download cancelled: %s", entry.camera_name)
 
-    def _replace_action_with_show_folder(self, entry: _DownloadEntry) -> None:
+    def _set_action_button(
+        self,
+        entry: _DownloadEntry,
+        text: str,
+        callback: Callable[[], None],
+        *,
+        enabled: bool = True,
+    ) -> None:
         old_widget = self._downloads.cellWidget(entry.row, _COLUMN_ACTION)
         if old_widget is not None:
             old_widget.deleteLater()
-        show_button = QPushButton("Show Folder")
-        show_button.clicked.connect(partial(self._show_output_folder, entry.output))
-        self._downloads.setCellWidget(entry.row, _COLUMN_ACTION, show_button)
-        entry.action_button = show_button
+        button = QPushButton(text)
+        button.clicked.connect(callback)
+        button.setEnabled(enabled)
+        self._downloads.setCellWidget(entry.row, _COLUMN_ACTION, button)
+        entry.action_button = button
+
+    def _restart_download(self, entry: _DownloadEntry) -> None:
+        if not entry.terminal or entry.completed or entry.worker in self._workers:
+            return
+        if entry.output.exists():
+            QMessageBox.warning(
+                self,
+                "Output Already Exists",
+                f"Move or remove {entry.output.name} before restarting this job.",
+            )
+            return
+        self._reserved_paths.add(self._reservation_key(entry.output))
+        entry.terminal = False
+        entry.cancelling = False
+        entry.completed = False
+        entry.downloaded_bytes = 0
+        entry.last_progress_at = None
+        self._set_table_text(entry.row, _COLUMN_STATUS, "Preparing export…", tooltip="")
+        self._set_table_text(entry.row, _COLUMN_DOWNLOADED, "0 bytes")
+        self._set_table_text(entry.row, _COLUMN_EXPECTED, "Unknown")
+        self._set_table_text(entry.row, _COLUMN_SPEED, "—")
+        entry.progress_bar.setRange(0, 0)
+        entry.progress_bar.setFormat("")
+        worker = _DownloadWorker(entry.config, entry.camera, entry.output, self)
+        self._set_action_button(entry, "Cancel", partial(self._cancel_download, worker))
+        self._start_download_worker(entry, worker)
+        self.statusBar().showMessage(f"Restarted download for {entry.camera_name}", 5000)
+        _LOGGER.info("Restarted camera download: %s -> %s", entry.camera_name, entry.output)
 
     @staticmethod
     def _show_output_folder(output: Path) -> None:
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(output.parent)))
 
     def _download_worker_finished(self, worker: _DownloadWorker) -> None:
-        self._workers.pop(worker, None)
+        entry = self._workers.pop(worker, None)
         worker.deleteLater()
+        if entry is not None and entry.terminal and not entry.completed:
+            entry.action_button.setEnabled(True)
         active_count = len(self._workers)
         message = "Ready" if active_count == 0 else f"{active_count} downloads active"
         self.statusBar().showMessage(message)
         self._update_activity_indicator()
+        self._update_bulk_buttons()
         self._finish_close_if_ready()
 
     def _set_table_text(self, row: int, column: int, text: str, *, tooltip: str | None = None) -> None:
@@ -1133,6 +1547,7 @@ class _MainWindow(QMainWindow):
         has_background_work = self._camera_loader is not None or bool(self._workers)
         if not has_background_work:
             self._preferences.setValue("output_directory", self._output_edit.text())
+            self._logs_window.close()
             _LOGGER.info("Application closed")
             self._remove_log_handler()
             event.accept()
@@ -1161,20 +1576,76 @@ class _MainWindow(QMainWindow):
         event.ignore()
 
 
-def _initial_settings(dotenv_path: Path) -> tuple[_ConnectionSettings | None, int]:
+def _initial_profiles(dotenv_path: Path, store: _ProfileStore) -> tuple[_ProfileState | None, int]:  # noqa: PLR0911
+    try:
+        state = store.load()
+    except _ProfileStoreError as exc:
+        QMessageBox.critical(None, "Could Not Read Profiles", str(exc))
+        return None, 1
+    if state.profiles:
+        _remove_legacy_dotenv(dotenv_path)
+        return state, 0
+
     settings = _environment_settings(dotenv_path)
-    if dotenv_path.is_file() and not _settings_need_prompt(settings):
-        return settings, 0
-    dialog = _CredentialsDialog(settings, dotenv_path, first_run=not dotenv_path.is_file(), parent=None)
+    if not _settings_need_prompt(settings):
+        profile = _ConnectionProfile(str(uuid.uuid4()), settings.instance_url, settings).normalized()
+        state = _ProfileState((profile,), profile.profile_id)
+        try:
+            store.save(state)
+        except _ProfileStoreError as exc:
+            QMessageBox.critical(None, "Could Not Save Profile", str(exc))
+            return None, 1
+        _remove_legacy_dotenv(dotenv_path)
+        return state, 0
+
+    blank_profile = _ConnectionProfile(str(uuid.uuid4()), "", settings)
+    dialog = _CredentialsDialog(
+        blank_profile,
+        first_run=True,
+        new_profile=True,
+        parent=None,
+    )
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None, 0
-    settings = dialog.selected_settings()
+    profile = dialog.selected_profile()
+    state = _ProfileState((profile,), profile.profile_id)
     try:
-        _write_dotenv(dotenv_path, settings)
-    except OSError as exc:
-        QMessageBox.critical(None, "Could Not Save .env", _exception_text(exc))
+        store.save(state)
+    except _ProfileStoreError as exc:
+        QMessageBox.critical(None, "Could Not Save Profile", str(exc))
         return None, 1
-    return settings, 0
+    _remove_legacy_dotenv(dotenv_path)
+    return state, 0
+
+
+def _remove_legacy_dotenv(dotenv_path: Path) -> None:
+    # A source checkout shares its cwd .env with the CLI, so only remove the
+    # GUI-owned application-data file created by an older bundled release.
+    if not _is_bundled() or not dotenv_path.is_file():
+        return
+    try:
+        dotenv_path.unlink()
+    except OSError as exc:
+        QMessageBox.warning(
+            None,
+            "Legacy Credential File",
+            f"Profiles are stored securely, but the old plaintext file could not be removed: {_exception_text(exc)}",
+        )
+
+
+def _is_supported_gui_platform() -> bool:
+    return os.name == "nt" or sys.platform.startswith("linux")
+
+
+def _configure_platform_keyring() -> None:
+    if os.name == "nt":
+        from keyring.backends.Windows import WinVaultKeyring  # noqa: PLC0415
+
+        keyring.set_keyring(WinVaultKeyring())
+    elif sys.platform.startswith("linux"):
+        from keyring.backends.SecretService import Keyring as SecretServiceKeyring  # noqa: PLC0415
+
+        keyring.set_keyring(SecretServiceKeyring())
 
 
 def main() -> int:
@@ -1185,11 +1656,20 @@ def main() -> int:
     icon_path = _application_icon_path()
     if icon_path.is_file():
         app.setWindowIcon(QIcon(str(icon_path)))
+    if not _is_supported_gui_platform():
+        QMessageBox.critical(
+            None,
+            "Unsupported Platform",
+            "The Qt interface supports Windows and Linux. Use the native SwiftUI application on macOS.",
+        )
+        return 1
+    _configure_platform_keyring()
     dotenv_path = _application_dotenv_path()
-    settings, exit_code = _initial_settings(dotenv_path)
-    if settings is None:
+    profile_store = _ProfileStore()
+    profile_state, exit_code = _initial_profiles(dotenv_path, profile_store)
+    if profile_state is None:
         return exit_code
-    window = _MainWindow(settings, dotenv_path)
+    window = _MainWindow(profile_state, profile_store=profile_store)
     window.show()
     return app.exec()
 

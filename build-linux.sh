@@ -40,6 +40,7 @@ pyinstaller_args=(
     --collect-submodules uiprotect.data
     --collect-submodules uiprotect.devices
     --collect-submodules uiprotect.events
+    --hidden-import keyring.backends.SecretService
     --add-data "${DEFAULT_ICON}:timelapse_assets"
     --icon "${ICON_PATH}"
 )
