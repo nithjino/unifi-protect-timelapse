@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     QObject,
     QPropertyAnimation,
     QSettings,
+    QStandardPaths,
     Qt,
     QThread,
     QTimer,
@@ -105,6 +106,7 @@ _STALE_SPEED_SECONDS = 2.0
 _LOG_ANIMATION_DURATION_MS = 180
 _LOG_DRAWER_HEIGHT = 220
 _MAX_LOG_LINES = 2000
+_APPLICATION_DIRECTORY_NAME = "TimeLapse"
 _MINIMUM_DATE = QDateTime.fromString("2000-01-01T00:00:00", Qt.DateFormat.ISODate)
 _TABLE_HEADERS = ("Job", "Camera", "Status", "Progress", "Downloaded", "Expected", "Speed", "Output", "Action")
 _COLUMN_JOB = 0
@@ -183,6 +185,36 @@ class _QtLogHandler(logging.Handler):
             self._emitter.message_ready.emit(self.format(record))
         except Exception:
             self.handleError(record)
+
+
+def _is_bundled() -> bool:
+    return bool(getattr(sys, "frozen", False))
+
+
+def _application_data_directory() -> Path:
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / _APPLICATION_DIRECTORY_NAME
+    if os.name == "nt":
+        app_data = os.environ.get("APPDATA")
+        base_directory = Path(app_data) if app_data else Path.home() / "AppData" / "Roaming"
+        return base_directory / _APPLICATION_DIRECTORY_NAME
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    base_directory = Path(config_home) if config_home else Path.home() / ".config"
+    return base_directory / _APPLICATION_DIRECTORY_NAME
+
+
+def _application_dotenv_path() -> Path:
+    if _is_bundled():
+        return _application_data_directory() / ".env"
+    return Path.cwd() / ".env"
+
+
+def _default_output_directory() -> Path:
+    if not _is_bundled():
+        return Path.cwd()
+    movies_directory = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation)
+    base_directory = Path(movies_directory) if movies_directory else Path.home()
+    return base_directory / _APPLICATION_DIRECTORY_NAME
 
 
 def _environment_settings(dotenv_path: Path) -> _ConnectionSettings:
@@ -785,7 +817,7 @@ class _MainWindow(QMainWindow):
 
     def _saved_output_directory(self) -> str:
         saved = self._preferences.value("output_directory")
-        return saved if isinstance(saved, str) and saved else str(Path.cwd())
+        return saved if isinstance(saved, str) and saved else str(_default_output_directory())
 
     @Slot()
     def _choose_output_directory(self) -> None:
@@ -1141,7 +1173,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("UniFi Protect Timelapse")
     app.setOrganizationName("TimeLapse")
-    dotenv_path = Path.cwd() / ".env"
+    dotenv_path = _application_dotenv_path()
     settings, exit_code = _initial_settings(dotenv_path)
     if settings is None:
         return exit_code

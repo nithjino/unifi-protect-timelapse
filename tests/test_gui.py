@@ -117,6 +117,20 @@ def test_activity_indicator_tracks_background_work(
     assert main_window._activity_widget.isHidden() is True
 
 
+def test_source_and_bundled_apps_use_appropriate_writable_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delattr(gui_module.sys, "frozen", raising=False)
+    assert gui_module._application_dotenv_path() == tmp_path / ".env"
+    assert gui_module._default_output_directory() == tmp_path
+
+    monkeypatch.setattr(gui_module.sys, "frozen", True, raising=False)
+    assert gui_module._application_dotenv_path() == gui_module._application_data_directory() / ".env"
+    assert gui_module._default_output_directory().name == gui_module._APPLICATION_DIRECTORY_NAME
+
+
 def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _REQUIRED_ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
