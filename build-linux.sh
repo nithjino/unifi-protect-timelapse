@@ -7,6 +7,8 @@ DIST_DIR="${ROOT_DIR}/dist/linux"
 WORK_DIR="${ROOT_DIR}/build/pyinstaller-linux"
 SPEC_DIR="${WORK_DIR}/spec"
 ENTRY_POINT="${ROOT_DIR}/timelapse/gui.py"
+DEFAULT_ICON="${ROOT_DIR}/assets/icons/timelapse.png"
+ICON_PATH="${TIMELAPSE_ICON:-${DEFAULT_ICON}}"
 ARTIFACT="${DIST_DIR}/timelapse"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -38,14 +40,17 @@ pyinstaller_args=(
     --collect-submodules uiprotect.data
     --collect-submodules uiprotect.devices
     --collect-submodules uiprotect.events
+    --add-data "${DEFAULT_ICON}:timelapse_assets"
+    --icon "${ICON_PATH}"
 )
 
-if [[ -n "${TIMELAPSE_ICON:-}" ]]; then
-    if [[ ! -f "${TIMELAPSE_ICON}" ]]; then
-        echo "Error: TIMELAPSE_ICON does not exist: ${TIMELAPSE_ICON}" >&2
-        exit 1
-    fi
-    pyinstaller_args+=(--icon "${TIMELAPSE_ICON}")
+if [[ ! -f "${DEFAULT_ICON}" ]]; then
+    echo "Error: bundled application icon does not exist: ${DEFAULT_ICON}" >&2
+    exit 1
+fi
+if [[ ! -f "${ICON_PATH}" ]]; then
+    echo "Error: Linux icon does not exist: ${ICON_PATH}" >&2
+    exit 1
 fi
 
 echo "Building Linux timelapse executable..."
@@ -57,8 +62,10 @@ if [[ ! -f "${ARTIFACT}" ]]; then
 fi
 
 chmod +x "${ARTIFACT}"
+install -m 644 "${DEFAULT_ICON}" "${DIST_DIR}/timelapse.png"
 
 echo
 echo "Build complete: ${ARTIFACT}"
+echo "Launcher icon: ${DIST_DIR}/timelapse.png"
 echo "The executable contains Python, Qt, and all runtime dependencies."
 echo "Build on the oldest Linux distribution you intend to support for the widest glibc compatibility."

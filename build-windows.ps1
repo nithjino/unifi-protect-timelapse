@@ -10,6 +10,9 @@ $DistDir = Join-Path $RootDir "dist\windows"
 $WorkDir = Join-Path $RootDir "build\pyinstaller-windows"
 $SpecDir = Join-Path $WorkDir "spec"
 $EntryPoint = Join-Path $RootDir "timelapse\gui.py"
+$DefaultIcon = Join-Path $RootDir "assets\icons\timelapse.ico"
+$RuntimeIcon = Join-Path $RootDir "assets\icons\timelapse.png"
+$IconPath = if ($env:TIMELAPSE_ICON) { $env:TIMELAPSE_ICON } else { $DefaultIcon }
 $Artifact = Join-Path $DistDir "timelapse.exe"
 
 if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
@@ -38,14 +41,16 @@ $PyInstallerArgs = @(
     "--paths", $RootDir,
     "--collect-submodules", "uiprotect.data",
     "--collect-submodules", "uiprotect.devices",
-    "--collect-submodules", "uiprotect.events"
+    "--collect-submodules", "uiprotect.events",
+    "--add-data", "${RuntimeIcon};timelapse_assets",
+    "--icon", $IconPath
 )
 
-if ($env:TIMELAPSE_ICON) {
-    if (-not (Test-Path -PathType Leaf $env:TIMELAPSE_ICON)) {
-        throw "TIMELAPSE_ICON does not exist: $env:TIMELAPSE_ICON"
-    }
-    $PyInstallerArgs += @("--icon", $env:TIMELAPSE_ICON)
+if (-not (Test-Path -PathType Leaf $RuntimeIcon)) {
+    throw "Bundled application icon does not exist: $RuntimeIcon"
+}
+if (-not (Test-Path -PathType Leaf $IconPath)) {
+    throw "Windows icon does not exist: $IconPath"
 }
 
 $PyInstallerArgs += $EntryPoint

@@ -32,7 +32,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -107,6 +107,8 @@ _LOG_ANIMATION_DURATION_MS = 180
 _LOG_DRAWER_HEIGHT = 220
 _MAX_LOG_LINES = 2000
 _APPLICATION_DIRECTORY_NAME = "TimeLapse"
+_ICON_BUNDLE_DIRECTORY = "timelapse_assets"
+_ICON_FILENAME = "timelapse.png"
 _MINIMUM_DATE = QDateTime.fromString("2000-01-01T00:00:00", Qt.DateFormat.ISODate)
 _TABLE_HEADERS = ("Job", "Camera", "Status", "Progress", "Downloaded", "Expected", "Speed", "Output", "Action")
 _COLUMN_JOB = 0
@@ -189,6 +191,13 @@ class _QtLogHandler(logging.Handler):
 
 def _is_bundled() -> bool:
     return bool(getattr(sys, "frozen", False))
+
+
+def _application_icon_path() -> Path:
+    bundle_directory = getattr(sys, "_MEIPASS", None)
+    if isinstance(bundle_directory, str):
+        return Path(bundle_directory) / _ICON_BUNDLE_DIRECTORY / _ICON_FILENAME
+    return Path(__file__).resolve().parent.parent / "assets" / "icons" / _ICON_FILENAME
 
 
 def _application_data_directory() -> Path:
@@ -1173,6 +1182,9 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("UniFi Protect Timelapse")
     app.setOrganizationName("TimeLapse")
+    icon_path = _application_icon_path()
+    if icon_path.is_file():
+        app.setWindowIcon(QIcon(str(icon_path)))
     dotenv_path = _application_dotenv_path()
     settings, exit_code = _initial_settings(dotenv_path)
     if settings is None:

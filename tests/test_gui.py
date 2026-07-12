@@ -131,6 +131,19 @@ def test_source_and_bundled_apps_use_appropriate_writable_paths(
     assert gui_module._default_output_directory().name == gui_module._APPLICATION_DIRECTORY_NAME
 
 
+def test_application_icon_path_supports_source_and_bundled_apps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delattr(gui_module.sys, "_MEIPASS", raising=False)
+    source_icon = gui_module._application_icon_path()
+    assert source_icon.name == "timelapse.png"
+    assert source_icon.is_file()
+
+    monkeypatch.setattr(gui_module.sys, "_MEIPASS", str(tmp_path), raising=False)
+    assert gui_module._application_icon_path() == tmp_path / "timelapse_assets" / "timelapse.png"
+
+
 def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in _REQUIRED_ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
