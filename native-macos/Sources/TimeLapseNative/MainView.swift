@@ -127,7 +127,7 @@ struct MainView: View {
         VStack(alignment: .leading, spacing: 11) {
             Label("New Timelapse", systemImage: "timelapse")
                 .font(.headline)
-            HStack(alignment: .top, spacing: 18) {
+            HStack(alignment: .top, spacing: 13) {
                 Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 9) {
                     GridRow {
                         Text("Start").foregroundStyle(.secondary)
