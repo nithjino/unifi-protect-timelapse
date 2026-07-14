@@ -71,8 +71,9 @@ def main_window(
     return window
 
 
-def _table_text(window: gui_module._MainWindow, row: int, column: int) -> str:
-    item = window._downloads.item(row, column)
+def _entry_text(window: gui_module._MainWindow, entry: gui_module._DownloadEntry, column: int) -> str:
+    table = window._daily_automations if entry.daily_schedule else window._downloads
+    item = table.item(entry.row, column)
     assert item is not None
     return item.text()
 
@@ -107,12 +108,16 @@ def test_daily_schedule_adds_list_row_and_daily_downloads(
 
     main_window._run_daily_schedule_if_due()
 
-    assert _table_text(main_window, schedule_entry.row, gui_module._COLUMN_STATUS) == "Scheduled daily"
+    assert main_window._job_tabs.tabText(0) == "Downloads"
+    assert main_window._job_tabs.tabText(1) == "Daily Automations"
+    assert main_window._daily_automations.rowCount() == 1
+    assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Scheduled daily"
     assert len(started) == 1
     assert started[0].output.name.startswith("daily_timelapse_Front_Door_")
+    assert main_window._downloads.rowCount() == 1
 
     main_window._stop_daily_schedule()
-    assert _table_text(main_window, schedule_entry.row, gui_module._COLUMN_STATUS) == "Stopped"
+    assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Stopped"
 
 
 def test_logs_button_opens_separate_window_and_displays_logs(
@@ -370,10 +375,10 @@ def test_progress_row_shows_known_and_unknown_totals(
         ),
     )
 
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_STATUS) == "Downloading"
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_DOWNLOADED) == "1.5 KiB"
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_EXPECTED) == "4.0 KiB"
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_SPEED) == "2.0 KiB/s"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_STATUS) == "Downloading"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_DOWNLOADED) == "1.5 KiB"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_EXPECTED) == "4.0 KiB"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_SPEED) == "2.0 KiB/s"
     assert entry.progress_bar.minimum() == 0
     assert entry.progress_bar.maximum() == gui_module._PROGRESS_SCALE
     assert entry.progress_bar.value() == 375
@@ -389,9 +394,9 @@ def test_progress_row_shows_known_and_unknown_totals(
         ),
     )
 
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_DOWNLOADED) == "2.0 KiB"
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_EXPECTED) == "Unknown"
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_SPEED) == "1.0 KiB/s"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_DOWNLOADED) == "2.0 KiB"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_EXPECTED) == "Unknown"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_SPEED) == "1.0 KiB/s"
     assert entry.progress_bar.minimum() == 0
     assert entry.progress_bar.maximum() == 0
 
@@ -417,7 +422,38 @@ def test_stalled_download_speed_falls_to_zero(
     main_window._clear_stalled_speeds()
     main_window._workers.clear()
 
-    assert _table_text(main_window, entry.row, gui_module._COLUMN_SPEED) == "0 bytes/s"
+    assert _entry_text(main_window, entry, gui_module._COLUMN_SPEED) == "0 bytes/s"
+
+
+def test_bulk_controls_only_affect_the_active_job_tab(
+    main_window: gui_module._MainWindow,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
+    download_entry = main_window._add_download_row(1, camera, tmp_path / "active.mp4", worker)
+    main_window._workers[worker] = download_entry
+    schedule_entry = main_window._add_daily_schedule_row((camera,), tmp_path)
+    main_window._daily_schedule = gui_module._DailySchedule((camera,), tmp_path, "600x", schedule_entry)
+
+    main_window._job_tabs.setCurrentIndex(0)
+    main_window._update_bulk_buttons()
+    assert main_window._cancel_all_button.text() == "Cancel All"
+    main_window._cancel_all_jobs()
+    assert download_entry.cancelling is True
+    assert main_window._daily_schedule is not None
+
+    main_window._job_tabs.setCurrentIndex(1)
+    assert main_window._cancel_all_button.text() == "Stop All"
+    main_window._cancel_all_jobs()
+    assert main_window._daily_schedule is None
+    assert schedule_entry.terminal is True
+    main_window._workers.clear()
 
 
 def test_bulk_download_controls_preserve_active_rows(
@@ -495,6 +531,6 @@ def test_double_click_completed_job_opens_video(
     opened: list[str] = []
     monkeypatch.setattr(gui_module.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
 
-    main_window._open_completed_video(entry.row, gui_module._COLUMN_CAMERA)
+    main_window._open_completed_video(main_window._downloads, entry.row, gui_module._COLUMN_CAMERA)
 
     assert opened == [str(output)]

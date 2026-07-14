@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -1103,7 +1104,7 @@ class _MainWindow(QMainWindow):
             self._adjusting_full_day = False
 
     def _downloads_group(self) -> QGroupBox:
-        group = QGroupBox("Downloads")
+        group = QGroupBox("Jobs")
         layout = QVBoxLayout(group)
         controls = QHBoxLayout()
         self._clear_all_button = QPushButton("Clear All")
@@ -1116,37 +1117,73 @@ class _MainWindow(QMainWindow):
         controls.addWidget(self._cancel_all_button)
         controls.addStretch(1)
         layout.addLayout(controls)
-        self._empty_downloads = QLabel("No downloads yet\nSelect cameras and start a timelapse to track it here.")
-        self._empty_downloads.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._empty_downloads.setMinimumHeight(58)
-        layout.addWidget(self._empty_downloads)
-        self._downloads = QTableWidget(0, len(_TABLE_HEADERS))
-        self._downloads.setMinimumHeight(220)
-        self._downloads.setHorizontalHeaderLabels(_TABLE_HEADERS)
-        self._downloads.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._downloads.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._downloads.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self._downloads.setAlternatingRowColors(True)
-        self._downloads.setSortingEnabled(False)
-        self._downloads.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._downloads.customContextMenuRequested.connect(self._show_job_context_menu)
-        self._downloads.cellDoubleClicked.connect(self._open_completed_video)
-        self._downloads.verticalHeader().setVisible(False)
-        header = self._downloads.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(_COLUMN_PROGRESS, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(_COLUMN_OUTPUT, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self._downloads)
+
+        self._job_tabs = QTabWidget()
+        downloads_page, self._empty_downloads, self._downloads = self._job_list_page(
+            "No downloads yet\nSelect cameras and start a timelapse to track it here."
+        )
+        automations_page, self._empty_daily_automations, self._daily_automations = self._job_list_page(
+            "No daily automations\nEnable daily automatic timelapses to track the schedule here."
+        )
+        self._job_tabs.addTab(downloads_page, "Downloads")
+        self._job_tabs.addTab(automations_page, "Daily Automations")
+        self._job_tabs.currentChanged.connect(self._job_tab_changed)
+        layout.addWidget(self._job_tabs)
+
         self._downloads_group_widget = group
         self._sync_download_view()
         self._update_bulk_buttons()
         return group
 
+    def _job_list_page(self, empty_message: str) -> tuple[QWidget, QLabel, QTableWidget]:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        empty_label = QLabel(empty_message)
+        empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_label.setMinimumHeight(58)
+        layout.addWidget(empty_label)
+
+        table = QTableWidget(0, len(_TABLE_HEADERS))
+        table.setMinimumHeight(220)
+        table.setHorizontalHeaderLabels(_TABLE_HEADERS)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(False)
+        table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        table.customContextMenuRequested.connect(partial(self._show_job_context_menu, table))
+        table.cellDoubleClicked.connect(partial(self._open_completed_video, table))
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(_COLUMN_PROGRESS, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(_COLUMN_OUTPUT, QHeaderView.ResizeMode.Stretch)
+        layout.addWidget(table)
+        return page, empty_label, table
+
+    @Slot(int)
+    def _job_tab_changed(self, _index: int) -> None:
+        self._sync_download_view()
+        self._update_bulk_buttons()
+
     def _sync_download_view(self) -> None:
-        has_jobs = bool(self._entries)
-        self._empty_downloads.setVisible(not has_jobs)
-        self._downloads.setVisible(has_jobs)
-        self._downloads_group_widget.setMaximumHeight(16_777_215 if has_jobs else 145)
+        has_downloads = any(not entry.daily_schedule for entry in self._entries)
+        has_daily_automations = any(entry.daily_schedule for entry in self._entries)
+        self._empty_downloads.setVisible(not has_downloads)
+        self._downloads.setVisible(has_downloads)
+        self._empty_daily_automations.setVisible(not has_daily_automations)
+        self._daily_automations.setVisible(has_daily_automations)
+        active_tab_has_jobs = has_daily_automations if self._shows_daily_automations else has_downloads
+        self._downloads_group_widget.setMaximumHeight(16_777_215 if active_tab_has_jobs else 180)
+
+    @property
+    def _shows_daily_automations(self) -> bool:
+        return self._job_tabs.currentIndex() == 1
+
+    def _visible_entries(self) -> list[_DownloadEntry]:
+        return [entry for entry in self._entries if entry.daily_schedule == self._shows_daily_automations]
 
     def _saved_output_directory(self) -> str:
         saved = self._preferences.value("output_directory")
@@ -1410,8 +1447,8 @@ class _MainWindow(QMainWindow):
             state=None,
             model=None,
         )
-        row = self._downloads.rowCount()
-        self._downloads.insertRow(row)
+        row = self._daily_automations.rowCount()
+        self._daily_automations.insertRow(row)
         values = {
             _COLUMN_JOB: str(self._next_job_number),
             _COLUMN_CAMERA: camera.name,
@@ -1426,15 +1463,15 @@ class _MainWindow(QMainWindow):
             item = QTableWidgetItem(value)
             if column == _COLUMN_OUTPUT:
                 item.setToolTip(str(output_directory))
-            self._downloads.setItem(row, column, item)
+            self._daily_automations.setItem(row, column, item)
         progress_bar = QProgressBar()
         progress_bar.setRange(0, 1)
         progress_bar.setValue(0)
         progress_bar.setFormat("Daily")
-        self._downloads.setCellWidget(row, _COLUMN_PROGRESS, progress_bar)
+        self._daily_automations.setCellWidget(row, _COLUMN_PROGRESS, progress_bar)
         stop_button = QPushButton("Stop")
         stop_button.clicked.connect(self._stop_daily_schedule)
-        self._downloads.setCellWidget(row, _COLUMN_ACTION, stop_button)
+        self._daily_automations.setCellWidget(row, _COLUMN_ACTION, stop_button)
         entry = _DownloadEntry(
             row=row,
             job_number=self._next_job_number - 1,
@@ -1458,7 +1495,7 @@ class _MainWindow(QMainWindow):
             return
         self._daily_schedule = None
         schedule.entry.terminal = True
-        self._set_table_text(schedule.entry.row, _COLUMN_STATUS, "Stopped")
+        self._set_entry_text(schedule.entry, _COLUMN_STATUS, "Stopped")
         self._set_action_button(schedule.entry, "Remove", partial(self._remove_entry, schedule.entry))
         self._set_daily_checkbox(checked=False)
         self._update_bulk_buttons()
@@ -1602,43 +1639,49 @@ class _MainWindow(QMainWindow):
             return
         entry.cancelling = True
         entry.action_button.setEnabled(False)
-        self._set_table_text(entry.row, _COLUMN_STATUS, "Cancelling…")
+        self._set_entry_text(entry, _COLUMN_STATUS, "Cancelling…")
         _LOGGER.info("Cancelling camera download: %s", entry.camera_name)
         worker.cancel()
         self._update_bulk_buttons()
 
     @Slot()
     def _cancel_all_jobs(self) -> None:
+        if self._shows_daily_automations:
+            if self._daily_schedule is not None:
+                self._stop_daily_schedule()
+            return
         cancellable = [worker for worker, entry in self._workers.items() if not entry.terminal and not entry.cancelling]
         for worker in cancellable:
             self._cancel_download(worker)
-        if self._daily_schedule is not None:
-            self._stop_daily_schedule()
         if cancellable:
             self.statusBar().showMessage(f"Cancelling {len(cancellable)} downloads…")
 
     @Slot()
     def _clear_finished_jobs(self) -> None:
-        removable = [entry for entry in self._entries if self._is_removable(entry)]
+        removable = [entry for entry in self._visible_entries() if self._is_removable(entry)]
         for entry in sorted(removable, key=lambda item: item.row, reverse=True):
             self._remove_entry(entry)
         if removable:
-            self.statusBar().showMessage(f"Cleared {len(removable)} finished downloads", 5000)
-            _LOGGER.info("Cleared %d finished downloads", len(removable))
+            description = "stopped daily automations" if self._shows_daily_automations else "finished downloads"
+            self.statusBar().showMessage(f"Cleared {len(removable)} {description}", 5000)
+            _LOGGER.info("Cleared %d %s", len(removable), description)
 
     def _update_bulk_buttons(self) -> None:
-        self._clear_all_button.setEnabled(any(self._is_removable(entry) for entry in self._entries))
-        self._cancel_all_button.setEnabled(
-            any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
+        self._clear_all_button.setEnabled(any(self._is_removable(entry) for entry in self._visible_entries()))
+        self._cancel_all_button.setText("Stop All" if self._shows_daily_automations else "Cancel All")
+        has_cancellable_jobs = (
+            self._daily_schedule is not None
+            if self._shows_daily_automations
+            else any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
         )
+        self._cancel_all_button.setEnabled(has_cancellable_jobs)
 
     def _is_removable(self, entry: _DownloadEntry) -> bool:
         return entry.terminal and entry.worker not in self._workers
 
-    @Slot(QPoint)
-    def _show_job_context_menu(self, position: QPoint) -> None:
-        index = self._downloads.indexAt(position)
-        entry = self._entry_for_row(index.row())
+    def _show_job_context_menu(self, table: QTableWidget, position: QPoint) -> None:
+        index = table.indexAt(position)
+        entry = self._entry_for_row(table, index.row())
         if entry is None:
             return
         menu = QMenu(self)
@@ -1666,11 +1709,10 @@ class _MainWindow(QMainWindow):
         remove_action = menu.addAction("Remove from List")
         remove_action.setEnabled(self._is_removable(entry))
         remove_action.triggered.connect(partial(self._remove_entry, entry))
-        menu.exec(self._downloads.viewport().mapToGlobal(position))
+        menu.exec(table.viewport().mapToGlobal(position))
 
-    @Slot(int, int)
-    def _open_completed_video(self, row: int, _column: int) -> None:
-        entry = self._entry_for_row(row)
+    def _open_completed_video(self, table: QTableWidget, row: int, _column: int) -> None:
+        entry = self._entry_for_row(table, row)
         if entry is not None and entry.completed:
             self._open_entry_video(entry)
 
@@ -1680,21 +1722,28 @@ class _MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(entry.output)))
 
-    def _entry_for_row(self, row: int) -> _DownloadEntry | None:
-        return next((entry for entry in self._entries if entry.row == row), None)
+    def _entry_for_row(self, table: QTableWidget, row: int) -> _DownloadEntry | None:
+        return next(
+            (entry for entry in self._entries if self._table_for_entry(entry) is table and entry.row == row),
+            None,
+        )
+
+    def _table_for_entry(self, entry: _DownloadEntry) -> QTableWidget:
+        return self._daily_automations if entry.daily_schedule else self._downloads
 
     def _remove_entry(self, entry: _DownloadEntry) -> None:
         if not self._is_removable(entry):
             return
+        table = self._table_for_entry(entry)
         removed_row = entry.row
-        self._downloads.removeRow(removed_row)
+        table.removeRow(removed_row)
         self._entries.remove(entry)
         for remaining in self._entries:
-            if remaining.row > removed_row:
+            if remaining.daily_schedule == entry.daily_schedule and remaining.row > removed_row:
                 remaining.row -= 1
         self._sync_download_view()
         self._update_bulk_buttons()
-        self.statusBar().showMessage(f"Removed {entry.camera_name} from the download list", 5000)
+        self.statusBar().showMessage(f"Removed {entry.camera_name} from the job list", 5000)
 
     def _download_progress(self, entry: _DownloadEntry, payload: object) -> None:
         if entry.terminal or not isinstance(payload, DownloadProgress):
@@ -1703,11 +1752,11 @@ class _MainWindow(QMainWindow):
         entry.last_progress_at = monotonic()
         if not entry.cancelling:
             status = "Downloading" if payload.downloaded_bytes else "Preparing export…"
-            self._set_table_text(entry.row, _COLUMN_STATUS, status)
-        self._set_table_text(entry.row, _COLUMN_DOWNLOADED, _format_bytes(payload.downloaded_bytes))
+            self._set_entry_text(entry, _COLUMN_STATUS, status)
+        self._set_entry_text(entry, _COLUMN_DOWNLOADED, _format_bytes(payload.downloaded_bytes))
         expected = "Unknown" if payload.total_bytes is None else _format_bytes(payload.total_bytes)
-        self._set_table_text(entry.row, _COLUMN_EXPECTED, expected)
-        self._set_table_text(entry.row, _COLUMN_SPEED, _format_speed(payload.bytes_per_second))
+        self._set_entry_text(entry, _COLUMN_EXPECTED, expected)
+        self._set_entry_text(entry, _COLUMN_SPEED, _format_speed(payload.bytes_per_second))
         if payload.total_bytes:
             fraction = min(payload.downloaded_bytes / payload.total_bytes, 1.0)
             entry.progress_bar.setRange(0, _PROGRESS_SCALE)
@@ -1727,15 +1776,15 @@ class _MainWindow(QMainWindow):
                 or now - entry.last_progress_at < _STALE_SPEED_SECONDS
             ):
                 continue
-            self._set_table_text(entry.row, _COLUMN_SPEED, "0 bytes/s")
+            self._set_entry_text(entry, _COLUMN_SPEED, "0 bytes/s")
 
     def _download_succeeded(self, entry: _DownloadEntry, _output_text: str) -> None:
         entry.terminal = True
         entry.completed = True
-        self._set_table_text(entry.row, _COLUMN_STATUS, "Completed")
+        self._set_entry_text(entry, _COLUMN_STATUS, "Completed")
         with suppress(OSError):
             entry.downloaded_bytes = entry.output.stat().st_size
-        self._set_table_text(entry.row, _COLUMN_DOWNLOADED, _format_bytes(entry.downloaded_bytes))
+        self._set_entry_text(entry, _COLUMN_DOWNLOADED, _format_bytes(entry.downloaded_bytes))
         entry.progress_bar.setRange(0, _PROGRESS_SCALE)
         entry.progress_bar.setValue(_PROGRESS_SCALE)
         entry.progress_bar.setFormat("100%")
@@ -1747,8 +1796,8 @@ class _MainWindow(QMainWindow):
         entry.terminal = True
         entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
-        self._set_table_text(entry.row, _COLUMN_STATUS, "Failed", tooltip=message)
-        self._set_table_text(entry.row, _COLUMN_SPEED, "—")
+        self._set_entry_text(entry, _COLUMN_STATUS, "Failed", tooltip=message)
+        self._set_entry_text(entry, _COLUMN_SPEED, "—")
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
         self._update_bulk_buttons()
         _LOGGER.error("Camera download failed for %s: %s", entry.camera_name, message)
@@ -1757,8 +1806,8 @@ class _MainWindow(QMainWindow):
         entry.terminal = True
         entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
-        self._set_table_text(entry.row, _COLUMN_STATUS, "Cancelled")
-        self._set_table_text(entry.row, _COLUMN_SPEED, "—")
+        self._set_entry_text(entry, _COLUMN_STATUS, "Cancelled")
+        self._set_entry_text(entry, _COLUMN_SPEED, "—")
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
         self._update_bulk_buttons()
         _LOGGER.info("Camera download cancelled: %s", entry.camera_name)
@@ -1771,13 +1820,14 @@ class _MainWindow(QMainWindow):
         *,
         enabled: bool = True,
     ) -> None:
-        old_widget = self._downloads.cellWidget(entry.row, _COLUMN_ACTION)
+        table = self._table_for_entry(entry)
+        old_widget = table.cellWidget(entry.row, _COLUMN_ACTION)
         if old_widget is not None:
             old_widget.deleteLater()
         button = QPushButton(text)
         button.clicked.connect(callback)
         button.setEnabled(enabled)
-        self._downloads.setCellWidget(entry.row, _COLUMN_ACTION, button)
+        table.setCellWidget(entry.row, _COLUMN_ACTION, button)
         entry.action_button = button
 
     def _restart_download(self, entry: _DownloadEntry) -> None:
@@ -1796,10 +1846,10 @@ class _MainWindow(QMainWindow):
         entry.completed = False
         entry.downloaded_bytes = 0
         entry.last_progress_at = None
-        self._set_table_text(entry.row, _COLUMN_STATUS, "Preparing export…", tooltip="")
-        self._set_table_text(entry.row, _COLUMN_DOWNLOADED, "0 bytes")
-        self._set_table_text(entry.row, _COLUMN_EXPECTED, "Unknown")
-        self._set_table_text(entry.row, _COLUMN_SPEED, "—")
+        self._set_entry_text(entry, _COLUMN_STATUS, "Preparing export…", tooltip="")
+        self._set_entry_text(entry, _COLUMN_DOWNLOADED, "0 bytes")
+        self._set_entry_text(entry, _COLUMN_EXPECTED, "Unknown")
+        self._set_entry_text(entry, _COLUMN_SPEED, "—")
         entry.progress_bar.setRange(0, 0)
         entry.progress_bar.setFormat("")
         worker = _DownloadWorker(entry.config, entry.camera, entry.output, self)
@@ -1824,11 +1874,19 @@ class _MainWindow(QMainWindow):
         self._update_bulk_buttons()
         self._finish_close_if_ready()
 
-    def _set_table_text(self, row: int, column: int, text: str, *, tooltip: str | None = None) -> None:
-        item = self._downloads.item(row, column)
+    def _set_entry_text(
+        self,
+        entry: _DownloadEntry,
+        column: int,
+        text: str,
+        *,
+        tooltip: str | None = None,
+    ) -> None:
+        table = self._table_for_entry(entry)
+        item = table.item(entry.row, column)
         if item is None:
             item = QTableWidgetItem()
-            self._downloads.setItem(row, column, item)
+            table.setItem(entry.row, column, item)
         item.setText(text)
         if tooltip is not None:
             item.setToolTip(tooltip)
