@@ -10,7 +10,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 
 - Interactive camera discovery and selection
 - Native SwiftUI interface for macOS
-- Qt desktop interface built with PySide6
+- Cross-platform Qt desktop interface built with PySide6
 - CLI speeds of `60x`, `120x`, `300x`, and `600x`
 - Exact date/time ranges or daylight-saving-aware local calendar days
 - Daily automatic exports for the most recently completed day
@@ -24,7 +24,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 
 - Python 3.11 or newer
 - [`uv`](https://docs.astral.sh/uv/) for dependency and environment management
-- A UniFi Protect console reachable over HTTPS
+- A reachable UniFi Protect console; trusted self-signed certificates are supported
 - A Protect Integration API token for camera discovery
 - A dedicated local Protect user with permission to view and export recordings
 
@@ -184,9 +184,9 @@ open dist/macos/timelapse.app
 
 The build requires macOS 15 or newer, the Swift/Xcode command-line toolchain, and `uv`; its isolated backend environment uses Python 3.13 by default. Without `MACOS_SIGN_IDENTITY`, the script applies an ad-hoc signature suitable for local development. Set `MACOS_SIGN_IDENTITY` and, optionally, `MACOS_NOTARY_PROFILE` when producing a distributable build.
 
-## Qt (PySide6 / PyQt-style) GUI
+## Cross-platform Qt GUI (macOS, Linux, and Windows)
 
-The Qt interface offers the same core workflow on macOS and Linux: connection profiles, camera selection, exact or 24-hour ranges, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored with the operating system's credential store through `keyring`.
+The PySide6 interface—often referred to as the PyQt GUI—runs on macOS, Linux, and Windows. macOS and Windows also have native GUIs for people who prefer a platform-native experience. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored with the operating system's credential store through `keyring`.
 
 ![Qt TimeLapse interface](docs/screenshots/pyqt-ui.png)
 
@@ -204,9 +204,15 @@ Build the bundled Linux application on Linux:
 
 The Linux build is written to `dist/linux/`. Build on the oldest Linux distribution you intend to support for the widest glibc compatibility.
 
-## Windows GUI
+## Native Windows GUI
 
-**Coming soon.**
+The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
+
+```powershell
+.\build-windows.ps1
+```
+
+The build produces one self-contained distributable at `dist\windows\timelapse.exe`. The recipient does not need to install Python or .NET.
 
 ## Date and output behavior
 
