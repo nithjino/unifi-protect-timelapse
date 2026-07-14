@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from timelapse.config import parse_args
+from timelapse.config import Config, CreateProfile, parse_args
+from timelapse.profiles import ConnectionProfile
 
 ENVIRONMENT_VARIABLES = (
     "UNIFI_PROTECT_URL",
@@ -28,6 +29,12 @@ REQUIRED_ARGUMENTS = [
 ]
 
 
+def _parse_config() -> Config:
+    command = parse_args()
+    assert isinstance(command, Config)
+    return command
+
+
 def test_parse_args_loads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     for name in ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
@@ -44,7 +51,7 @@ TIMELAPSE_OUTPUT=from-env.mp4
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["timelapse", *REQUIRED_ARGUMENTS])
 
-    config = parse_args()
+    config = _parse_config()
 
     assert config.instance_url == "https://protect.local/proxy/protect/integration/v1"
     assert config.token == "test-token"  # noqa: S105
@@ -76,7 +83,7 @@ def test_process_environment_wins_over_dotenv(monkeypatch: pytest.MonkeyPatch, t
         ],
     )
 
-    assert parse_args().output == Path("from-process-env.mp4")
+    assert _parse_config().output == Path("from-process-env.mp4")
 
 
 @pytest.mark.parametrize(
@@ -102,7 +109,7 @@ def test_dates_are_cli_only(
     monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
     monkeypatch.setattr(sys, "argv", arguments)
 
-    config = parse_args()
+    config = _parse_config()
 
     assert config.end - config.start == timedelta(days=1)
 
@@ -130,7 +137,7 @@ def test_one_date_only_boundary_creates_full_local_day(
         ],
     )
 
-    config = parse_args()
+    config = _parse_config()
 
     assert config.start.hour == 0
     assert config.start.minute == 0
@@ -156,7 +163,7 @@ def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_
         ],
     )
 
-    config = parse_args()
+    config = _parse_config()
 
     assert config.daily is True
     assert config.output == tmp_path
@@ -179,7 +186,7 @@ def test_speed_defaults_to_600x(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     ]
     monkeypatch.setattr(sys, "argv", arguments)
 
-    assert parse_args().speed == "600x"
+    assert _parse_config().speed == "600x"
 
 
 def test_private_credentials_can_be_passed_on_command_line(
@@ -201,7 +208,105 @@ def test_private_credentials_can_be_passed_on_command_line(
     ]
     monkeypatch.setattr(sys, "argv", arguments)
 
-    config = parse_args()
+    config = _parse_config()
 
     assert config.username == "command-line-user"
     assert config.password == "command-line-password"  # noqa: S105
+
+
+def test_create_profile_uses_dotenv_connection_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        """UNIFI_PROTECT_URL=https://protect.local
+UNIFI_PROTECT_TOKEN=test-token
+UNIFI_PROTECT_USERNAME=timelapse-user
+UNIFI_PROTECT_PASSWORD=test-password
+UNIFI_PROTECT_VERIFY_SSL=false
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["timelapse", "--create-profile"])
+
+    command = parse_args()
+
+    assert command == CreateProfile(
+        instance_url="https://protect.local",
+        token="test-token",  # noqa: S106
+        username="timelapse-user",
+        password="test-password",  # noqa: S106
+        verify_ssl=False,
+    )
+
+
+def test_named_profile_supplies_connection_details(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "timelapse.profiles.load_profile",
+        lambda name: ConnectionProfile(
+            name=name,
+            instance_url="https://profile.local",
+            token="profile-token",  # noqa: S106
+            username="profile-user",
+            password="profile-password",  # noqa: S106
+            verify_ssl=False,
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["timelapse", "--profile", "home", *REQUIRED_ARGUMENTS])
+
+    config = _parse_config()
+
+    assert isinstance(config, Config)
+    assert config.instance_url == "https://profile.local"
+    assert config.token == "profile-token"  # noqa: S105
+    assert config.username == "profile-user"
+    assert config.password == "profile-password"  # noqa: S105
+    assert config.verify_ssl is False
+
+
+def test_dotenv_is_used_instead_of_named_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    for name in ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        """UNIFI_PROTECT_URL=https://protect.local
+UNIFI_PROTECT_TOKEN=test-token
+UNIFI_PROTECT_USERNAME=timelapse-user
+UNIFI_PROTECT_PASSWORD=test-password
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["timelapse", "--profile", "home", *REQUIRED_ARGUMENTS])
+
+    with pytest.raises(SystemExit):
+        parse_args()
+
+
+def test_incomplete_dotenv_prompts_for_missing_connection_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    for name in ENVIRONMENT_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    (tmp_path / ".env").write_text(
+        """UNIFI_PROTECT_URL=https://protect.local
+UNIFI_PROTECT_VERIFY_SSL=true
+""",
+        encoding="utf-8",
+    )
+    secret_answers = iter(["prompted-token", "prompted-password"])
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "prompted-user")
+    monkeypatch.setattr("timelapse.config.getpass.getpass", lambda _prompt: next(secret_answers))
+    monkeypatch.setattr(sys, "argv", ["timelapse", *REQUIRED_ARGUMENTS])
+
+    config = _parse_config()
+
+    assert isinstance(config, Config)
+    assert config.instance_url == "https://protect.local"
+    assert config.token == "prompted-token"  # noqa: S105
+    assert config.username == "prompted-user"
+    assert config.password == "prompted-password"  # noqa: S105

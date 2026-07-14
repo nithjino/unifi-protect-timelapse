@@ -18,6 +18,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 - Streaming downloads with progress, cancellation, and atomic finalization
 - Safe output filenames and protection against overwriting existing videos
 - Configurable request timeout and maximum download size
+- Reusable CLI connection profiles stored in the operating system credential store
 - OS credential-store integration in the desktop interfaces
 
 ## Requirements
@@ -69,6 +70,10 @@ uv run timelapse --start-date 07-13-2026
 
 The CLI reads `.env` from the current working directory. Explicit command-line arguments take precedence over environment-backed defaults, and existing process environment variables take precedence over values in `.env`.
 
+When `.env` exists, it is the automatic connection source and the CLI prompts for any required connection value that
+is missing. To use `--profile NAME`, remove or rename `.env`; without `.env`, provide either a profile or all required
+connection values explicitly.
+
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `UNIFI_PROTECT_URL` | Yes | — | Protect Integration API URL, normally ending in `/proxy/protect/integration/v1` |
@@ -89,6 +94,30 @@ Display every available option:
 ```bash
 uv run timelapse --help
 ```
+
+### Create and use a connection profile
+
+Create a profile interactively. The CLI requires you to enter a profile name; it does not generate or select a
+default name:
+
+```bash
+uv run timelapse --create-profile
+```
+
+When `.env` exists, the flow imports its connection values and asks only for anything missing. It always asks for the
+profile name and never supplies a default. Without `.env`, it asks for the Protect URL, Integration API token, local
+Protect username and password, and whether TLS certificates should be verified. Connection details are stored in the
+operating system credential store. Profile names are case-sensitive, and an existing profile is not silently
+overwritten.
+
+Use the saved connection details by passing the profile name alongside the normal export options:
+
+```bash
+uv run timelapse --profile home --start-date 07-13-2026
+```
+
+An explicitly supplied connection flag overrides the corresponding profile value for that invocation. A named profile
+can be selected only when `.env` is not present in the current working directory.
 
 ### Export one complete local day
 
@@ -233,6 +262,7 @@ The build produces one self-contained distributable at `dist\windows\timelapse.e
 - The Integration API token is used for camera discovery; private video export uses the local username and password.
 - Keep TLS verification enabled unless you are connecting to a trusted local console with a self-signed certificate.
 - `.env` is ignored by Git, but it is still a plaintext file. Restrict its filesystem permissions and never commit it.
+- CLI profiles keep their connection details in the operating system credential store.
 - The desktop interfaces store connection secrets in the platform credential store instead of application preferences.
 - Export error bodies are size-limited and escaped before they are printed to a terminal.
 
@@ -296,6 +326,7 @@ The main source areas are:
 | Path | Responsibility |
 | --- | --- |
 | `timelapse/config.py` | CLI parsing, `.env` loading, validation, and date ranges |
+| `timelapse/profiles.py` | Secure storage and loading for named CLI connection profiles |
 | `timelapse/protect.py` | Protect URL parsing, authentication, and camera discovery |
 | `timelapse/download.py` | Streaming downloads, output naming, progress, and limits |
 | `timelapse/schedule.py` | Local calendar-day and daily scheduling helpers |

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import getpass
 import sys
 from datetime import timedelta
 from pathlib import Path
 
 from timelapse import TimelapseError
-from timelapse.config import Config, parse_args
+from timelapse.config import Config, CreateProfile, parse_args
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
+from timelapse.profiles import ConnectionProfile, ProfileError, save_profile
 from timelapse.protect import CameraInfo, camera_name
 from timelapse.schedule import (
     config_for_local_day,
@@ -44,7 +46,11 @@ def _choose_camera(cameras: list[CameraInfo]) -> CameraInfo:
 
 async def _run() -> int:
     try:
-        config = parse_args()
+        command = parse_args()
+        if isinstance(command, CreateProfile):
+            _create_profile(command)
+            return 0
+        config = command
         camera = _choose_camera(await list_available_cameras(config))
         if config.daily:
             await _run_daily(config, camera)
@@ -63,6 +69,41 @@ async def _run() -> int:
 
     _write_stdout(f"Saved timelapse to {output}\n")
     return 0
+
+
+def _create_profile(command: CreateProfile) -> None:
+    _write_stdout("Create a connection profile. Every field is required.\n")
+    profile = ConnectionProfile(
+        name=_prompt_required("Profile name"),
+        instance_url=command.instance_url or _prompt_required("Protect Integration API URL"),
+        token=command.token or _prompt_required("Protect API token", secret=True),
+        username=command.username or _prompt_required("Local Protect username"),
+        password=command.password or _prompt_required("Local Protect password", secret=True),
+        verify_ssl=command.verify_ssl if command.verify_ssl is not None else _prompt_verify_ssl(),
+    )
+    try:
+        save_profile(profile)
+    except ProfileError as exc:
+        raise TimelapseError(str(exc)) from exc
+    _write_stdout(f"Created profile {profile.name.strip()!r}.\n")
+
+
+def _prompt_required(label: str, *, secret: bool = False) -> str:
+    while True:
+        value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")
+        if value.strip():
+            return value
+        _write_stdout(f"{label} is required.\n")
+
+
+def _prompt_verify_ssl() -> bool:
+    while True:
+        value = input("Verify TLS certificates? [Y/n]: ").strip().lower()
+        if value in {"", "y", "yes"}:
+            return True
+        if value in {"n", "no"}:
+            return False
+        _write_stdout("Please enter yes or no.\n")
 
 
 async def _export(config: Config, camera: CameraInfo, output: Path) -> None:
