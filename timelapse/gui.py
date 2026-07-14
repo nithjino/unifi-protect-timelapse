@@ -1,4 +1,4 @@
-"""Windows and Linux Qt interface for the UniFi Protect timelapse exporter."""
+"""Cross-platform Qt interface for the UniFi Protect timelapse exporter."""
 
 from __future__ import annotations
 
@@ -388,6 +388,8 @@ def _application_data_directory() -> Path:
         app_data = os.environ.get("APPDATA")
         base_directory = Path(app_data) if app_data else Path.home() / "AppData" / "Roaming"
         return base_directory / _APPLICATION_DIRECTORY_NAME
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / _APPLICATION_DIRECTORY_NAME
     config_home = os.environ.get("XDG_CONFIG_HOME")
     base_directory = Path(config_home) if config_home else Path.home() / ".config"
     return base_directory / _APPLICATION_DIRECTORY_NAME
@@ -1990,7 +1992,7 @@ def _remove_legacy_dotenv(dotenv_path: Path) -> None:
 
 
 def _is_supported_gui_platform() -> bool:
-    return os.name == "nt" or sys.platform.startswith("linux")
+    return os.name == "nt" or sys.platform.startswith(("darwin", "linux"))
 
 
 def _configure_platform_keyring() -> None:
@@ -1998,6 +2000,10 @@ def _configure_platform_keyring() -> None:
         from keyring.backends.Windows import WinVaultKeyring  # noqa: PLC0415
 
         keyring.set_keyring(WinVaultKeyring())
+    elif sys.platform == "darwin":
+        from keyring.backends.macOS import Keyring as MacOSKeyring  # noqa: PLC0415
+
+        keyring.set_keyring(MacOSKeyring())
     elif sys.platform.startswith("linux"):
         from keyring.backends.SecretService import Keyring as SecretServiceKeyring  # noqa: PLC0415
 
@@ -2016,7 +2022,7 @@ def main() -> int:
         QMessageBox.critical(
             None,
             "Unsupported Platform",
-            "The Qt interface supports Windows and Linux. Use the native SwiftUI application on macOS.",
+            "The Qt interface supports Windows, macOS, and Linux.",
         )
         return 1
     _configure_platform_keyring()

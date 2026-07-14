@@ -189,16 +189,28 @@ def test_application_icon_path_supports_source_and_bundled_apps(
     assert gui_module._application_icon_path() == tmp_path / "timelapse_assets" / "timelapse.png"
 
 
-def test_qt_gui_is_limited_to_windows_and_linux(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_qt_gui_supports_windows_macos_and_linux(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(gui_module.os, "name", "posix")
     monkeypatch.setattr(gui_module.sys, "platform", "darwin")
-    assert gui_module._is_supported_gui_platform() is False
+    assert gui_module._is_supported_gui_platform() is True
 
     monkeypatch.setattr(gui_module.sys, "platform", "linux")
     assert gui_module._is_supported_gui_platform() is True
 
+    monkeypatch.setattr(gui_module.sys, "platform", "freebsd")
+    assert gui_module._is_supported_gui_platform() is False
+
     monkeypatch.setattr(gui_module.os, "name", "nt")
     assert gui_module._is_supported_gui_platform() is True
+
+
+def test_macos_uses_application_support_directory(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(gui_module.os, "name", "posix")
+    monkeypatch.setattr(gui_module.sys, "platform", "darwin")
+
+    assert gui_module._application_data_directory() == (
+        gui_module.Path.home() / "Library" / "Application Support" / gui_module._APPLICATION_DIRECTORY_NAME
+    )
 
 
 def test_missing_dotenv_values_require_prompt(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
