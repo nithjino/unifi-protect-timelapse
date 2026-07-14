@@ -1,0 +1,41 @@
+<Window x:Class="TimeLapseNative.ConnectionDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Connection Profile" Width="620" Height="590" ResizeMode="NoResize"
+        WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
+  <Grid Margin="22">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" />
+      <RowDefinition Height="*" /><RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="145" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+    <TextBlock Grid.Row="0" Grid.ColumnSpan="2" Text="Connection Profile" FontSize="21" FontWeight="SemiBold" Margin="0,0,0,6" />
+    <TextBlock Grid.Row="1" Grid.ColumnSpan="2" Text="Connect to the Integration API for cameras and use a dedicated local Protect user to export recordings."
+               TextWrapping="Wrap" Foreground="#666" Margin="0,0,0,16" />
+    <TextBlock Grid.Row="2" Text="Profile name" VerticalAlignment="Center" />
+    <TextBox x:Name="ProfileNameText" Grid.Row="2" Grid.Column="1" Margin="0,4" />
+    <TextBlock Grid.Row="3" Text="Protect URL" VerticalAlignment="Center" />
+    <TextBox x:Name="UrlText" Grid.Row="3" Grid.Column="1" Margin="0,4" />
+    <TextBlock Grid.Row="4" Text="API token" VerticalAlignment="Center" />
+    <PasswordBox x:Name="TokenText" Grid.Row="4" Grid.Column="1" Margin="0,4" />
+    <TextBlock Grid.Row="5" Text="Local username" VerticalAlignment="Center" />
+    <TextBox x:Name="UsernameText" Grid.Row="5" Grid.Column="1" Margin="0,4" />
+    <TextBlock Grid.Row="6" Text="Local password" VerticalAlignment="Center" />
+    <PasswordBox x:Name="PasswordText" Grid.Row="6" Grid.Column="1" Margin="0,4" />
+    <CheckBox x:Name="VerifySslCheck" Grid.Row="7" Grid.Column="1" Content="Verify TLS certificate" Margin="0,8" IsChecked="True" />
+    <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal">
+      <TextBlock Text="Timeout (seconds)" VerticalAlignment="Center" Margin="0,0,8,0" />
+      <TextBox x:Name="TimeoutText" Width="70" Text="0" Margin="0,0,18,0" />
+      <TextBlock Text="Max MiB" VerticalAlignment="Center" Margin="0,0,8,0" />
+      <TextBox x:Name="MaxMiBText" Width="80" Text="10240" />
+    </StackPanel>
+    <TextBlock Grid.Row="9" Grid.ColumnSpan="2" Text="🔑  Stored securely in Windows Credential Manager. Set either optional limit to 0 to disable it."
+               Foreground="#666" VerticalAlignment="Top" Margin="0,18,0,0" TextWrapping="Wrap" />
+    <StackPanel Grid.Row="10" Grid.ColumnSpan="2" Orientation="Horizontal" HorizontalAlignment="Right">
+      <Button Content="Cancel" IsCancel="True" Margin="0,0,8,0" />
+      <Button Content="Save" IsDefault="True" Click="Save_Click" Background="#1769C2" Foreground="White" />
+    </StackPanel>
+  </Grid>
+</Window>

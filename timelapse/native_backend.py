@@ -1,4 +1,4 @@
-"""JSON-lines bridge between the native macOS UI and Python export services."""
+"""JSON-lines bridge between native desktop UIs and Python export services."""
 
 from __future__ import annotations
 
