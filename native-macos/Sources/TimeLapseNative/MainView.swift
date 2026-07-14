@@ -20,6 +20,8 @@ struct MainView: View {
                 connectionOverlay
             } else if model.showingCameraSheet {
                 cameraOverlay
+            } else if model.showingDailyScheduleSheet {
+                dailyScheduleOverlay
             }
         }
         .onAppear { model.start() }
@@ -53,6 +55,22 @@ struct MainView: View {
                 selectedIDs: model.selectedCameraIDs,
                 onSave: model.applyCameraSelection,
                 onCancel: { model.showingCameraSheet = false }
+            )
+            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+            .shadow(radius: 18, y: 8)
+        }
+        .transition(.opacity.combined(with: .scale(scale: 0.98)))
+    }
+
+    private var dailyScheduleOverlay: some View {
+        ZStack {
+            modalBackdrop
+            DailyScheduleView(
+                cameras: model.cameras,
+                initialSelectedIDs: model.selectedCameraIDs,
+                initialOutputDirectory: model.outputDirectory,
+                onSave: model.configureDailySchedule,
+                onCancel: model.cancelDailyScheduleSheet
             )
             .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             .shadow(radius: 18, y: 8)
@@ -120,6 +138,11 @@ struct MainView: View {
                         .pickerStyle(.menu)
                         .frame(width: 105, alignment: .leading)
                     }
+                    GridRow {
+                        Text("")
+                        Toggle("24-hour timelapse", isOn: fullDayModeBinding)
+                            .help("Use date-only controls and export exactly one complete local calendar day.")
+                    }
                 }
                 Divider()
                 VStack(alignment: .leading, spacing: 10) {
@@ -154,6 +177,8 @@ struct MainView: View {
                             .disabled(model.selectedCameras.isEmpty)
                         Spacer()
                     }
+                    Toggle("Daily automatic timelapses", isOn: dailyAutomaticBinding)
+                        .help("Export each completed local day while this program remains open.")
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -162,10 +187,37 @@ struct MainView: View {
     }
 
     private func compactDatePicker(_ title: String, selection: Binding<Date>) -> some View {
-        DatePicker(title, selection: selection, in: minimumDate..., displayedComponents: [.date, .hourAndMinute])
+        DatePicker(
+            title,
+            selection: model.fullDayMode ? fullDayBinding(title == "Start") : selection,
+            in: minimumDate...,
+            displayedComponents: model.fullDayMode ? [.date] : [.date, .hourAndMinute]
+        )
             .labelsHidden()
             .datePickerStyle(.compact)
             .help("Type a date and time or open the calendar to choose a date.")
+    }
+
+    private var fullDayModeBinding: Binding<Bool> {
+        Binding(get: { model.fullDayMode }, set: { enabled in model.setFullDayMode(enabled) })
+    }
+
+    private var dailyAutomaticBinding: Binding<Bool> {
+        Binding(
+            get: { model.dailyAutomaticEnabled },
+            set: { enabled in
+                if enabled { model.requestDailySchedule() } else { model.stopDailySchedule() }
+            }
+        )
+    }
+
+    private func fullDayBinding(_ isStart: Bool) -> Binding<Date> {
+        Binding(
+            get: { isStart ? model.startDate : model.endDate },
+            set: { value in
+                if isStart { model.setFullDayStart(value) } else { model.setFullDayEnd(value) }
+            }
+        )
     }
 
     private var profileSelection: Binding<UUID?> {
@@ -265,6 +317,10 @@ struct MainView: View {
     @ViewBuilder
     private func jobMenu(for job: DownloadJob) -> some View {
         switch job.state {
+        case .scheduled:
+            Button("Stop Daily Job", systemImage: "stop.circle") { model.stopDailySchedule() }
+        case .stopped:
+            EmptyView()
         case .cancelled, .failed:
             Button("Restart", systemImage: "arrow.clockwise") { model.restart(job) }
         case .completed:
@@ -317,7 +373,9 @@ private struct DownloadProgressCell: View {
     @ObservedObject var job: DownloadJob
 
     var body: some View {
-        if let total = job.totalBytes, total > 0 {
+        if job.isDailySchedule {
+            ProgressView(value: 0)
+        } else if let total = job.totalBytes, total > 0 {
             ProgressView(value: min(Double(job.downloadedBytes) / Double(total), 1))
         } else if job.state == .completed {
             ProgressView(value: 1)
@@ -335,7 +393,7 @@ private struct DownloadBytesCell: View {
     let expected: Bool
 
     var body: some View {
-        Text(expected ? job.totalBytes.map(formatBytes) ?? "Unknown" : formatBytes(job.downloadedBytes))
+        Text(job.isDailySchedule ? "—" : expected ? job.totalBytes.map(formatBytes) ?? "Unknown" : formatBytes(job.downloadedBytes))
             .monospacedDigit()
     }
 }
@@ -358,6 +416,10 @@ private struct DownloadActionCell: View {
 
     var body: some View {
         switch job.state {
+        case .scheduled:
+            Button("Stop") { model.stopDailySchedule() }
+        case .stopped:
+            Button("Remove") { model.remove(job) }
         case .completed:
             Button("Show") { model.reveal(job) }
                 .help("Show the output location in Finder.")

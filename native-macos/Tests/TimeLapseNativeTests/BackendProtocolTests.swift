@@ -7,6 +7,8 @@ final class BackendProtocolTests: XCTestCase {
         XCTAssertTrue(DownloadState.completed.isTerminal)
         XCTAssertTrue(DownloadState.cancelled.isTerminal)
         XCTAssertTrue(DownloadState.failed("network error").isTerminal)
+        XCTAssertTrue(DownloadState.stopped.isTerminal)
+        XCTAssertFalse(DownloadState.scheduled.isTerminal)
         XCTAssertFalse(DownloadState.preparing.isTerminal)
         XCTAssertFalse(DownloadState.downloading.isTerminal)
         XCTAssertFalse(DownloadState.cancelling.isTerminal)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -80,6 +80,39 @@ def _table_text(window: gui_module._MainWindow, row: int, column: int) -> str:
 def test_date_editors_offer_calendar_popups(main_window: gui_module._MainWindow) -> None:
     assert main_window._start_edit.calendarPopup() is True
     assert main_window._end_edit.calendarPopup() is True
+
+
+def test_24_hour_toggle_uses_date_only_one_day_range(main_window: gui_module._MainWindow) -> None:
+    main_window._full_day_checkbox.setChecked(True)
+
+    start = main_window._start_edit.dateTime()
+    end = main_window._end_edit.dateTime()
+
+    assert "h:mm" not in main_window._start_edit.displayFormat()
+    assert start.time().hour() == 0
+    assert end == start.addDays(1)
+
+
+def test_daily_schedule_adds_list_row_and_daily_downloads(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cameras = (CameraInfo(id="camera-1", name="Front Door", state=None, model=None),)
+    schedule_entry = main_window._add_daily_schedule_row(cameras, tmp_path)
+    main_window._daily_schedule = gui_module._DailySchedule(cameras, tmp_path, "600x", schedule_entry)
+    started: list[gui_module._DownloadEntry] = []
+    monkeypatch.setattr(gui_module, "latest_complete_local_day", lambda: date(2026, 7, 12))
+    monkeypatch.setattr(main_window, "_start_download_worker", lambda entry, _worker: started.append(entry))
+
+    main_window._run_daily_schedule_if_due()
+
+    assert _table_text(main_window, schedule_entry.row, gui_module._COLUMN_STATUS) == "Scheduled daily"
+    assert len(started) == 1
+    assert started[0].output.name.startswith("daily_timelapse_Front_Door_")
+
+    main_window._stop_daily_schedule()
+    assert _table_text(main_window, schedule_entry.row, gui_module._COLUMN_STATUS) == "Stopped"
 
 
 def test_logs_button_opens_separate_window_and_displays_logs(

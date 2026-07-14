@@ -176,28 +176,32 @@ struct BackendEvent: Decodable, Sendable {
 }
 
 enum DownloadState: Equatable, Sendable {
+    case scheduled
     case preparing
     case downloading
     case cancelling
     case completed
     case cancelled
     case failed(String)
+    case stopped
 
     var text: String {
         switch self {
+        case .scheduled: "Scheduled daily"
         case .preparing: "Preparing export…"
         case .downloading: "Downloading"
         case .cancelling: "Cancelling…"
         case .completed: "Completed"
         case .cancelled: "Cancelled"
         case let .failed(message): "Failed: \(message)"
+        case .stopped: "Stopped"
         }
     }
 
     var isTerminal: Bool {
         switch self {
-        case .completed, .cancelled, .failed: true
-        case .preparing, .downloading, .cancelling: false
+        case .completed, .cancelled, .failed, .stopped: true
+        case .scheduled, .preparing, .downloading, .cancelling: false
         }
     }
 
@@ -217,7 +221,8 @@ final class DownloadJob: ObservableObject, Identifiable {
     let requestStart: String
     let requestEnd: String
     let requestSpeed: String
-    @Published var state: DownloadState = .preparing
+    let isDailySchedule: Bool
+    @Published var state: DownloadState
     @Published var downloadedBytes: Int64 = 0
     @Published var totalBytes: Int64?
     @Published var bytesPerSecond = 0.0
@@ -232,7 +237,9 @@ final class DownloadJob: ObservableObject, Identifiable {
         requestSettings: BackendSettings,
         requestStart: String,
         requestEnd: String,
-        requestSpeed: String
+        requestSpeed: String,
+        isDailySchedule: Bool = false,
+        initialState: DownloadState = .preparing
     ) {
         self.id = id
         self.groupNumber = groupNumber
@@ -242,6 +249,8 @@ final class DownloadJob: ObservableObject, Identifiable {
         self.requestStart = requestStart
         self.requestEnd = requestEnd
         self.requestSpeed = requestSpeed
+        self.isDailySchedule = isDailySchedule
+        state = initialState
     }
 }
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -101,8 +102,64 @@ def test_dates_are_cli_only(
     monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
     monkeypatch.setattr(sys, "argv", arguments)
 
-    with pytest.raises(SystemExit):
-        parse_args()
+    config = parse_args()
+
+    assert config.end - config.start == timedelta(days=1)
+
+
+@pytest.mark.parametrize("flag", ["--start-date", "--end-date"])
+def test_one_date_only_boundary_creates_full_local_day(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    flag: str,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
+    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "timelapse",
+            "--instance",
+            "https://protect.local",
+            "--token",
+            "test-token",
+            flag,
+            "07-11-2026",
+        ],
+    )
+
+    config = parse_args()
+
+    assert config.start.hour == 0
+    assert config.start.minute == 0
+    assert config.end.date() == config.start.date() + timedelta(days=1)
+
+
+def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
+    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "timelapse",
+            "--instance",
+            "https://protect.local",
+            "--token",
+            "test-token",
+            "--daily",
+            "--output",
+            str(tmp_path),
+        ],
+    )
+
+    config = parse_args()
+
+    assert config.daily is True
+    assert config.output == tmp_path
 
 
 def test_speed_defaults_to_600x(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

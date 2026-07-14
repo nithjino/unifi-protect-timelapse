@@ -8,6 +8,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var selectedProfileID: UUID?
     @Published var startDate = Date().addingTimeInterval(-24 * 60 * 60)
     @Published var endDate = Date()
+    @Published var fullDayMode = false
+    @Published private(set) var dailyAutomaticEnabled = false
     @Published var speed = "600x"
     @Published var outputDirectory: URL
     @Published var cameras: [CameraInfo] = []
@@ -17,6 +19,7 @@ final class AppModel: ObservableObject {
     @Published var statusMessage = "Ready"
     @Published var showingConnectionSheet = false
     @Published var showingCameraSheet = false
+    @Published var showingDailyScheduleSheet = false
     @Published var isFirstRun = false
     @Published var alert: AppAlert?
     @Published private(set) var isLoadingCameras = false
@@ -27,6 +30,7 @@ final class AppModel: ObservableObject {
     private var cameraRequestID: String?
     private var cameraReceivedTerminal = false
     private var openCameraSheetAfterLoad = false
+    private var openDailySheetAfterLoad = false
     private var downloadProcesses: [UUID: BackendProcess] = [:]
     private var downloadReceivedTerminal: Set<UUID> = []
     private var reservedOutputPaths: Set<String> = []
@@ -37,6 +41,8 @@ final class AppModel: ObservableObject {
     private let initialCredentialAlert: AppAlert?
     private let initialMigrationMessage: String?
     private var editingProfileID: UUID?
+    private var dailySchedule: DailySchedule?
+    private var dailyTimer: Timer?
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
     var hasActiveBackendProcesses: Bool { cameraProcess != nil || !downloadProcesses.isEmpty }
@@ -62,6 +68,15 @@ final class AppModel: ObservableObject {
         case 1: selectedCameras[0].name
         default: "\(selectedCameras.count) cameras selected"
         }
+    }
+
+    private struct DailySchedule {
+        let cameras: [CameraInfo]
+        let outputDirectory: URL
+        let settings: BackendSettings
+        let speed: String
+        let jobID: UUID
+        var lastRunDay: Date?
     }
 
     init() {
@@ -228,9 +243,148 @@ final class AppModel: ObservableObject {
         appendLog(level: "INFO", message: "Selected \(ids.count) cameras")
     }
 
+    func setFullDayStart(_ date: Date) {
+        let start = Calendar.current.startOfDay(for: date)
+        startDate = start
+        endDate = Calendar.current.date(byAdding: .day, value: 1, to: start) ?? start.addingTimeInterval(24 * 60 * 60)
+    }
+
+    func setFullDayEnd(_ date: Date) {
+        let end = Calendar.current.startOfDay(for: date)
+        endDate = end
+        startDate = Calendar.current.date(byAdding: .day, value: -1, to: end) ?? end.addingTimeInterval(-24 * 60 * 60)
+    }
+
+    func setFullDayMode(_ enabled: Bool) {
+        fullDayMode = enabled
+        if enabled { setFullDayStart(startDate) }
+    }
+
+    func requestDailySchedule() {
+        guard !dailyAutomaticEnabled else { return }
+        if cameras.isEmpty {
+            openCameraSheetAfterLoad = false
+            openDailySheetAfterLoad = true
+            loadCameras()
+        } else {
+            showingDailyScheduleSheet = true
+        }
+    }
+
+    func cancelDailyScheduleSheet() {
+        showingDailyScheduleSheet = false
+        openDailySheetAfterLoad = false
+    }
+
+    func configureDailySchedule(cameraIDs: Set<String>, outputDirectory: URL) {
+        guard dailySchedule == nil else { return }
+        let selected = cameras.filter { cameraIDs.contains($0.id) }
+        guard !selected.isEmpty else {
+            alert = AppAlert(title: "No Cameras Selected", message: "Select at least one camera for the daily job.")
+            return
+        }
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: outputDirectory.path, isDirectory: &isDirectory), !isDirectory.boolValue {
+            alert = AppAlert(title: "Invalid Output Folder", message: "The selected output location is not a folder.")
+            return
+        }
+        do {
+            try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        } catch {
+            alert = AppAlert(title: "Could Not Create Output Folder", message: error.localizedDescription)
+            return
+        }
+        let group = nextGroupNumber
+        nextGroupNumber += 1
+        let camera = CameraInfo(
+            id: "daily-schedule-\(UUID().uuidString)",
+            name: selected.count == 1 ? selected[0].name : "\(selected.count) cameras",
+            state: nil,
+            model: nil
+        )
+        let job = DownloadJob(
+            groupNumber: group,
+            camera: camera,
+            outputURL: outputDirectory,
+            requestSettings: BackendSettings(settings),
+            requestStart: "",
+            requestEnd: "",
+            requestSpeed: speed,
+            isDailySchedule: true,
+            initialState: .scheduled
+        )
+        jobs.append(job)
+        dailySchedule = DailySchedule(
+            cameras: selected,
+            outputDirectory: outputDirectory,
+            settings: BackendSettings(settings),
+            speed: speed,
+            jobID: job.id,
+            lastRunDay: nil
+        )
+        dailyAutomaticEnabled = true
+        showingDailyScheduleSheet = false
+        statusMessage = "Scheduled daily timelapses for \(selected.count) cameras"
+        appendLog(level: "INFO", message: statusMessage)
+        startDailyTimer()
+        runDailyScheduleIfDue()
+    }
+
+    func stopDailySchedule() {
+        guard let schedule = dailySchedule else { return }
+        dailyTimer?.invalidate()
+        dailyTimer = nil
+        dailySchedule = nil
+        dailyAutomaticEnabled = false
+        jobs.first { $0.id == schedule.jobID }?.state = .stopped
+        statusMessage = "Stopped daily automatic timelapses"
+        appendLog(level: "INFO", message: statusMessage)
+    }
+
+    private func startDailyTimer() {
+        dailyTimer?.invalidate()
+        dailyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.runDailyScheduleIfDue()
+            }
+        }
+    }
+
+    private func runDailyScheduleIfDue() {
+        guard var schedule = dailySchedule else { return }
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let firstDay = schedule.lastRunDay.flatMap { calendar.date(byAdding: .day, value: 1, to: $0) }
+            ?? calendar.date(byAdding: .day, value: -1, to: today)
+        guard var day = firstDay else { return }
+        while day < today {
+            guard let end = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            let group = nextGroupNumber
+            nextGroupNumber += 1
+            for camera in schedule.cameras {
+                startDownload(
+                    camera: camera,
+                    group: group,
+                    start: day,
+                    end: end,
+                    speed: schedule.speed,
+                    outputDirectory: schedule.outputDirectory,
+                    requestSettings: schedule.settings,
+                    daily: true
+                )
+            }
+            schedule.lastRunDay = day
+            dailySchedule = schedule
+            statusMessage = "Started daily job \(group) for \(Self.calendarDay(day))"
+            appendLog(level: "INFO", message: statusMessage)
+            day = end
+        }
+    }
+
     func loadCameras(openSelection: Bool = false) {
         guard !isLoadingCameras else { return }
         guard settings.validationError == nil else {
+            openDailySheetAfterLoad = false
             isFirstRun = true
             showingConnectionSheet = true
             return
@@ -254,6 +408,7 @@ final class AppModel: ObservableObject {
         } catch {
             cameraProcess = nil
             isLoadingCameras = false
+            openDailySheetAfterLoad = false
             showError(title: "Could Not Load Cameras", message: error.localizedDescription)
         }
     }
@@ -272,13 +427,25 @@ final class AppModel: ObservableObject {
         let group = nextGroupNumber
         nextGroupNumber += 1
         for camera in selectedCameras {
-            startDownload(camera: camera, group: group)
+            startDownload(
+                camera: camera,
+                group: group,
+                start: startDate,
+                end: endDate,
+                speed: speed,
+                outputDirectory: outputDirectory,
+                requestSettings: BackendSettings(settings)
+            )
         }
         statusMessage = "Started job \(group) with \(selectedCameras.count) downloads"
         appendLog(level: "INFO", message: statusMessage)
     }
 
     func cancel(_ job: DownloadJob) {
+        if job.isDailySchedule {
+            stopDailySchedule()
+            return
+        }
         guard !job.state.isTerminal, job.state != .cancelling else { return }
         job.state = .cancelling
         downloadProcesses[job.id]?.cancel()
@@ -310,6 +477,7 @@ final class AppModel: ObservableObject {
     }
 
     func restart(_ job: DownloadJob) {
+        guard !job.isDailySchedule else { return }
         guard job.state == .cancelled || job.state.isFailure, downloadProcesses[job.id] == nil else { return }
         guard !FileManager.default.fileExists(atPath: job.outputURL.path) else {
             alert = AppAlert(
@@ -359,6 +527,9 @@ final class AppModel: ObservableObject {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         shutdownCompletion = completion
+        dailyTimer?.invalidate()
+        dailyTimer = nil
+        dailySchedule = nil
         cameraProcess?.cancel()
         for process in downloadProcesses.values {
             process.cancel()
@@ -377,12 +548,17 @@ final class AppModel: ObservableObject {
             statusMessage = "Loaded \(cameras.count) cameras"
             appendLog(level: "INFO", message: statusMessage)
             if cameras.isEmpty {
+                openDailySheetAfterLoad = false
                 alert = AppAlert(title: "No Cameras", message: "No cameras were returned by UniFi Protect.")
             } else if openCameraSheetAfterLoad {
                 showingCameraSheet = true
+            } else if openDailySheetAfterLoad {
+                openDailySheetAfterLoad = false
+                showingDailyScheduleSheet = true
             }
         case "error":
             cameraReceivedTerminal = true
+            openDailySheetAfterLoad = false
             showError(title: "Could Not Load Cameras", message: event.message ?? "An unknown backend error occurred.")
         case "log":
             appendLog(level: event.level ?? "INFO", message: event.message ?? "")
@@ -397,6 +573,7 @@ final class AppModel: ObservableObject {
         cameraProcess = nil
         isLoadingCameras = false
         if !cameraReceivedTerminal && !completion.wasCancelled {
+            openDailySheetAfterLoad = false
             let detail = completion.stderr.isEmpty
                 ? "The backend exited with status \(completion.exitCode) without returning a camera list."
                 : completion.stderr
@@ -405,15 +582,31 @@ final class AppModel: ObservableObject {
         finishShutdownIfReady()
     }
 
-    private func startDownload(camera: CameraInfo, group: Int) {
-        let outputURL = reserveOutputURL(camera: camera)
+    private func startDownload(
+        camera: CameraInfo,
+        group: Int,
+        start: Date,
+        end: Date,
+        speed: String,
+        outputDirectory: URL,
+        requestSettings: BackendSettings,
+        daily: Bool = false
+    ) {
+        let outputURL = reserveOutputURL(
+            camera: camera,
+            start: start,
+            end: end,
+            speed: speed,
+            outputDirectory: outputDirectory,
+            daily: daily
+        )
         let job = DownloadJob(
             groupNumber: group,
             camera: camera,
             outputURL: outputURL,
-            requestSettings: BackendSettings(settings),
-            requestStart: Self.iso8601String(startDate),
-            requestEnd: Self.iso8601String(endDate),
+            requestSettings: requestSettings,
+            requestStart: Self.iso8601String(start),
+            requestEnd: Self.iso8601String(end),
             requestSpeed: speed
         )
         jobs.append(job)
@@ -509,8 +702,16 @@ final class AppModel: ObservableObject {
         finishShutdownIfReady()
     }
 
-    private func reserveOutputURL(camera: CameraInfo) -> URL {
-        let base = "timelapse_\(Self.safeFilename(camera.name))_\(Self.filenameDate(startDate))_\(Self.filenameDate(endDate))_\(speed)"
+    private func reserveOutputURL(
+        camera: CameraInfo,
+        start: Date,
+        end: Date,
+        speed: String,
+        outputDirectory: URL,
+        daily: Bool
+    ) -> URL {
+        let prefix = daily ? "daily_timelapse" : "timelapse"
+        let base = "\(prefix)_\(Self.safeFilename(camera.name))_\(Self.filenameDate(start))_\(Self.filenameDate(end))_\(speed)"
         var counter = 1
         while true {
             let suffix = counter == 1 ? "" : "_\(counter)"
@@ -564,6 +765,10 @@ final class AppModel: ObservableObject {
         filenameDateFormatter.string(from: date)
     }
 
+    private static func calendarDay(_ date: Date) -> String {
+        calendarDayFormatter.string(from: date)
+    }
+
     private static func safeFilename(_ value: String) -> String {
         let invalid = CharacterSet(charactersIn: "<>:\"/\\|?*")
             .union(.controlCharacters)
@@ -586,6 +791,14 @@ final class AppModel: ObservableObject {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    private static let calendarDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
         return formatter
     }()
 }

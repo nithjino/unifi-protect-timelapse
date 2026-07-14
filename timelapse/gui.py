@@ -10,7 +10,7 @@ import sys
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from threading import Lock
@@ -28,6 +28,7 @@ from PySide6.QtCore import (
     QStandardPaths,
     Qt,
     QThread,
+    QTime,
     QTimer,
     QUrl,
     Signal,
@@ -68,6 +69,7 @@ from timelapse import TimelapseError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo, parse_connection
+from timelapse.schedule import config_for_local_day, daily_output_path, latest_complete_local_day
 from timelapse.service import export_timelapse, list_available_cameras
 
 if TYPE_CHECKING:
@@ -303,7 +305,7 @@ class _DownloadEntry:
     output: Path
     camera: CameraInfo
     config: Config
-    worker: _DownloadWorker
+    worker: _DownloadWorker | None
     progress_bar: QProgressBar
     action_button: QPushButton
     downloaded_bytes: int = 0
@@ -311,10 +313,20 @@ class _DownloadEntry:
     cancelling: bool = False
     terminal: bool = False
     completed: bool = False
+    daily_schedule: bool = False
 
     @property
     def camera_name(self) -> str:
         return self.camera.name
+
+
+@dataclass
+class _DailySchedule:
+    cameras: tuple[CameraInfo, ...]
+    output_directory: Path
+    speed: str
+    entry: _DownloadEntry
+    last_run_day: date | None = None
 
 
 class _LogEmitter(QObject):
@@ -631,6 +643,80 @@ class _CameraSelectionDialog(QDialog):
         return [camera for camera in self._cameras if camera.id in selected_ids]
 
 
+class _DailyScheduleDialog(QDialog):
+    def __init__(self, cameras: list[CameraInfo], initial_directory: Path, parent: QWidget | None) -> None:
+        super().__init__(parent)
+        self._cameras = cameras
+        self.setWindowTitle("Daily Automatic Timelapses")
+        self.resize(560, 480)
+        layout = QVBoxLayout(self)
+        explanation = QLabel(
+            "Select the cameras and destination for automatic 24-hour timelapses. "
+            "The latest completed day is exported now, then each new day is exported while this app stays open."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
+        self._camera_list = QListWidget()
+        self._camera_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        for camera in cameras:
+            item = QListWidgetItem(camera.name)
+            item.setData(Qt.ItemDataRole.UserRole, camera.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self._camera_list.addItem(item)
+        layout.addWidget(self._camera_list)
+        output_row = QHBoxLayout()
+        output_row.addWidget(QLabel("Save to:"))
+        self._output_edit = QLineEdit(str(initial_directory))
+        self._output_edit.setReadOnly(True)
+        output_row.addWidget(self._output_edit, stretch=1)
+        choose_button = QPushButton("Choose…")
+        choose_button.clicked.connect(self._choose_directory)
+        output_row.addWidget(choose_button)
+        layout.addLayout(output_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        select_all = buttons.addButton("Select All", QDialogButtonBox.ButtonRole.ActionRole)
+        select_all.clicked.connect(self._select_all)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @Slot()
+    def _choose_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(self, "Choose Daily Timelapse Folder", self._output_edit.text())
+        if selected:
+            self._output_edit.setText(selected)
+
+    @Slot()
+    def _select_all(self) -> None:
+        for index in range(self._camera_list.count()):
+            item = self._camera_list.item(index)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Checked)
+
+    def selected_cameras(self) -> list[CameraInfo]:
+        selected_ids = {
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for index in range(self._camera_list.count())
+            if (item := self._camera_list.item(index)) is not None and item.checkState() == Qt.CheckState.Checked
+        }
+        return [camera for camera in self._cameras if camera.id in selected_ids]
+
+    def output_directory(self) -> Path:
+        return Path(self._output_edit.text()).expanduser()
+
+    def accept(self) -> None:
+        """Validate the daily schedule before closing the dialog."""
+        if not self.selected_cameras():
+            QMessageBox.warning(self, "No Cameras Selected", "Select at least one camera for the daily job.")
+            return
+        output = self.output_directory()
+        if output.exists() and not output.is_dir():
+            QMessageBox.warning(self, "Invalid Output Folder", "The selected output location is not a folder.")
+            return
+        super().accept()
+
+
 class _CameraLoader(QThread):
     cameras_loaded: ClassVar[Signal] = Signal(object)
     load_failed: ClassVar[Signal] = Signal(str)
@@ -766,10 +852,13 @@ class _MainWindow(QMainWindow):
         self._selected_cameras: list[CameraInfo] = []
         self._camera_loader: _CameraLoader | None = None
         self._open_camera_dialog_after_load = False
+        self._open_daily_dialog_after_load = False
         self._workers: dict[_DownloadWorker, _DownloadEntry] = {}
         self._entries: list[_DownloadEntry] = []
         self._reserved_paths: set[str] = set()
         self._next_job_number = 1
+        self._daily_schedule: _DailySchedule | None = None
+        self._adjusting_full_day = False
         self._closing = False
         self._log_handler_attached = False
         self.setWindowTitle("UniFi Protect Timelapse")
@@ -782,6 +871,10 @@ class _MainWindow(QMainWindow):
         self._speed_timer.setInterval(1000)
         self._speed_timer.timeout.connect(self._clear_stalled_speeds)
         self._speed_timer.start()
+        self._daily_timer = QTimer(self)
+        self._daily_timer.setInterval(60_000)
+        self._daily_timer.timeout.connect(self._run_daily_schedule_if_due)
+        self._daily_timer.start()
         self._install_log_handler()
         self._update_profile_controls()
         self._update_camera_summary()
@@ -894,7 +987,7 @@ class _MainWindow(QMainWindow):
         layout.addWidget(self._connection_label)
         return group
 
-    def _options_group(self) -> QGroupBox:
+    def _options_group(self) -> QGroupBox:  # noqa: PLR0915 - constructs one cohesive form
         group = QGroupBox("New Timelapse")
         group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         outer = QHBoxLayout(group)
@@ -903,8 +996,15 @@ class _MainWindow(QMainWindow):
         now = QDateTime.currentDateTime()
         self._start_edit = self._date_time_editor(now.addDays(-1))
         self._end_edit = self._date_time_editor(now)
+        self._start_edit.dateTimeChanged.connect(self._full_day_start_changed)
+        self._end_edit.dateTimeChanged.connect(self._full_day_end_changed)
         date_form.addRow("Start:", self._start_edit)
         date_form.addRow("End:", self._end_edit)
+
+        self._full_day_checkbox = QCheckBox("24-hour timelapse")
+        self._full_day_checkbox.setToolTip("Use date-only controls and export exactly one complete local calendar day.")
+        self._full_day_checkbox.toggled.connect(self._full_day_toggled)
+        date_form.addRow("", self._full_day_checkbox)
 
         self._speed_combo = QComboBox()
         self._speed_combo.addItems(list(SPEED_TO_FPS))
@@ -942,6 +1042,11 @@ class _MainWindow(QMainWindow):
         camera_layout.addStretch(1)
         details_form.addRow("Cameras:", camera_row)
 
+        self._daily_checkbox = QCheckBox("Daily automatic timelapses")
+        self._daily_checkbox.setToolTip("Export each completed local day while this program remains open.")
+        self._daily_checkbox.toggled.connect(self._daily_toggled)
+        details_form.addRow("", self._daily_checkbox)
+
         self._start_button = QPushButton("Start Downloads")
         self._start_button.setProperty("primary", "true")
         self._start_button.setMaximumWidth(180)
@@ -959,6 +1064,43 @@ class _MainWindow(QMainWindow):
         editor.setMinimumDateTime(_MINIMUM_DATE)
         editor.setToolTip("Type a date and time or use the calendar button to choose a date.")
         return editor
+
+    @Slot(bool)
+    def _full_day_toggled(self, enabled: bool) -> None:  # noqa: FBT001 - Qt signal signature
+        display_format = "MMM d, yyyy" if enabled else "MMM d, yyyy h:mm AP"
+        tooltip = "Choose a date." if enabled else "Type a date and time or use the calendar button to choose a date."
+        self._start_edit.setDisplayFormat(display_format)
+        self._end_edit.setDisplayFormat(display_format)
+        self._start_edit.setToolTip(tooltip)
+        self._end_edit.setToolTip(tooltip)
+        if enabled:
+            self._set_full_day_from_start(self._start_edit.dateTime())
+
+    @Slot(QDateTime)
+    def _full_day_start_changed(self, value: QDateTime) -> None:
+        if self._full_day_checkbox.isChecked() and not self._adjusting_full_day:
+            self._set_full_day_from_start(value)
+
+    @Slot(QDateTime)
+    def _full_day_end_changed(self, value: QDateTime) -> None:
+        if not self._full_day_checkbox.isChecked() or self._adjusting_full_day:
+            return
+        self._adjusting_full_day = True
+        try:
+            end = QDateTime(value.date(), QTime(0, 0))
+            self._end_edit.setDateTime(end)
+            self._start_edit.setDateTime(end.addDays(-1))
+        finally:
+            self._adjusting_full_day = False
+
+    def _set_full_day_from_start(self, value: QDateTime) -> None:
+        self._adjusting_full_day = True
+        try:
+            start = QDateTime(value.date(), QTime(0, 0))
+            self._start_edit.setDateTime(start)
+            self._end_edit.setDateTime(start.addDays(1))
+        finally:
+            self._adjusting_full_day = False
 
     def _downloads_group(self) -> QGroupBox:
         group = QGroupBox("Downloads")
@@ -1166,16 +1308,23 @@ class _MainWindow(QMainWindow):
         selected_ids = {camera.id for camera in self._selected_cameras}
         self._selected_cameras = [camera for camera in self._cameras if camera.id in selected_ids]
         if not self._cameras:
+            self._open_daily_dialog_after_load = False
+            self._set_daily_checkbox(checked=False)
             QMessageBox.information(self, "No Cameras", "No cameras were returned by UniFi Protect.")
             return
         self.statusBar().showMessage(f"Loaded {len(self._cameras)} cameras", 5000)
         _LOGGER.info("Loaded %d cameras", len(self._cameras))
         if self._open_camera_dialog_after_load:
             self._show_camera_selection()
+        elif self._open_daily_dialog_after_load:
+            self._open_daily_dialog_after_load = False
+            self._show_daily_schedule_dialog()
 
     @Slot(str)
     def _camera_load_failed(self, message: str) -> None:
         if not self._closing:
+            self._open_daily_dialog_after_load = False
+            self._set_daily_checkbox(checked=False)
             QMessageBox.critical(self, "Could Not Load Cameras", message)
             self.statusBar().showMessage("Camera loading failed", 5000)
             _LOGGER.error("Camera loading failed: %s", message)
@@ -1208,6 +1357,143 @@ class _MainWindow(QMainWindow):
         self._camera_summary.setText(summary)
         self._camera_summary.setToolTip(", ".join(camera.name for camera in self._selected_cameras))
         self._start_button.setEnabled(count > 0 and not self._closing)
+
+    @Slot(bool)
+    def _daily_toggled(self, enabled: bool) -> None:  # noqa: FBT001 - Qt signal signature
+        if not enabled:
+            if self._daily_schedule is not None:
+                self._stop_daily_schedule()
+            return
+        if self._daily_schedule is not None:
+            return
+        if not self._cameras:
+            self._open_camera_dialog_after_load = False
+            self._open_daily_dialog_after_load = True
+            self._load_cameras(open_dialog=False)
+            return
+        self._show_daily_schedule_dialog()
+
+    def _show_daily_schedule_dialog(self) -> None:
+        dialog = _DailyScheduleDialog(self._cameras, Path(self._output_edit.text()).expanduser(), self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._set_daily_checkbox(checked=False)
+            return
+        output_directory = dialog.output_directory()
+        cameras = tuple(dialog.selected_cameras())
+        try:
+            output_directory.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could Not Create Output Folder", _exception_text(exc))
+            self._set_daily_checkbox(checked=False)
+            return
+        entry = self._add_daily_schedule_row(cameras, output_directory)
+        self._daily_schedule = _DailySchedule(
+            cameras=cameras,
+            output_directory=output_directory,
+            speed=self._speed_combo.currentText(),
+            entry=entry,
+        )
+        self.statusBar().showMessage(f"Scheduled daily timelapses for {len(cameras)} cameras", 5000)
+        _LOGGER.info("Scheduled daily timelapses for %d cameras in %s", len(cameras), output_directory)
+        self._run_daily_schedule_if_due()
+
+    def _add_daily_schedule_row(
+        self,
+        cameras: tuple[CameraInfo, ...],
+        output_directory: Path,
+    ) -> _DownloadEntry:
+        now = datetime.now().astimezone()
+        config = self._settings.make_config(now, now + timedelta(seconds=1), self._speed_combo.currentText())
+        camera = CameraInfo(
+            id="daily-schedule",
+            name=f"{len(cameras)} cameras" if len(cameras) != 1 else cameras[0].name,
+            state=None,
+            model=None,
+        )
+        row = self._downloads.rowCount()
+        self._downloads.insertRow(row)
+        values = {
+            _COLUMN_JOB: str(self._next_job_number),
+            _COLUMN_CAMERA: camera.name,
+            _COLUMN_STATUS: "Scheduled daily",
+            _COLUMN_DOWNLOADED: "—",
+            _COLUMN_EXPECTED: "—",
+            _COLUMN_SPEED: "—",
+            _COLUMN_OUTPUT: output_directory.name or str(output_directory),
+        }
+        self._next_job_number += 1
+        for column, value in values.items():
+            item = QTableWidgetItem(value)
+            if column == _COLUMN_OUTPUT:
+                item.setToolTip(str(output_directory))
+            self._downloads.setItem(row, column, item)
+        progress_bar = QProgressBar()
+        progress_bar.setRange(0, 1)
+        progress_bar.setValue(0)
+        progress_bar.setFormat("Daily")
+        self._downloads.setCellWidget(row, _COLUMN_PROGRESS, progress_bar)
+        stop_button = QPushButton("Stop")
+        stop_button.clicked.connect(self._stop_daily_schedule)
+        self._downloads.setCellWidget(row, _COLUMN_ACTION, stop_button)
+        entry = _DownloadEntry(
+            row=row,
+            job_number=self._next_job_number - 1,
+            output=output_directory,
+            camera=camera,
+            config=config,
+            worker=None,
+            progress_bar=progress_bar,
+            action_button=stop_button,
+            daily_schedule=True,
+        )
+        self._entries.append(entry)
+        self._sync_download_view()
+        self._update_bulk_buttons()
+        return entry
+
+    @Slot()
+    def _stop_daily_schedule(self) -> None:
+        schedule = self._daily_schedule
+        if schedule is None:
+            return
+        self._daily_schedule = None
+        schedule.entry.terminal = True
+        self._set_table_text(schedule.entry.row, _COLUMN_STATUS, "Stopped")
+        self._set_action_button(schedule.entry, "Remove", partial(self._remove_entry, schedule.entry))
+        self._set_daily_checkbox(checked=False)
+        self._update_bulk_buttons()
+        self.statusBar().showMessage("Stopped daily automatic timelapses", 5000)
+        _LOGGER.info("Stopped daily automatic timelapses")
+
+    def _set_daily_checkbox(self, *, checked: bool) -> None:
+        self._daily_checkbox.blockSignals(True)  # noqa: FBT003 - Qt API
+        self._daily_checkbox.setChecked(checked)
+        self._daily_checkbox.blockSignals(False)  # noqa: FBT003 - Qt API
+
+    @Slot()
+    def _run_daily_schedule_if_due(self) -> None:
+        schedule = self._daily_schedule
+        if schedule is None:
+            return
+        latest_day = latest_complete_local_day()
+        day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day is not None else latest_day
+        if day > latest_day:
+            return
+        while day <= latest_day:
+            schedule.last_run_day = day
+            config = config_for_local_day(schedule.entry.config, day)
+            job_number = self._next_job_number
+            self._next_job_number += 1
+            for camera in schedule.cameras:
+                preferred = daily_output_path(config, camera, schedule.output_directory)
+                output = self._reserve_output_path(preferred)
+                worker = _DownloadWorker(config, camera, output, self)
+                entry = self._add_download_row(job_number, camera, output, worker, config=config)
+                self._start_download_worker(entry, worker)
+                _LOGGER.info("Started daily camera download: %s -> %s", camera.name, output)
+            self.statusBar().showMessage(f"Started daily job {job_number} for {day.isoformat()}")
+            day += timedelta(days=1)
+        self._update_activity_indicator()
 
     @Slot()
     def _queue_downloads(self) -> None:
@@ -1326,6 +1612,8 @@ class _MainWindow(QMainWindow):
         cancellable = [worker for worker, entry in self._workers.items() if not entry.terminal and not entry.cancelling]
         for worker in cancellable:
             self._cancel_download(worker)
+        if self._daily_schedule is not None:
+            self._stop_daily_schedule()
         if cancellable:
             self.statusBar().showMessage(f"Cancelling {len(cancellable)} downloads…")
 
@@ -1354,7 +1642,12 @@ class _MainWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
-        if entry.completed:
+        if entry.daily_schedule and not entry.terminal:
+            stop_action = menu.addAction("Stop Daily Job")
+            stop_action.triggered.connect(self._stop_daily_schedule)
+        elif entry.daily_schedule:
+            pass
+        elif entry.completed:
             open_action = menu.addAction("Open Video")
             open_action.triggered.connect(partial(self._open_entry_video, entry))
             show_action = menu.addAction("Show Folder")
@@ -1365,8 +1658,10 @@ class _MainWindow(QMainWindow):
             restart_action.triggered.connect(partial(self._restart_download, entry))
         else:
             cancel_action = menu.addAction("Cancel")
-            cancel_action.setEnabled(not entry.cancelling)
-            cancel_action.triggered.connect(partial(self._cancel_download, entry.worker))
+            worker = entry.worker
+            cancel_action.setEnabled(not entry.cancelling and worker is not None)
+            if worker is not None:
+                cancel_action.triggered.connect(partial(self._cancel_download, worker))
         menu.addSeparator()
         remove_action = menu.addAction("Remove from List")
         remove_action.setEnabled(self._is_removable(entry))
@@ -1486,7 +1781,7 @@ class _MainWindow(QMainWindow):
         entry.action_button = button
 
     def _restart_download(self, entry: _DownloadEntry) -> None:
-        if not entry.terminal or entry.completed or entry.worker in self._workers:
+        if entry.daily_schedule or not entry.terminal or entry.completed or entry.worker in self._workers:
             return
         if entry.output.exists():
             QMessageBox.warning(
@@ -1546,6 +1841,7 @@ class _MainWindow(QMainWindow):
         """Cancel background work before allowing the native window to close."""
         has_background_work = self._camera_loader is not None or bool(self._workers)
         if not has_background_work:
+            self._daily_schedule = None
             self._preferences.setValue("output_directory", self._output_edit.text())
             self._logs_window.close()
             _LOGGER.info("Application closed")
@@ -1566,6 +1862,8 @@ class _MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
+        self._daily_schedule = None
+        self._daily_timer.stop()
         self._start_button.setEnabled(False)
         self.statusBar().showMessage("Cancelling active work…")
         _LOGGER.info("Application close requested; cancelling active work")
