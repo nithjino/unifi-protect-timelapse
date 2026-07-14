@@ -46,9 +46,14 @@ final class AppModel: ObservableObject {
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
     var hasActiveBackendProcesses: Bool { cameraProcess != nil || !downloadProcesses.isEmpty }
-    var hasClearableJobs: Bool { jobs.contains { $0.state.isTerminal } }
-    var hasCancellableJobs: Bool {
-        jobs.contains { !$0.state.isTerminal && $0.state != .cancelling }
+    func hasClearableJobs(dailyAutomations: Bool) -> Bool {
+        jobs.contains { $0.isDailySchedule == dailyAutomations && $0.state.isTerminal }
+    }
+
+    func hasCancellableJobs(dailyAutomations: Bool) -> Bool {
+        jobs.contains {
+            $0.isDailySchedule == dailyAutomations && !$0.state.isTerminal && $0.state != .cancelling
+        }
     }
     var selectedProfile: ConnectionProfile? {
         profiles.first { $0.id == selectedProfileID }
@@ -452,27 +457,35 @@ final class AppModel: ObservableObject {
         appendLog(level: "INFO", message: "Cancellation requested for \(job.camera.name)")
     }
 
-    func cancelAllJobs() {
-        let cancellableJobs = jobs.filter { !$0.state.isTerminal && $0.state != .cancelling }
+    func cancelAllJobs(dailyAutomations: Bool) {
+        let cancellableJobs = jobs.filter {
+            $0.isDailySchedule == dailyAutomations && !$0.state.isTerminal && $0.state != .cancelling
+        }
         guard !cancellableJobs.isEmpty else { return }
         for job in cancellableJobs {
             cancel(job)
         }
-        statusMessage = "Cancelling \(cancellableJobs.count) downloads…"
+        statusMessage = dailyAutomations
+            ? "Stopping \(cancellableJobs.count) daily automations…"
+            : "Cancelling \(cancellableJobs.count) downloads…"
     }
 
     func remove(_ job: DownloadJob) {
         guard job.state.isTerminal else { return }
         jobs.removeAll { $0.id == job.id }
-        statusMessage = "Removed \(job.camera.name) from the download list"
+        statusMessage = "Removed \(job.camera.name) from the job list"
         appendLog(level: "INFO", message: statusMessage)
     }
 
-    func clearFinishedJobs() {
-        let removedCount = jobs.count(where: { $0.state.isTerminal })
+    func clearFinishedJobs(dailyAutomations: Bool) {
+        let removedCount = jobs.count(where: {
+            $0.isDailySchedule == dailyAutomations && $0.state.isTerminal
+        })
         guard removedCount > 0 else { return }
-        jobs.removeAll { $0.state.isTerminal }
-        statusMessage = "Cleared \(removedCount) finished downloads"
+        jobs.removeAll { $0.isDailySchedule == dailyAutomations && $0.state.isTerminal }
+        statusMessage = dailyAutomations
+            ? "Cleared \(removedCount) stopped daily automations"
+            : "Cleared \(removedCount) finished downloads"
         appendLog(level: "INFO", message: statusMessage)
     }
 

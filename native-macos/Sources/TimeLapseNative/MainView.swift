@@ -1,9 +1,17 @@
 import SwiftUI
 
 struct MainView: View {
+    private enum JobListTab: String, CaseIterable {
+        case downloads = "Downloads"
+        case dailyAutomations = "Daily Automations"
+
+        var showsDailyAutomations: Bool { self == .dailyAutomations }
+    }
+
     @ObservedObject var model: AppModel
     @Environment(\.openWindow) private var openWindow
     @State private var selectedJobIDs: Set<UUID> = []
+    @State private var selectedJobListTab = JobListTab.downloads
 
     var body: some View {
         ZStack {
@@ -144,6 +152,7 @@ struct MainView: View {
                             .help("Use date-only controls and export exactly one complete local calendar day.")
                     }
                 }
+                .fixedSize(horizontal: true, vertical: false)
                 Divider()
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 8) {
@@ -195,6 +204,7 @@ struct MainView: View {
         )
             .labelsHidden()
             .datePickerStyle(.compact)
+            .fixedSize(horizontal: true, vertical: false)
             .help("Type a date and time or open the calendar to choose a date.")
     }
 
@@ -229,24 +239,38 @@ struct MainView: View {
     private var downloadsGroup: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(spacing: 8) {
-                Label("Downloads", systemImage: "arrow.down.circle")
+                Label("Jobs", systemImage: "arrow.down.circle")
                     .font(.headline)
                 Button("Clear All") { clearFinishedJobs() }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!model.hasClearableJobs)
-                Button("Cancel All") { model.cancelAllJobs() }
+                    .disabled(!model.hasClearableJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations))
+                Button(selectedJobListTab.showsDailyAutomations ? "Stop All" : "Cancel All") {
+                    model.cancelAllJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations)
+                }
                     .buttonStyle(.borderedProminent)
-                    .disabled(!model.hasCancellableJobs)
+                    .disabled(!model.hasCancellableJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations))
                 Spacer()
             }
-            if model.jobs.isEmpty {
+            Picker("Job list", selection: $selectedJobListTab) {
+                ForEach(JobListTab.allCases, id: \.self) { tab in
+                    Text(tab.rawValue).tag(tab)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .frame(width: 300)
+            .onChange(of: selectedJobListTab) {
+                selectedJobIDs.removeAll()
+            }
+            if visibleJobs.isEmpty {
                 HStack(spacing: 12) {
-                    Image(systemName: "tray")
+                    Image(systemName: selectedJobListTab.showsDailyAutomations ? "calendar.badge.clock" : "tray")
                         .font(.title2)
                         .foregroundStyle(.tertiary)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("No downloads yet").font(.headline)
-                        Text("Select cameras and start a timelapse to track it here.")
+                        Text(selectedJobListTab.showsDailyAutomations ? "No daily automations" : "No downloads yet")
+                            .font(.headline)
+                        Text(emptyJobListMessage)
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
@@ -258,11 +282,11 @@ struct MainView: View {
             }
         }
         .modernCard()
-        .frame(maxHeight: model.jobs.isEmpty ? 116 : .infinity)
+        .frame(maxHeight: visibleJobs.isEmpty ? 150 : .infinity)
     }
 
     private var downloadsTable: some View {
-        Table(model.jobs, selection: $selectedJobIDs) {
+        Table(visibleJobs, selection: $selectedJobIDs) {
             TableColumn("Job") { job in Text("\(job.groupNumber)") }.width(42)
             TableColumn("Camera") { job in Text(job.camera.name).lineLimit(1) }.width(min: 100, ideal: 135)
             TableColumn("Status") { job in DownloadStatusCell(job: job) }.width(min: 110, ideal: 145)
@@ -280,12 +304,24 @@ struct MainView: View {
             TableColumn("Action") { job in DownloadActionCell(model: model, job: job) }.width(min: 70, ideal: 95)
         }
         .contextMenu(forSelectionType: UUID.self) { selectedIDs in
-            if let job = model.jobs.first(where: { selectedIDs.contains($0.id) }) {
+            if let job = visibleJobs.first(where: { selectedIDs.contains($0.id) }) {
                 jobMenu(for: job)
             }
         } primaryAction: { selectedIDs in
-            guard let job = model.jobs.first(where: { selectedIDs.contains($0.id) }) else { return }
+            guard let job = visibleJobs.first(where: { selectedIDs.contains($0.id) }) else { return }
             model.openVideo(job)
+        }
+    }
+
+    private var visibleJobs: [DownloadJob] {
+        model.jobs.filter { $0.isDailySchedule == selectedJobListTab.showsDailyAutomations }
+    }
+
+    private var emptyJobListMessage: String {
+        if selectedJobListTab.showsDailyAutomations {
+            "Enable daily automatic timelapses to track the schedule here."
+        } else {
+            "Select cameras and start a timelapse to track it here."
         }
     }
 
@@ -342,8 +378,8 @@ struct MainView: View {
     }
 
     private func clearFinishedJobs() {
-        model.clearFinishedJobs()
-        selectedJobIDs.formIntersection(model.jobs.map(\.id))
+        model.clearFinishedJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations)
+        selectedJobIDs.formIntersection(visibleJobs.map(\.id))
     }
 
 }
