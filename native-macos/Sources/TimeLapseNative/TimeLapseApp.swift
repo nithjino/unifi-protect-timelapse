@@ -36,9 +36,9 @@ struct TimeLapseApp: App {
     var body: some Scene {
         Window("UniFi Protect Timelapse", id: "main") {
             MainView(model: appDelegate.model)
-                .frame(minWidth: 1_100, minHeight: 560)
+                .frame(minWidth: 1_250, minHeight: 560)
         }
-        .defaultSize(width: 1_180, height: 680)
+        .defaultSize(width: 1_400, height: 680)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .newItem) {

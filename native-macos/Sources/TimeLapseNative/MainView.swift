@@ -288,20 +288,27 @@ struct MainView: View {
     private var downloadsTable: some View {
         Table(visibleJobs, selection: $selectedJobIDs) {
             TableColumn("Job") { job in Text("\(job.groupNumber)") }.width(42)
-            TableColumn("Camera") { job in Text(job.camera.name).lineLimit(1) }.width(min: 100, ideal: 135)
-            TableColumn("Status") { job in DownloadStatusCell(job: job) }.width(min: 110, ideal: 145)
-            TableColumn("Progress") { job in DownloadProgressCell(job: job) }.width(min: 130, ideal: 180)
-            TableColumn("Downloaded") { job in DownloadBytesCell(job: job, expected: false) }.width(min: 78, ideal: 92)
-            TableColumn("Expected") { job in DownloadBytesCell(job: job, expected: true) }.width(min: 72, ideal: 88)
-            TableColumn("Speed") { job in DownloadSpeedCell(job: job) }.width(min: 72, ideal: 90)
+            TableColumn("Camera") { job in Text(job.camera.name).lineLimit(1) }.width(min: 80, ideal: 105)
+            TableColumn("Time Range") { job in
+                Text(job.timeRangeText)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .help(job.timeRangeText)
+            }
+            .width(min: 205, ideal: 235)
+            TableColumn("Status") { job in DownloadStatusCell(job: job) }.width(min: 95, ideal: 120)
+            TableColumn("Progress") { job in DownloadProgressCell(job: job) }.width(min: 110, ideal: 145)
+            TableColumn("Downloaded") { job in DownloadBytesCell(job: job, expected: false) }.width(min: 70, ideal: 85)
+            TableColumn("Expected") { job in DownloadBytesCell(job: job, expected: true) }.width(min: 65, ideal: 80)
+            TableColumn("Speed") { job in DownloadSpeedCell(job: job) }.width(min: 65, ideal: 80)
             TableColumn("Output") { job in
                 Text(job.outputURL.lastPathComponent)
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(job.outputURL.path)
             }
-            .width(min: 120, ideal: 210)
-            TableColumn("Action") { job in DownloadActionCell(model: model, job: job) }.width(min: 70, ideal: 95)
+            .width(min: 100, ideal: 160)
+            TableColumn("Action") { job in DownloadActionCell(model: model, job: job) }.width(min: 65, ideal: 80)
         }
         .contextMenu(forSelectionType: UUID.self) { selectedIDs in
             if let job = visibleJobs.first(where: { selectedIDs.contains($0.id) }) {

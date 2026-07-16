@@ -252,6 +252,24 @@ final class DownloadJob: ObservableObject, Identifiable {
         self.isDailySchedule = isDailySchedule
         state = initialState
     }
+
+    var timeRangeText: String {
+        guard !isDailySchedule else { return "Next completed day" }
+        guard
+            let start = Self.requestDateFormatter.date(from: requestStart),
+            let end = Self.requestDateFormatter.date(from: requestEnd)
+        else { return "—" }
+        let endText = Calendar.current.isDate(start, inSameDayAs: end)
+            ? end.formatted(date: .omitted, time: .shortened)
+            : end.formatted(date: .abbreviated, time: .shortened)
+        return "\(start.formatted(date: .abbreviated, time: .shortened)) → \(endText)"
+    }
+
+    private static let requestDateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
 }
 
 struct LogEntry: Identifiable, Sendable {

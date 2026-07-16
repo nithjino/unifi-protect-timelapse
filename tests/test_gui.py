@@ -149,6 +149,11 @@ def test_activity_indicator_tracks_background_work(
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "output.mp4", main_window)
     entry = main_window._add_download_row(1, camera, tmp_path / "output.mp4", worker)
 
+    expected_end = config.end.astimezone().strftime("%I:%M %p")
+    assert _entry_text(main_window, entry, gui_module._COLUMN_TIME_RANGE) == (
+        f"{gui_module._format_job_datetime(config.start)} → {expected_end}"
+    )
+
     assert main_window._activity_widget.isHidden() is True
 
     main_window._workers[worker] = entry

@@ -24,6 +24,8 @@ def test_windows_native_gui_includes_full_day_and_daily_controls() -> None:
     assert 'Header="Daily Automations"' in main_xaml
     assert 'ItemsSource="{Binding DownloadJobs}"' in main_xaml
     assert 'ItemsSource="{Binding DailyAutomationJobs}"' in main_xaml
+    assert main_xaml.count('Header="Time Range" Binding="{Binding TimeRangeText}"') == 2
+    assert "public string TimeRangeText" in (ROOT / "native-windows" / "Models.cs").read_text(encoding="utf-8")
     assert "RunDailyScheduleIfDue" in main_code
     assert "daily_timelapse" in main_code
     assert "ShowingDailyAutomations" in main_code

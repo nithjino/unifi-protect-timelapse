@@ -15,6 +15,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 - Exact date/time ranges or daylight-saving-aware local calendar days
 - Daily automatic exports for the most recently completed day
 - Multiple concurrent per-camera jobs in the desktop interfaces
+- Job tables show the requested start and end date/time for every timelapse
 - Streaming downloads with progress, cancellation, and atomic finalization
 - Safe output filenames and protection against overwriting existing videos
 - Configurable request timeout and maximum download size
@@ -200,7 +201,7 @@ uv run python -m timelapse --start-date 07-13-2026
 
 ## Native macOS GUI
 
-The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
+The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
 
 ![Native macOS TimeLapse interface](docs/screenshots/macos-native-ui.png)
 
@@ -213,9 +214,9 @@ open dist/macos/timelapse.app
 
 The build requires macOS 15 or newer, the Swift/Xcode command-line toolchain, and `uv`; its isolated backend environment uses Python 3.13 by default. Without `MACOS_SIGN_IDENTITY`, the script applies an ad-hoc signature suitable for local development. Set `MACOS_SIGN_IDENTITY` and, optionally, `MACOS_NOTARY_PROFILE` when producing a distributable build.
 
-## Cross-platform Qt GUI (macOS, Linux, and Windows)
+## Qt GUI (Linux and Windows)
 
-The PySide6 interface—often referred to as the PyQt GUI—runs on macOS, Linux, and Windows. macOS and Windows also have native GUIs for people who prefer a platform-native experience. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored with the operating system's credential store through `keyring`.
+The PySide6 interface—often referred to as the PyQt GUI—runs on Linux and Windows. macOS uses the native SwiftUI application instead. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, requested time ranges in the job list, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored with the operating system's credential store through `keyring`.
 
 ![Qt TimeLapse interface](docs/screenshots/pyqt-ui.png)
 
@@ -235,7 +236,7 @@ The Linux build is written to `dist/linux/`. Build on the oldest Linux distribut
 
 ## Native Windows GUI
 
-The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
+The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. Its job list includes the requested start and end date/time along with download progress and actions. Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
 
 ```powershell
 .\build-windows.ps1

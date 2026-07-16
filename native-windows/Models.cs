@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Serialization;
 
@@ -168,6 +169,22 @@ public sealed class DownloadJob : INotifyPropertyChanged
 
     public bool IsTerminal => State is DownloadState.Completed or DownloadState.Cancelled or DownloadState.Failed or DownloadState.Stopped;
     public string CameraName => Camera.Name;
+    public string TimeRangeText
+    {
+        get
+        {
+            if (IsDailySchedule) return "Next completed day";
+            if (!DateTimeOffset.TryParse(RequestStart, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var start)
+                || !DateTimeOffset.TryParse(RequestEnd, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var end))
+                return "—";
+            var localStart = start.ToLocalTime();
+            var localEnd = end.ToLocalTime();
+            var endText = localStart.Date == localEnd.Date
+                ? localEnd.ToString("t", CultureInfo.CurrentCulture)
+                : localEnd.ToString("g", CultureInfo.CurrentCulture);
+            return $"{localStart.ToString("g", CultureInfo.CurrentCulture)} → {endText}";
+        }
+    }
     public string OutputName => Path.GetFileName(OutputPath);
     public string StatusText => State switch
     {

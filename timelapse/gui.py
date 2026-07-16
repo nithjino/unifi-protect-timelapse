@@ -103,16 +103,28 @@ _SELECTED_PROFILE_KEY = "selected_connection_profile_id"
 _ICON_BUNDLE_DIRECTORY = "timelapse_assets"
 _ICON_FILENAME = "timelapse.png"
 _MINIMUM_DATE = QDateTime.fromString("2000-01-01T00:00:00", Qt.DateFormat.ISODate)
-_TABLE_HEADERS = ("Job", "Camera", "Status", "Progress", "Downloaded", "Expected", "Speed", "Output", "Action")
+_TABLE_HEADERS = (
+    "Job",
+    "Camera",
+    "Time Range",
+    "Status",
+    "Progress",
+    "Downloaded",
+    "Expected",
+    "Speed",
+    "Output",
+    "Action",
+)
 _COLUMN_JOB = 0
 _COLUMN_CAMERA = 1
-_COLUMN_STATUS = 2
-_COLUMN_PROGRESS = 3
-_COLUMN_DOWNLOADED = 4
-_COLUMN_EXPECTED = 5
-_COLUMN_SPEED = 6
-_COLUMN_OUTPUT = 7
-_COLUMN_ACTION = 8
+_COLUMN_TIME_RANGE = 2
+_COLUMN_STATUS = 3
+_COLUMN_PROGRESS = 4
+_COLUMN_DOWNLOADED = 5
+_COLUMN_EXPECTED = 6
+_COLUMN_SPEED = 7
+_COLUMN_OUTPUT = 8
+_COLUMN_ACTION = 9
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
 
@@ -319,6 +331,19 @@ class _DownloadEntry:
     @property
     def camera_name(self) -> str:
         return self.camera.name
+
+
+def _format_job_datetime(value: datetime) -> str:
+    local_value = value.astimezone()
+    return f"{local_value:%b} {local_value.day}, {local_value:%Y} {local_value:%I:%M %p}"
+
+
+def _format_time_range(config: Config) -> str:
+    start = config.start.astimezone()
+    end = config.end.astimezone()
+    if start.date() == end.date():
+        return f"{_format_job_datetime(start)} → {end:%I:%M %p}"
+    return f"{_format_job_datetime(start)} → {_format_job_datetime(end)}"
 
 
 @dataclass
@@ -865,8 +890,8 @@ class _MainWindow(QMainWindow):
         self._closing = False
         self._log_handler_attached = False
         self.setWindowTitle("UniFi Protect Timelapse")
-        self.resize(1180, 680)
-        self.setMinimumSize(1100, 560)
+        self.resize(1400, 680)
+        self.setMinimumSize(1250, 560)
         self._install_styles()
         self._build_menu()
         self._build_interface()
@@ -1454,6 +1479,7 @@ class _MainWindow(QMainWindow):
         values = {
             _COLUMN_JOB: str(self._next_job_number),
             _COLUMN_CAMERA: camera.name,
+            _COLUMN_TIME_RANGE: "Next completed day",
             _COLUMN_STATUS: "Scheduled daily",
             _COLUMN_DOWNLOADED: "—",
             _COLUMN_EXPECTED: "—",
@@ -1589,6 +1615,7 @@ class _MainWindow(QMainWindow):
         values = {
             _COLUMN_JOB: str(job_number),
             _COLUMN_CAMERA: camera.name,
+            _COLUMN_TIME_RANGE: _format_time_range(config or worker.config),
             _COLUMN_STATUS: "Preparing export…",
             _COLUMN_DOWNLOADED: "0 bytes",
             _COLUMN_EXPECTED: "Unknown",

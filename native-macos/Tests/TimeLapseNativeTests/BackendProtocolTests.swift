@@ -3,6 +3,23 @@ import XCTest
 @testable import TimeLapseNative
 
 final class BackendProtocolTests: XCTestCase {
+    @MainActor
+    func testDownloadJobFormatsRequestedTimeRange() {
+        let settings = BackendSettings(ConnectionSettings())
+        let job = DownloadJob(
+            groupNumber: 1,
+            camera: CameraInfo(id: "camera-1", name: "Front Door", state: nil, model: nil),
+            outputURL: URL(fileURLWithPath: "/tmp/timelapse.mp4"),
+            requestSettings: settings,
+            requestStart: "2026-07-11T08:00:00.000Z",
+            requestEnd: "2026-07-11T09:00:00.000Z",
+            requestSpeed: "600x"
+        )
+
+        XCTAssertTrue(job.timeRangeText.contains("→"))
+        XCTAssertNotEqual(job.timeRangeText, "—")
+    }
+
     func testOnlyFinishedDownloadStatesAreTerminal() {
         XCTAssertTrue(DownloadState.completed.isTerminal)
         XCTAssertTrue(DownloadState.cancelled.isTerminal)
