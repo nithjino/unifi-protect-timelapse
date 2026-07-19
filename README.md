@@ -222,7 +222,7 @@ uv run python -m timelapse --start-date 07-13-2026
 
 The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, automatic thumbnail previews, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
 
-![Native macOS TimeLapse interface](docs/screenshots/macos-native-ui.png)
+![Native macOS TimeLapse interface showing a start-time thumbnail preview](docs/screenshots/macos-native-ui.png)
 
 Build and launch the native app on macOS:
 
@@ -237,7 +237,7 @@ The build requires macOS 15 or newer, the Swift/Xcode command-line toolchain, an
 
 The PySide6 interface—often referred to as the PyQt GUI—runs on macOS, Linux, and Windows. macOS and Windows also have native interfaces. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, automatic thumbnail previews, requested time ranges in the job list, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored through `keyring` in the macOS Keychain, Windows Credential Manager, or the Linux desktop Secret Service.
 
-![Qt TimeLapse interface](docs/screenshots/pyqt-ui.png)
+![Qt TimeLapse interface showing a start-time thumbnail preview](docs/screenshots/pyqt-ui.png)
 
 Run it directly from a source checkout:
 
