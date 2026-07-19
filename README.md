@@ -1,6 +1,6 @@
 # UniFi Protect TimeLapse
 
-Create MP4 timelapses from UniFi Protect recordings with an interactive command-line tool, a native macOS app, or a Qt desktop interface.
+Create MP4 timelapses from UniFi Protect recordings with an interactive command-line tool, native macOS and Windows apps, or a cross-platform Qt desktop interface.
 
 The exporter lists the cameras available through the UniFi Protect Integration API, lets you select what to export, and streams the finished video to disk. It supports exact time ranges, complete local calendar days, and continuously scheduled daily exports.
 
@@ -10,12 +10,14 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 
 - Interactive camera discovery and selection
 - Native SwiftUI interface for macOS
+- Native WPF interface for Windows
 - Cross-platform Qt desktop interface built with PySide6
 - CLI speeds of `60x`, `120x`, `300x`, and `600x`
 - Exact date/time ranges or daylight-saving-aware local calendar days
 - Daily automatic exports for the most recently completed day
 - Multiple concurrent per-camera jobs in the desktop interfaces
 - Job tables show the requested start and end date/time for every timelapse
+- Automatic start/end thumbnail previews with exact-time and live-snapshot fallback
 - Streaming downloads with progress, cancellation, and atomic finalization
 - Safe output filenames and protection against overwriting existing videos
 - Configurable request timeout and maximum download size
@@ -24,13 +26,30 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 
 ## Requirements
 
-- Python 3.11 or newer
-- [`uv`](https://docs.astral.sh/uv/) for dependency and environment management
+- Python 3.11 or newer and [`uv`](https://docs.astral.sh/uv/) when running from source
 - A reachable UniFi Protect console; trusted self-signed certificates are supported
-- A Protect Integration API token for camera discovery
-- A dedicated local Protect user with permission to view and export recordings
+- A Protect Integration API token for camera discovery and live-snapshot fallback
+- A dedicated local Protect user with the device permissions listed below
 
-Do not use a UI.com SSO account for video export authentication. A minimally privileged local Protect account is recommended.
+Packaged desktop applications include their Python runtime. Building the native macOS app additionally requires macOS 15 and the Swift/Xcode command-line toolchain; building the native Windows app requires Windows and the .NET 8 SDK.
+
+### Protect authentication and permissions
+
+TimeLapse uses two Protect authentication paths:
+
+- The **Integration API token** lists cameras and supplies the current live snapshot if an exact historical thumbnail cannot be retrieved.
+- The **local Protect username and password** authenticate private recording exports and exact historical thumbnails. Use a dedicated local account, not a UI.com SSO or owner account.
+
+For thumbnails and exports to work as intended, create a custom role for the local account with these **Device Permissions**:
+
+| Permission | Required for |
+| --- | --- |
+| **All devices**, or **Specify** with every camera TimeLapse may use | Access to the selected cameras |
+| **Livestream** | Exact historical thumbnails (`readmedia` / `livestream`) |
+| **Playback** | Access to recorded footage |
+| **Playback Download** | MP4 timelapse exports |
+
+TimeLapse does not require Livestream Audio, Playback Audio, PTZ Control, Delete Footage, Edit Device Settings, Remove Device, or the Alarm Manager, Find Anything, and Case Manager application permissions. Grant any additional permissions only if that account needs them for another purpose.
 
 ## Quick start
 
@@ -78,8 +97,8 @@ connection values explicitly.
 | Variable | Required | Default | Purpose |
 | --- | --- | --- | --- |
 | `UNIFI_PROTECT_URL` | Yes | — | Protect Integration API URL, normally ending in `/proxy/protect/integration/v1` |
-| `UNIFI_PROTECT_TOKEN` | Yes | — | Integration API token used to list cameras |
-| `UNIFI_PROTECT_USERNAME` | Yes | — | Dedicated local Protect username used for video exports |
+| `UNIFI_PROTECT_TOKEN` | Yes | — | Integration API token used to list cameras and retrieve fallback live snapshots |
+| `UNIFI_PROTECT_USERNAME` | Yes | — | Dedicated local Protect username used for exports and exact historical thumbnails |
 | `UNIFI_PROTECT_PASSWORD` | Yes | — | Password for the dedicated local Protect user |
 | `UNIFI_PROTECT_VERIFY_SSL` | No | `true` | Whether to verify the Protect console's TLS certificate |
 | `TIMELAPSE_OUTPUT` | No | Generated filename | Output MP4 path, or output directory in daily mode |
@@ -201,7 +220,7 @@ uv run python -m timelapse --start-date 07-13-2026
 
 ## Native macOS GUI
 
-The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
+The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, automatic thumbnail previews, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
 
 ![Native macOS TimeLapse interface](docs/screenshots/macos-native-ui.png)
 
@@ -214,9 +233,9 @@ open dist/macos/timelapse.app
 
 The build requires macOS 15 or newer, the Swift/Xcode command-line toolchain, and `uv`; its isolated backend environment uses Python 3.13 by default. Without `MACOS_SIGN_IDENTITY`, the script applies an ad-hoc signature suitable for local development. Set `MACOS_SIGN_IDENTITY` and, optionally, `MACOS_NOTARY_PROFILE` when producing a distributable build.
 
-## Qt GUI (Linux and Windows)
+## Cross-platform Qt GUI (macOS, Linux, and Windows)
 
-The PySide6 interface—often referred to as the PyQt GUI—runs on Linux and Windows. macOS uses the native SwiftUI application instead. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, requested time ranges in the job list, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored with the operating system's credential store through `keyring`.
+The PySide6 interface—often referred to as the PyQt GUI—runs on macOS, Linux, and Windows. macOS and Windows also have native interfaces. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, automatic thumbnail previews, requested time ranges in the job list, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored through `keyring` in the macOS Keychain, Windows Credential Manager, or the Linux desktop Secret Service.
 
 ![Qt TimeLapse interface](docs/screenshots/pyqt-ui.png)
 
@@ -236,13 +255,26 @@ The Linux build is written to `dist/linux/`. Build on the oldest Linux distribut
 
 ## Native Windows GUI
 
-The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. Its job list includes the requested start and end date/time along with download progress and actions. Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
+The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. It supports connection profiles, multi-camera exports, exact or 24-hour ranges, daily automations, automatic thumbnail previews, requested time ranges in the job list, download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in Windows Credential Manager.
+
+Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
 
 ```powershell
 .\build-windows.ps1
 ```
 
-The build produces one self-contained distributable at `dist\windows\timelapse.exe`. The recipient does not need to install Python or .NET.
+The build produces one self-contained `win-x64` distributable at `dist\windows\timelapse.exe`. Set `TIMELAPSE_WINDOWS_RUNTIME` before building to target another Windows runtime identifier. The recipient does not need to install Python or .NET.
+
+## Desktop thumbnail previews
+
+The native macOS, native Windows, and Qt interfaces share the same preview behavior:
+
+- Selecting or changing a start or end date/time immediately starts a background thumbnail request. Hovering over that field only displays the current loading, image, or error state; it does not initiate another request.
+- A result or failure is cached for that camera and timestamp. Repeated hovers reuse it until the selected camera, connection profile, date, or time changes.
+- When multiple cameras are selected, the preview uses the first selected camera and identifies it in the popover.
+- A 24-hour timelapse previews `12:00 AM` on both the start date and end date.
+- TimeLapse first requests the exact historical frame through the private Protect API using the local account. If that fails, it requests the camera's current live snapshot through the Integration API token and labels the preview **Live snapshot — selected time unavailable**.
+- If both requests fail, the interface explains that the local account needs **Livestream** permission and the Integration API token needs access to the camera.
 
 ## Date and output behavior
 
@@ -259,8 +291,8 @@ The build produces one self-contained distributable at `dist\windows\timelapse.e
 
 ## Security notes
 
-- Use a dedicated local Protect account with only the permissions needed to view and export recordings.
-- The Integration API token is used for camera discovery; private video export uses the local username and password.
+- Use a dedicated local Protect account with only Livestream, Playback, Playback Download, and access to the cameras TimeLapse may use.
+- The Integration API token is used for camera discovery and fallback live snapshots. Private video exports and exact historical thumbnails use the local username and password.
 - Keep TLS verification enabled unless you are connecting to a trusted local console with a self-signed certificate.
 - `.env` is ignored by Git, but it is still a plaintext file. Restrict its filesystem permissions and never commit it.
 - CLI profiles keep their connection details in the operating system credential store.
@@ -271,7 +303,24 @@ The build produces one self-contained distributable at `dist\windows\timelapse.e
 
 ### Camera listing works, but export returns `HTTP 401` with `{"error":403}`
 
-The Integration API token can list cameras but does not authenticate the private video-export endpoint. Confirm that `UNIFI_PROTECT_USERNAME` and `UNIFI_PROTECT_PASSWORD` belong to a local Protect user with recording export access.
+The Integration API token can list cameras but does not authenticate the private video-export endpoint. Confirm that `UNIFI_PROTECT_USERNAME` and `UNIFI_PROTECT_PASSWORD` belong to a local Protect user assigned to that camera with Playback and Playback Download permissions.
+
+### A thumbnail is labeled as a live snapshot
+
+The exact historical request failed, so TimeLapse used the Integration API token to retrieve the camera's current image. Assign the local Protect account to that camera and enable Livestream permission to retrieve the frame at the selected time. Playback and Playback Download are still required for exports.
+
+### A thumbnail cannot be loaded
+
+If both thumbnail paths fail, check both credentials:
+
+- The local account must be assigned to the camera and have Livestream permission for the exact historical image.
+- The Integration API token must be valid and able to access that camera for the live fallback.
+
+After correcting access, change the selected date or time to retry. A time with no retained recording can still fall back to the current live snapshot.
+
+### Protect login returns `HTTP 429`
+
+Protect is rate-limiting local-account authentication. Wait for the console's rate-limit window to clear and avoid running multiple copies of TimeLapse with the same account. Thumbnail requests are started when a date/time is selected and cached for that camera and timestamp; merely hovering over the date/time does not start another request.
 
 ### TLS certificate verification fails
 
@@ -322,6 +371,14 @@ Run the native macOS tests on macOS:
 swift test --package-path native-macos
 ```
 
+Build-check the native Windows project with the .NET 8 SDK:
+
+```bash
+dotnet build native-windows/TimeLapseNative.csproj -p:EnableWindowsTargeting=true
+```
+
+The full packaged Windows build must be run on Windows with `build-windows.ps1`.
+
 The main source areas are:
 
 | Path | Responsibility |
@@ -331,9 +388,10 @@ The main source areas are:
 | `timelapse/protect.py` | Protect URL parsing, authentication, and camera discovery |
 | `timelapse/download.py` | Streaming downloads, output naming, progress, and limits |
 | `timelapse/schedule.py` | Local calendar-day and daily scheduling helpers |
-| `timelapse/service.py` | UI-neutral camera and export orchestration |
+| `timelapse/service.py` | UI-neutral camera discovery, thumbnail, and export orchestration |
 | `timelapse/cli.py` | Interactive CLI workflow |
 | `timelapse/gui.py` | Qt desktop interface |
 | `timelapse/native_backend.py` | JSON-lines bridge used by native desktop shells |
 | `native-macos/` | Native SwiftUI macOS application |
+| `native-windows/` | Native WPF Windows application |
 | `tests/` | Python unit and GUI tests |
