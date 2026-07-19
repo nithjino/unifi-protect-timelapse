@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import signal
 import sys
 from contextlib import suppress
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import TYPE_CHECKING
 
 from timelapse import TimelapseError
@@ -22,6 +24,9 @@ if TYPE_CHECKING:
     from timelapse.download import DownloadProgress
 
 MAX_REQUEST_BYTES = 1024 * 1024
+# This module is also executed with ``python -m`` and bundled as a standalone
+# executable, where ``__name__`` is ``__main__`` rather than a package child.
+_LOGGER = logging.getLogger("timelapse.native_backend")
 
 
 class _ProtocolError(ValueError):
@@ -34,6 +39,29 @@ def _write_event(payload: Mapping[str, object]) -> None:
     serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     sys.stdout.write(f"{serialized}\n")
     sys.stdout.flush()
+
+
+class _NativeLogHandler(logging.Handler):
+    """Forward backend logs through the JSON-lines protocol used by native UIs."""
+
+    def __init__(self, request_id: str | None) -> None:
+        super().__init__(logging.INFO)
+        self._request_id = request_id
+        self.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            _write_event(
+                {
+                    "id": self._request_id,
+                    "event": "log",
+                    "level": record.levelname,
+                    "message": message,
+                }
+            )
+        except Exception:
+            self.handleError(record)
 
 
 def _mapping(value: object, field: str) -> dict[str, object]:
@@ -217,6 +245,10 @@ def _request_id(request: Mapping[str, object] | None) -> str | None:
 
 
 async def _run(request: Mapping[str, object]) -> int:
+    started_at = perf_counter()
+    request_id = _request_id(request)
+    command = request.get("command")
+    _LOGGER.info("Backend command started: command=%s, request_id=%s", command, request_id)
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
     if task is not None:
@@ -225,19 +257,55 @@ async def _run(request: Mapping[str, object]) -> int:
     try:
         await _dispatch(request)
     except asyncio.CancelledError:
+        _LOGGER.info(
+            "Backend command cancelled: command=%s, request_id=%s, elapsed=%.2fs",
+            command,
+            request_id,
+            perf_counter() - started_at,
+        )
         _write_event({"id": _request_id(request), "event": "cancelled"})
         return 0
+    except TimelapseError as exc:
+        _LOGGER.log(
+            logging.ERROR,
+            "Backend command failed: command=%s, request_id=%s, elapsed=%.2fs, error=%s",
+            command,
+            request_id,
+            perf_counter() - started_at,
+            exc,
+        )
+        raise
+    except Exception:
+        _LOGGER.exception(
+            "Backend command failed: command=%s, request_id=%s, elapsed=%.2fs",
+            command,
+            request_id,
+            perf_counter() - started_at,
+        )
+        raise
     finally:
         with suppress(NotImplementedError, RuntimeError):
             loop.remove_signal_handler(signal.SIGTERM)
+    _LOGGER.info(
+        "Backend command completed: command=%s, request_id=%s, elapsed=%.2fs",
+        command,
+        request_id,
+        perf_counter() - started_at,
+    )
     return 0
 
 
 def main() -> int:
     """Read one native-UI request, run it, and emit JSON-line events."""
     request: dict[str, object] | None = None
+    log_handler: _NativeLogHandler | None = None
+    package_logger = logging.getLogger("timelapse")
+    previous_log_level = package_logger.level
     try:
         request = _read_request()
+        log_handler = _NativeLogHandler(_request_id(request))
+        package_logger.addHandler(log_handler)
+        package_logger.setLevel(logging.INFO)
         return asyncio.run(_run(request))
     except _ProtocolError as exc:
         _write_event({"id": _request_id(request), "event": "error", "code": exc.code, "message": str(exc)})
@@ -248,6 +316,10 @@ def main() -> int:
         return 0
     except Exception as exc:
         _write_event({"id": _request_id(request), "event": "error", "code": "internal_error", "message": str(exc)})
+    finally:
+        if log_handler is not None:
+            package_logger.removeHandler(log_handler)
+        package_logger.setLevel(previous_log_level)
     return 1
 
 

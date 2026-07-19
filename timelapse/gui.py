@@ -971,6 +971,7 @@ class _MainWindow(QMainWindow):
             logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%H:%M:%S")
         )
         logging.getLogger().addHandler(self._log_handler)
+        logging.getLogger("timelapse").setLevel(logging.INFO)
         self._log_handler_attached = True
 
     def _remove_log_handler(self) -> None:

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic
+from time import monotonic, perf_counter
 from typing import TYPE_CHECKING
 
 from timelapse import TimelapseError
@@ -21,12 +23,14 @@ if TYPE_CHECKING:
     from uiprotect import ProtectApiClient
 
 MEBIBYTE = 1024 * 1024
+KIBIBYTE = 1024
 CHUNK_SIZE = MEBIBYTE
 MAX_ERROR_BODY_BYTES = 8 * 1024
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.1
 HTTP_OK = 200
 HTTP_MULTIPLE_CHOICES = 300
 MAX_CAMERA_FILENAME_CHARACTERS = 48
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -51,7 +55,7 @@ def default_output_path(config: Config, camera: CameraInfo) -> Path:
     return Path(f"timelapse_{safe_name}_{start}_{end}_{config.speed}.mp4")
 
 
-async def download_timelapse(
+async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-download lifecycle
     config: Config,
     connection: ProtectConnection,
     client: ProtectApiClient,
@@ -60,6 +64,8 @@ async def download_timelapse(
     progress_callback: ProgressCallback | None = None,
 ) -> None:
     """Stream a Protect timelapse export to an atomic temporary file."""
+    operation_started_at = perf_counter()
+    downloaded = 0
     params = {
         "camera": camera_id(camera),
         "start": str(_js_time(config.start)),
@@ -71,16 +77,44 @@ async def download_timelapse(
     client.set_header("Accept", "video/mp4,application/octet-stream,*/*")
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    response = await client.request(
-        "get",
+    _LOGGER.info(
+        "Requesting Protect video export: target=%s:%d%s, camera_id=%s, fps=%s, "
+        "request_timeout=%s, download_limit=%s",
+        connection.host,
+        connection.port,
         connection.export_path,
-        require_auth=True,
-        auto_close=False,
-        params=params,
-        timeout=config.request_timeout_seconds or 0,
+        params["camera"],
+        params["fps"],
+        _format_timeout(config.request_timeout_seconds),
+        _format_limit(config.max_download_mib),
+    )
+    request_started_at = perf_counter()
+    try:
+        response = await client.request(
+            "get",
+            connection.export_path,
+            require_auth=True,
+            auto_close=False,
+            params=params,
+            timeout=config.request_timeout_seconds or 0,
+        )
+    except asyncio.CancelledError:
+        _LOGGER.info("Protect video export request cancelled after %.2fs", perf_counter() - request_started_at)
+        raise
+    except Exception:
+        _LOGGER.exception("Protect video export request failed after %.2fs", perf_counter() - request_started_at)
+        raise
+
+    response_received_at = perf_counter()
+    total_header = response.headers.get("Content-Length")
+    total_bytes = int(total_header) if total_header and total_header.isdigit() else None
+    _LOGGER.info(
+        "Protect video export response received: status=%d, server_wait=%.2fs, expected_size=%s",
+        response.status,
+        response_received_at - request_started_at,
+        _format_bytes(total_bytes),
     )
     temp_output: Path | None = None
-
     try:
         if not HTTP_OK <= response.status < HTTP_MULTIPLE_CHOICES:
             detail = await _read_error_detail(response)
@@ -88,8 +122,6 @@ async def download_timelapse(
             message = f"timelapse export failed with HTTP {response.status}: {detail or reason}"
             raise TimelapseError(message)
 
-        total_header = response.headers.get("Content-Length")
-        total_bytes = int(total_header) if total_header and total_header.isdigit() else None
         max_bytes = config.max_download_mib * MEBIBYTE
         if max_bytes and total_bytes and total_bytes > max_bytes:
             message = (
@@ -99,6 +131,8 @@ async def download_timelapse(
             raise TimelapseError(message)
 
         download_started_at = monotonic()
+        stream_started_at = perf_counter()
+        first_chunk_received = False
         _emit_progress(progress_callback, 0, total_bytes, download_started_at, download_started_at)
 
         with tempfile.NamedTemporaryFile(
@@ -109,9 +143,16 @@ async def download_timelapse(
             delete=False,
         ) as file:
             temp_output = Path(file.name)
-            downloaded = 0
+            _LOGGER.info("Streaming export to temporary file: %s", temp_output)
             last_progress_update = download_started_at
             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
+                if not first_chunk_received:
+                    first_chunk_received = True
+                    _LOGGER.info(
+                        "First export bytes received: response_body_wait=%.2fs, first_chunk=%s",
+                        perf_counter() - response_received_at,
+                        _format_bytes(len(chunk)),
+                    )
                 next_downloaded = downloaded + len(chunk)
                 if max_bytes and next_downloaded > max_bytes:
                     message = f"download exceeded the {config.max_download_mib} MiB limit"
@@ -123,17 +164,39 @@ async def download_timelapse(
                     _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, now)
                     last_progress_update = now
 
+        stream_elapsed = perf_counter() - stream_started_at
+        _LOGGER.info(
+            "Export stream completed: downloaded=%s, stream_elapsed=%.2fs, average_speed=%s/s",
+            _format_bytes(downloaded),
+            stream_elapsed,
+            _format_bytes(round(downloaded / stream_elapsed) if stream_elapsed else 0),
+        )
+
         if output.exists():  # noqa: ASYNC240 - local metadata check immediately before the atomic replace
             message = f"refusing to overwrite existing output file: {output}"
             raise TimelapseError(message)
         temp_output.replace(output)
+        _LOGGER.info(
+            "Export finalized atomically: output=%s, total_elapsed=%.2fs",
+            output,
+            perf_counter() - operation_started_at,
+        )
         _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, monotonic())
+    except asyncio.CancelledError:
+        _LOGGER.info(
+            "Export download cancelled: downloaded=%s, elapsed=%.2fs",
+            _format_bytes(downloaded),
+            perf_counter() - operation_started_at,
+        )
+        raise
     except OSError as exc:
         message = f"could not write {output}: {exc}"
         raise TimelapseError(message) from exc
     finally:
         response.release()
         if temp_output is not None:
+            if temp_output.exists():
+                _LOGGER.info("Removing temporary export file: %s", temp_output)
             temp_output.unlink(missing_ok=True)
 
 
@@ -151,6 +214,24 @@ async def _read_error_detail(response: ClientResponse) -> str:
 
 def _sanitize_terminal_text(value: str) -> str:
     return value.encode("unicode_escape", errors="backslashreplace").decode("ascii")
+
+
+def _format_bytes(value: int | None) -> str:
+    if value is None:
+        return "unknown"
+    if value < KIBIBYTE:
+        return f"{value} bytes"
+    if value < MEBIBYTE:
+        return f"{value / KIBIBYTE:.1f} KiB"
+    return f"{value / MEBIBYTE:.1f} MiB"
+
+
+def _format_timeout(seconds: int) -> str:
+    return "disabled" if seconds == 0 else f"{seconds}s"
+
+
+def _format_limit(mebibytes: int) -> str:
+    return "disabled" if mebibytes == 0 else f"{mebibytes} MiB"
 
 
 def _emit_progress(

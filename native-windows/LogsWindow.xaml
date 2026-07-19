@@ -8,6 +8,11 @@
       <Button DockPanel.Dock="Right" Content="Clear" Click="Clear_Click" />
       <TextBlock Text="Application Logs" FontWeight="SemiBold" VerticalAlignment="Center" />
     </DockPanel>
-    <ListBox x:Name="LogList" Grid.Row="1" FontFamily="Consolas" FontSize="12" ItemsSource="{Binding Logs}" />
+    <TextBox x:Name="LogTextBox" Grid.Row="1"
+             FontFamily="Consolas" FontSize="12"
+             IsReadOnly="True" IsReadOnlyCaretVisible="True"
+             IsInactiveSelectionHighlightEnabled="True"
+             AcceptsReturn="True" TextWrapping="NoWrap"
+             VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" />
   </Grid>
 </Window>

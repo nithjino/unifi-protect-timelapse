@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import logging
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -161,6 +162,11 @@ def _write_stderr(message: str) -> None:
 
 def main() -> int:
     """Run the timelapse CLI."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     try:
         return asyncio.run(_run())
     except KeyboardInterrupt:
