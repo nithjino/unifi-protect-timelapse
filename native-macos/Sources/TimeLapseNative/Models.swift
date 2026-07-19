@@ -149,6 +149,29 @@ struct DownloadRequest: Encodable, Sendable {
     let output: String
 }
 
+enum ThumbnailBoundary: String, Hashable, Sendable {
+    case start
+    case end
+}
+
+struct ThumbnailRequest: Encodable, Sendable {
+    let id: String
+    let command = "thumbnail"
+    let settings: BackendSettings
+    let camera: CameraInfo
+    let timestamp: String
+}
+
+struct ThumbnailPreview: Equatable, Sendable {
+    let timestamp: Date
+    let cameraID: String?
+    let cameraName: String?
+    var imageData: Data?
+    var source: String?
+    var message: String?
+    var isLoading: Bool
+}
+
 struct BackendEvent: Decodable, Sendable {
     let id: String?
     let event: String
@@ -160,6 +183,8 @@ struct BackendEvent: Decodable, Sendable {
     let bytesPerSecond: Double?
     let elapsedSeconds: Double?
     let output: String?
+    let thumbnailBase64: String?
+    let thumbnailSource: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -172,6 +197,8 @@ struct BackendEvent: Decodable, Sendable {
         case bytesPerSecond = "bytes_per_second"
         case elapsedSeconds = "elapsed_seconds"
         case output
+        case thumbnailBase64 = "thumbnail_base64"
+        case thumbnailSource = "thumbnail_source"
     }
 }
 

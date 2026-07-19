@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MainView: View {
@@ -12,6 +13,7 @@ struct MainView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var selectedJobIDs: Set<UUID> = []
     @State private var selectedJobListTab = JobListTab.downloads
+    @State private var hoveredThumbnailBoundary: ThumbnailBoundary?
 
     var body: some View {
         ZStack {
@@ -196,7 +198,8 @@ struct MainView: View {
     }
 
     private func compactDatePicker(_ title: String, selection: Binding<Date>) -> some View {
-        DatePicker(
+        let boundary: ThumbnailBoundary = title == "Start" ? .start : .end
+        return DatePicker(
             title,
             selection: model.fullDayMode ? fullDayBinding(title == "Start") : selection,
             in: minimumDate...,
@@ -205,7 +208,82 @@ struct MainView: View {
             .labelsHidden()
             .datePickerStyle(.compact)
             .fixedSize(horizontal: true, vertical: false)
-            .help("Type a date and time or open the calendar to choose a date.")
+            .help("Choose a date and time, then hover here to preview the recording.")
+            .onHover { hovering in
+                if hovering {
+                    hoveredThumbnailBoundary = boundary
+                    model.requestThumbnail(for: boundary)
+                } else if hoveredThumbnailBoundary == boundary {
+                    hoveredThumbnailBoundary = nil
+                }
+            }
+            .onChange(of: selection.wrappedValue) {
+                model.requestThumbnail(for: boundary)
+            }
+            .popover(isPresented: thumbnailPopoverPresented(for: boundary), arrowEdge: .trailing) {
+                thumbnailPopover(for: boundary)
+            }
+    }
+
+    private func thumbnailPopoverPresented(for boundary: ThumbnailBoundary) -> Binding<Bool> {
+        Binding(
+            get: { hoveredThumbnailBoundary == boundary },
+            set: { presented in
+                if !presented, hoveredThumbnailBoundary == boundary {
+                    hoveredThumbnailBoundary = nil
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func thumbnailPopover(for boundary: ThumbnailBoundary) -> some View {
+        let preview = model.thumbnailPreviews[boundary]
+        VStack(alignment: .leading, spacing: 8) {
+            Text(boundary == .start ? "Start preview" : "End preview")
+                .font(.headline)
+            if let preview {
+                Text(preview.timestamp.formatted(date: .abbreviated, time: .shortened))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if preview.isLoading {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading thumbnail…")
+                    }
+                    .frame(width: 320, height: 180)
+                } else if let data = preview.imageData, let image = NSImage(data: data) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 320, height: 180)
+                        .background(.black)
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                } else {
+                    ContentUnavailableView(
+                        "Thumbnail unavailable",
+                        systemImage: "photo",
+                        description: Text(preview.message ?? "No recording thumbnail is available for this time.")
+                    )
+                    .frame(width: 320, height: 180)
+                }
+                if let cameraName = preview.cameraName {
+                    Text(model.selectedCameras.count > 1 ? "\(cameraName) · first selected camera" : cameraName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if preview.source == "live" {
+                    Text("Live snapshot · exact selected-time frame unavailable")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+            } else {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 320, height: 180)
+            }
+        }
+        .padding(12)
     }
 
     private var fullDayModeBinding: Binding<Bool> {

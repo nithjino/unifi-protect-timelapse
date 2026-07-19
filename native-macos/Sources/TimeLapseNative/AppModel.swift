@@ -23,6 +23,7 @@ final class AppModel: ObservableObject {
     @Published var isFirstRun = false
     @Published var alert: AppAlert?
     @Published private(set) var isLoadingCameras = false
+    @Published private(set) var thumbnailPreviews: [ThumbnailBoundary: ThumbnailPreview] = [:]
 
     let speeds = ["60x", "120x", "300x", "600x"]
 
@@ -32,6 +33,8 @@ final class AppModel: ObservableObject {
     private var openCameraSheetAfterLoad = false
     private var openDailySheetAfterLoad = false
     private var downloadProcesses: [UUID: BackendProcess] = [:]
+    private var thumbnailProcesses: [ThumbnailBoundary: BackendProcess] = [:]
+    private var thumbnailRequestIDs: [ThumbnailBoundary: String] = [:]
     private var downloadReceivedTerminal: Set<UUID> = []
     private var reservedOutputPaths: Set<String> = []
     private var nextGroupNumber = 1
@@ -45,7 +48,9 @@ final class AppModel: ObservableObject {
     private var dailyTimer: Timer?
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
-    var hasActiveBackendProcesses: Bool { cameraProcess != nil || !downloadProcesses.isEmpty }
+    var hasActiveBackendProcesses: Bool {
+        cameraProcess != nil || !downloadProcesses.isEmpty || !thumbnailProcesses.isEmpty
+    }
     func hasClearableJobs(dailyAutomations: Bool) -> Bool {
         jobs.contains { $0.isDailySchedule == dailyAutomations && $0.state.isTerminal }
     }
@@ -173,6 +178,7 @@ final class AppModel: ObservableObject {
         settings = profile.settings
         cameras.removeAll()
         selectedCameraIDs.removeAll()
+        clearThumbnailPreviews()
         statusMessage = "Selected \(profile.displayName)"
         appendLog(level: "INFO", message: "Selected connection profile: \(profile.displayName)")
     }
@@ -201,6 +207,7 @@ final class AppModel: ObservableObject {
         settings = profile.settings
         cameras.removeAll()
         selectedCameraIDs.removeAll()
+        clearThumbnailPreviews()
         editingProfileID = nil
         isFirstRun = false
         showingConnectionSheet = false
@@ -244,8 +251,13 @@ final class AppModel: ObservableObject {
 
     func applyCameraSelection(_ ids: Set<String>) {
         selectedCameraIDs = ids
+        clearThumbnailPreviews()
         showingCameraSheet = false
         appendLog(level: "INFO", message: "Selected \(ids.count) cameras")
+        if !selectedCameras.isEmpty {
+            requestThumbnail(for: .start)
+            requestThumbnail(for: .end)
+        }
     }
 
     func setFullDayStart(_ date: Date) {
@@ -263,6 +275,65 @@ final class AppModel: ObservableObject {
     func setFullDayMode(_ enabled: Bool) {
         fullDayMode = enabled
         if enabled { setFullDayStart(startDate) }
+    }
+
+    func requestThumbnail(for boundary: ThumbnailBoundary) {
+        let selectedDate = boundary == .start ? startDate : endDate
+        let timestamp = fullDayMode ? Calendar.current.startOfDay(for: selectedDate) : selectedDate
+        guard let camera = selectedCameras.first else {
+            thumbnailPreviews[boundary] = ThumbnailPreview(
+                timestamp: timestamp,
+                cameraID: nil,
+                cameraName: nil,
+                imageData: nil,
+                source: nil,
+                message: "Select a camera to preview this time.",
+                isLoading: false
+            )
+            return
+        }
+        if let preview = thumbnailPreviews[boundary],
+           preview.timestamp == timestamp,
+           preview.cameraID == camera.id {
+            return
+        }
+
+        thumbnailProcesses[boundary]?.cancel()
+        let id = UUID().uuidString
+        let process = BackendProcess()
+        thumbnailProcesses[boundary] = process
+        thumbnailRequestIDs[boundary] = id
+        thumbnailPreviews[boundary] = ThumbnailPreview(
+            timestamp: timestamp,
+            cameraID: camera.id,
+            cameraName: camera.name,
+            imageData: nil,
+            source: nil,
+            message: nil,
+            isLoading: true
+        )
+        let request = ThumbnailRequest(
+            id: id,
+            settings: BackendSettings(settings),
+            camera: camera,
+            timestamp: Self.iso8601String(timestamp)
+        )
+        do {
+            try process.start(
+                request: request,
+                onEvent: { [weak self] event in
+                    self?.handleThumbnailEvent(event, boundary: boundary, requestID: id)
+                },
+                onCompletion: { [weak self] completion in
+                    self?.finishThumbnail(completion, boundary: boundary, requestID: id)
+                }
+            )
+        } catch {
+            thumbnailProcesses.removeValue(forKey: boundary)
+            thumbnailRequestIDs.removeValue(forKey: boundary)
+            thumbnailPreviews[boundary]?.isLoading = false
+            thumbnailPreviews[boundary]?.message = error.localizedDescription
+        }
     }
 
     func requestDailySchedule() {
@@ -547,6 +618,61 @@ final class AppModel: ObservableObject {
         for process in downloadProcesses.values {
             process.cancel()
         }
+        for process in thumbnailProcesses.values {
+            process.cancel()
+        }
+        finishShutdownIfReady()
+    }
+
+    private func clearThumbnailPreviews() {
+        for process in thumbnailProcesses.values {
+            process.cancel()
+        }
+        thumbnailProcesses.removeAll()
+        thumbnailRequestIDs.removeAll()
+        thumbnailPreviews.removeAll()
+    }
+
+    private func handleThumbnailEvent(_ event: BackendEvent, boundary: ThumbnailBoundary, requestID: String) {
+        guard thumbnailRequestIDs[boundary] == requestID,
+              event.id == nil || event.id == requestID else { return }
+        switch event.event {
+        case "thumbnail":
+            guard let encoded = event.thumbnailBase64, let data = Data(base64Encoded: encoded) else {
+                thumbnailPreviews[boundary]?.isLoading = false
+                thumbnailPreviews[boundary]?.message = "The thumbnail data could not be read."
+                return
+            }
+            thumbnailPreviews[boundary]?.imageData = data
+            thumbnailPreviews[boundary]?.source = event.thumbnailSource
+            thumbnailPreviews[boundary]?.message = nil
+            thumbnailPreviews[boundary]?.isLoading = false
+        case "error":
+            thumbnailPreviews[boundary]?.isLoading = false
+            thumbnailPreviews[boundary]?.message = event.message ?? "No thumbnail is available for this time."
+        case "log":
+            appendLog(level: event.level ?? "INFO", message: event.message ?? "")
+        default:
+            break
+        }
+    }
+
+    private func finishThumbnail(
+        _ completion: BackendCompletion,
+        boundary: ThumbnailBoundary,
+        requestID: String
+    ) {
+        guard thumbnailRequestIDs[boundary] == requestID else { return }
+        thumbnailProcesses.removeValue(forKey: boundary)
+        thumbnailRequestIDs.removeValue(forKey: boundary)
+        if thumbnailPreviews[boundary]?.isLoading == true {
+            thumbnailPreviews[boundary]?.isLoading = false
+            if !completion.wasCancelled {
+                thumbnailPreviews[boundary]?.message = completion.stderr.isEmpty
+                    ? "No thumbnail is available for this time."
+                    : completion.stderr
+            }
+        }
         finishShutdownIfReady()
     }
 
@@ -760,7 +886,11 @@ final class AppModel: ObservableObject {
     }
 
     private func finishShutdownIfReady() {
-        guard isShuttingDown, cameraProcess == nil, downloadProcesses.isEmpty, let completion = shutdownCompletion else {
+        guard isShuttingDown,
+              cameraProcess == nil,
+              downloadProcesses.isEmpty,
+              thumbnailProcesses.isEmpty,
+              let completion = shutdownCompletion else {
             return
         }
         shutdownCompletion = nil

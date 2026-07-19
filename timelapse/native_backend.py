@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import signal
@@ -16,7 +17,7 @@ from typing import TYPE_CHECKING
 from timelapse import TimelapseError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.protect import CameraInfo
-from timelapse.service import export_timelapse, list_available_cameras
+from timelapse.service import export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -205,6 +206,27 @@ async def _download(request_id: str, request: Mapping[str, object]) -> None:
     _write_event({"id": request_id, "event": "complete", "output": str(output)})
 
 
+async def _thumbnail(request_id: str, request: Mapping[str, object]) -> None:
+    timestamp = _aware_datetime(_required_string(request, "timestamp"), "timestamp")
+    camera = _camera(request.get("camera"))
+    config = _config(
+        request,
+        start=timestamp,
+        end=timestamp + timedelta(seconds=1),
+        speed="600x",
+        output=None,
+    )
+    thumbnail = await fetch_camera_thumbnail(config, camera, timestamp)
+    _write_event(
+        {
+            "id": request_id,
+            "event": "thumbnail",
+            "thumbnail_base64": base64.b64encode(thumbnail.image).decode("ascii"),
+            "thumbnail_source": thumbnail.source,
+        }
+    )
+
+
 async def _dispatch(request: Mapping[str, object]) -> None:
     request_id = _required_string(request, "id")
     command = _required_string(request, "command")
@@ -216,6 +238,9 @@ async def _dispatch(request: Mapping[str, object]) -> None:
         return
     if command == "download":
         await _download(request_id, request)
+        return
+    if command == "thumbnail":
+        await _thumbnail(request_id, request)
         return
     message = f"unsupported command: {command}"
     raise _ProtocolError(message, code="unsupported_command")

@@ -9,6 +9,7 @@ import pytest
 import timelapse.native_backend as backend
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
+from timelapse.service import CameraThumbnail
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -94,6 +95,37 @@ def test_download_emits_progress_and_complete(monkeypatch: pytest.MonkeyPatch, t
         "elapsed_seconds": 2.0,
     }
     assert events[1] == {"id": "download-1", "event": "complete", "output": str(output)}
+
+
+def test_thumbnail_emits_base64_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    events: list[dict[str, object]] = []
+    timestamp = datetime(2026, 7, 11, 8, tzinfo=UTC)
+
+    async def fake_thumbnail(_config: object, camera: CameraInfo, requested_time: datetime) -> CameraThumbnail:
+        assert camera.id == "camera-1"
+        assert requested_time == timestamp
+        return CameraThumbnail(b"jpeg-image", "live")
+
+    request = {
+        "id": "thumbnail-1",
+        "command": "thumbnail",
+        "settings": _settings(),
+        "camera": {"id": "camera-1", "name": "Front Door", "state": None, "model": "G5"},
+        "timestamp": timestamp.isoformat(),
+    }
+    monkeypatch.setattr(backend, "fetch_camera_thumbnail", fake_thumbnail)
+    monkeypatch.setattr(backend, "_write_event", events.append)
+
+    asyncio.run(backend._dispatch(request))
+
+    assert events == [
+        {
+            "id": "thumbnail-1",
+            "event": "thumbnail",
+            "thumbnail_base64": "anBlZy1pbWFnZQ==",
+            "thumbnail_source": "live",
+        }
+    ]
 
 
 @pytest.mark.parametrize(

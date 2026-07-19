@@ -128,7 +128,9 @@ final class BackendProcess: @unchecked Sendable {
                     totalBytes: nil,
                     bytesPerSecond: nil,
                     elapsedSeconds: nil,
-                    output: nil
+                    output: nil,
+                    thumbnailBase64: nil,
+                    thumbnailSource: nil
                 )
                 DispatchQueue.main.async { onEvent(event) }
             }
@@ -197,7 +199,9 @@ final class BackendProcess: @unchecked Sendable {
                 totalBytes: nil,
                 bytesPerSecond: nil,
                 elapsedSeconds: nil,
-                output: nil
+                output: nil,
+                thumbnailBase64: nil,
+                thumbnailSource: nil
             )
             DispatchQueue.main.async { onEvent(event) }
         }

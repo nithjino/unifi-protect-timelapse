@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 import timelapse.gui as gui_module
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
+from timelapse.service import CameraThumbnail
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -92,6 +93,74 @@ def test_24_hour_toggle_uses_date_only_one_day_range(main_window: gui_module._Ma
     assert "h:mm" not in main_window._start_edit.displayFormat()
     assert start.time().hour() == 0
     assert end == start.addDays(1)
+
+
+def test_24_hour_hover_preview_uses_midnight_and_prompts_for_camera(main_window: gui_module._MainWindow) -> None:
+    main_window._full_day_checkbox.setChecked(True)
+
+    main_window._show_thumbnail_preview("start")
+
+    assert main_window._thumbnail_timestamp("start").hour == 0
+    assert "12:00 AM" in main_window._thumbnail_popup.time_label.text()
+    assert main_window._thumbnail_popup.image_label.text() == "Select a camera to preview this time."
+
+
+def test_thumbnail_loader_fetches_historical_image(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    timestamp = datetime(2026, 7, 11, 8, tzinfo=UTC).astimezone()
+    config = main_window._settings.make_config(timestamp, timestamp.replace(hour=9), "600x")
+
+    async def fake_thumbnail(
+        _config: object,
+        requested_camera: CameraInfo,
+        requested_time: datetime,
+    ) -> CameraThumbnail:
+        assert requested_camera == camera
+        assert requested_time == timestamp
+        return CameraThumbnail(b"image-data", "exact")
+
+    monkeypatch.setattr(gui_module, "fetch_camera_thumbnail", fake_thumbnail)
+    loader = gui_module._ThumbnailLoader(config, camera, timestamp)
+
+    with qtbot.waitSignal(loader.thumbnail_loaded, timeout=2_000) as signal:
+        loader.start()
+
+    assert signal.args == [CameraThumbnail(b"image-data", "exact")]
+    loader.wait()
+
+
+def test_failed_thumbnail_is_not_retried_on_hover(main_window: gui_module._MainWindow) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    main_window._selected_cameras = [camera]
+    timestamp = main_window._thumbnail_timestamp("start")
+    cache_key = (camera.id, round(timestamp.timestamp()))
+    main_window._thumbnail_failures[cache_key] = "Rate limited"
+
+    main_window._show_thumbnail_preview("start")
+    main_window._show_thumbnail_preview("start")
+
+    assert main_window._thumbnail_popup.image_label.text() == "Rate limited"
+    assert not main_window._thumbnail_loaders
+
+
+def test_datetime_change_prefetches_without_hover(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[tuple[str, bool]] = []
+    monkeypatch.setattr(
+        main_window,
+        "_show_thumbnail_preview",
+        lambda boundary, *, display=True: requests.append((boundary, display)),
+    )
+
+    main_window._thumbnail_datetime_changed("start", main_window._start_edit.dateTime())
+
+    assert requests == [("start", False)]
 
 
 def test_daily_schedule_adds_list_row_and_daily_downloads(

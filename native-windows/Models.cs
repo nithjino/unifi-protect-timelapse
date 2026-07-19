@@ -73,6 +73,8 @@ public sealed record CameraInfo(
     [property: JsonPropertyName("state")] string? State,
     [property: JsonPropertyName("model")] string? Model);
 
+public sealed record CameraThumbnail(byte[] Image, string Source);
+
 public sealed record BackendEvent
 {
     [JsonPropertyName("id")]
@@ -104,6 +106,12 @@ public sealed record BackendEvent
 
     [JsonPropertyName("output")]
     public string? Output { get; init; }
+
+    [JsonPropertyName("thumbnail_base64")]
+    public string? ThumbnailBase64 { get; init; }
+
+    [JsonPropertyName("thumbnail_source")]
+    public string? ThumbnailSource { get; init; }
 }
 
 public enum DownloadState

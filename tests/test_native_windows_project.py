@@ -29,6 +29,15 @@ def test_windows_native_gui_includes_full_day_and_daily_controls() -> None:
     assert "RunDailyScheduleIfDue" in main_code
     assert "daily_timelapse" in main_code
     assert "ShowingDailyAutomations" in main_code
+    assert 'x:Name="ThumbnailPopup"' in main_xaml
+    assert 'MouseEnter="ThumbnailHover_MouseEnter"' in main_xaml
+    assert '["command"] = "thumbnail"' in main_code
+    assert "ThumbnailBase64" in (ROOT / "native-windows" / "Models.cs").read_text(encoding="utf-8")
+    assert "_thumbnailRequests.ContainsKey(cacheKey)" in main_code
+    assert "_thumbnailFailures.TryGetValue(cacheKey" in main_code
+    assert 'TextChanged="TimeText_TextChanged"' in main_xaml
+    assert 'RefreshThumbnail("start")' in main_code
+    assert 'RefreshThumbnail("end")' in main_code
     assert "Select cameras and a destination" in daily_dialog
 
 

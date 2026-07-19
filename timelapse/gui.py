@@ -22,6 +22,7 @@ from dotenv import load_dotenv
 from keyring.errors import KeyringError
 from PySide6.QtCore import (
     QDateTime,
+    QEvent,
     QObject,
     QPoint,
     QSettings,
@@ -34,7 +35,7 @@ from PySide6.QtCore import (
     Signal,
     Slot,
 )
-from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon
+from PySide6.QtGui import QAction, QCloseEvent, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -45,6 +46,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -71,7 +73,7 @@ from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_S
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo, parse_connection
 from timelapse.schedule import config_for_local_day, daily_output_path, latest_complete_local_day
-from timelapse.service import export_timelapse, list_available_cameras
+from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -795,6 +797,121 @@ class _CameraLoader(QThread):
                 self._loop.call_soon_threadsafe(self._task.cancel)
 
 
+class _ThumbnailLoader(QThread):
+    thumbnail_loaded: ClassVar[Signal] = Signal(object)
+    load_failed: ClassVar[Signal] = Signal(str)
+
+    def __init__(self, config: Config, camera: CameraInfo, timestamp: datetime, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.camera = camera
+        self.timestamp = timestamp
+        self.cache_key = (camera.id, round(timestamp.timestamp()))
+        self._config = config
+        self._lock = Lock()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._task: asyncio.Task[CameraThumbnail] | None = None
+        self._cancel_requested = False
+
+    def run(self) -> None:
+        """Fetch one historical thumbnail in a private asyncio event loop."""
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(fetch_camera_thumbnail(self._config, self.camera, self.timestamp))
+        with self._lock:
+            self._loop = loop
+            self._task = task
+            cancel_requested = self._cancel_requested
+        if cancel_requested:
+            task.cancel()
+        try:
+            thumbnail = loop.run_until_complete(task)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.load_failed.emit(_exception_text(exc))
+        else:
+            self.thumbnail_loaded.emit(thumbnail)
+        finally:
+            with self._lock:
+                self._loop = None
+                self._task = None
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    def cancel(self) -> None:
+        """Request cancellation from the GUI thread."""
+        with self._lock:
+            if self._cancel_requested:
+                return
+            self._cancel_requested = True
+            self.requestInterruption()
+            if self._loop is not None and self._task is not None:
+                self._loop.call_soon_threadsafe(self._task.cancel)
+
+
+class _ThumbnailPopup(QFrame):
+    def __init__(self, parent: QWidget) -> None:
+        super().__init__(parent, Qt.WindowType.ToolTip)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(
+            "QFrame { background: palette(window); border: 1px solid palette(mid); border-radius: 8px; }"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        self.title_label = QLabel()
+        self.title_label.setStyleSheet("font-weight: 600; border: none;")
+        layout.addWidget(self.title_label)
+        self.time_label = QLabel()
+        self.time_label.setStyleSheet("color: palette(mid); border: none;")
+        layout.addWidget(self.time_label)
+        self.image_label = QLabel()
+        self.image_label.setFixedSize(320, 180)
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setWordWrap(True)
+        self.image_label.setStyleSheet("background: black; color: white; border: none; border-radius: 6px;")
+        layout.addWidget(self.image_label)
+        self.camera_label = QLabel()
+        self.camera_label.setStyleSheet("color: palette(mid); border: none;")
+        layout.addWidget(self.camera_label)
+        self.source_label = QLabel()
+        self.source_label.setStyleSheet("color: #b56800; border: none; font-weight: 600;")
+        self.source_label.setWordWrap(True)
+        layout.addWidget(self.source_label)
+
+    def prepare(self, boundary: str, timestamp: datetime, camera_text: str) -> None:
+        self.title_label.setText(f"{boundary.title()} preview")
+        self.time_label.setText(_format_job_datetime(timestamp))
+        self.camera_label.setText(camera_text)
+        self.source_label.clear()
+
+    def show_loading(self) -> None:
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText("Loading thumbnail…")
+
+    def show_message(self, message: str) -> None:
+        self.image_label.setPixmap(QPixmap())
+        self.image_label.setText(message)
+
+    def show_image(self, thumbnail: CameraThumbnail) -> None:
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(thumbnail.image):
+            self.show_message("The thumbnail data could not be read.")
+            return
+        scaled = pixmap.scaled(
+            self.image_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setText("")
+        self.image_label.setPixmap(scaled)
+        self.source_label.setText(
+            "Live snapshot · exact selected-time frame unavailable" if thumbnail.source == "live" else ""
+        )
+
+
 class _DownloadWorker(QThread):
     progress_changed: ClassVar[Signal] = Signal(object)
     download_succeeded: ClassVar[Signal] = Signal(str)
@@ -857,7 +974,7 @@ class _DownloadWorker(QThread):
 
 
 class _MainWindow(QMainWindow):
-    def __init__(
+    def __init__(  # noqa: PLR0915 - initializes one cohesive window state
         self,
         profile_state: _ProfileState | _ConnectionSettings,
         profile_store: _ProfileStore | None = None,
@@ -879,6 +996,11 @@ class _MainWindow(QMainWindow):
         self._cameras: list[CameraInfo] = []
         self._selected_cameras: list[CameraInfo] = []
         self._camera_loader: _CameraLoader | None = None
+        self._thumbnail_loaders: set[_ThumbnailLoader] = set()
+        self._active_thumbnail_loaders: dict[str, _ThumbnailLoader] = {}
+        self._thumbnail_cache: dict[tuple[str, int], CameraThumbnail] = {}
+        self._thumbnail_failures: dict[tuple[str, int], str] = {}
+        self._hovered_thumbnail_boundary: str | None = None
         self._open_camera_dialog_after_load = False
         self._open_daily_dialog_after_load = False
         self._workers: dict[_DownloadWorker, _DownloadEntry] = {}
@@ -895,6 +1017,7 @@ class _MainWindow(QMainWindow):
         self._install_styles()
         self._build_menu()
         self._build_interface()
+        self._thumbnail_popup = _ThumbnailPopup(self)
         self._speed_timer = QTimer(self)
         self._speed_timer.setInterval(1000)
         self._speed_timer.timeout.connect(self._clear_stalled_speeds)
@@ -1027,6 +1150,10 @@ class _MainWindow(QMainWindow):
         self._end_edit = self._date_time_editor(now)
         self._start_edit.dateTimeChanged.connect(self._full_day_start_changed)
         self._end_edit.dateTimeChanged.connect(self._full_day_end_changed)
+        self._start_edit.dateTimeChanged.connect(partial(self._thumbnail_datetime_changed, "start"))
+        self._end_edit.dateTimeChanged.connect(partial(self._thumbnail_datetime_changed, "end"))
+        self._start_edit.installEventFilter(self)
+        self._end_edit.installEventFilter(self)
         date_form.addRow("Start:", self._start_edit)
         date_form.addRow("End:", self._end_edit)
 
@@ -1091,17 +1218,19 @@ class _MainWindow(QMainWindow):
         editor.setCalendarPopup(True)
         editor.setDisplayFormat("MMM d, yyyy h:mm AP")
         editor.setMinimumDateTime(_MINIMUM_DATE)
-        editor.setToolTip("Type a date and time or use the calendar button to choose a date.")
+        editor.setStatusTip("Choose a date and time, then hover here to preview the recording.")
         return editor
 
     @Slot(bool)
     def _full_day_toggled(self, enabled: bool) -> None:  # noqa: FBT001 - Qt signal signature
         display_format = "MMM d, yyyy" if enabled else "MMM d, yyyy h:mm AP"
-        tooltip = "Choose a date." if enabled else "Type a date and time or use the calendar button to choose a date."
+        status_tip = "Choose a date, then hover here to preview midnight."
+        if not enabled:
+            status_tip = "Choose a date and time, then hover here to preview the recording."
         self._start_edit.setDisplayFormat(display_format)
         self._end_edit.setDisplayFormat(display_format)
-        self._start_edit.setToolTip(tooltip)
-        self._end_edit.setToolTip(tooltip)
+        self._start_edit.setStatusTip(status_tip)
+        self._end_edit.setStatusTip(status_tip)
         if enabled:
             self._set_full_day_from_start(self._start_edit.dateTime())
 
@@ -1130,6 +1259,123 @@ class _MainWindow(QMainWindow):
             self._end_edit.setDateTime(start.addDays(1))
         finally:
             self._adjusting_full_day = False
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        """Show a historical thumbnail while either date/time editor is hovered."""
+        boundary = "start" if watched is self._start_edit else "end" if watched is self._end_edit else None
+        if boundary is not None:
+            if event.type() == QEvent.Type.Enter:
+                self._show_thumbnail_preview(boundary)
+            elif event.type() == QEvent.Type.Leave and self._hovered_thumbnail_boundary == boundary:
+                self._hovered_thumbnail_boundary = None
+                self._thumbnail_popup.hide()
+        return super().eventFilter(watched, event)
+
+    def _thumbnail_datetime_changed(self, boundary: str, _value: QDateTime) -> None:
+        self._show_thumbnail_preview(boundary, display=self._hovered_thumbnail_boundary == boundary)
+
+    def _thumbnail_timestamp(self, boundary: str) -> datetime:
+        editor = self._start_edit if boundary == "start" else self._end_edit
+        return datetime.fromtimestamp(editor.dateTime().toSecsSinceEpoch()).astimezone()
+
+    def _show_thumbnail_preview(  # noqa: PLR0912 - handles cached async preview states
+        self,
+        boundary: str,
+        *,
+        display: bool = True,
+    ) -> None:
+        if display:
+            self._hovered_thumbnail_boundary = boundary
+        editor = self._start_edit if boundary == "start" else self._end_edit
+        timestamp = self._thumbnail_timestamp(boundary)
+        camera = self._selected_cameras[0] if self._selected_cameras else None
+        camera_text = ""
+        if camera is not None:
+            camera_text = camera.name if len(self._selected_cameras) == 1 else f"{camera.name} · first selected camera"
+        if display:
+            self._thumbnail_popup.prepare(boundary, timestamp, camera_text)
+        if camera is None:
+            if display:
+                self._thumbnail_popup.show_message("Select a camera to preview this time.")
+                self._position_thumbnail_popup(editor)
+            return
+
+        cache_key = (camera.id, round(timestamp.timestamp()))
+        if thumbnail := self._thumbnail_cache.get(cache_key):
+            if display:
+                self._thumbnail_popup.show_image(thumbnail)
+                self._position_thumbnail_popup(editor)
+            return
+        if message := self._thumbnail_failures.get(cache_key):
+            if display:
+                self._thumbnail_popup.show_message(message)
+                self._position_thumbnail_popup(editor)
+            return
+        active = self._active_thumbnail_loaders.get(boundary)
+        if active is not None and active.cache_key == cache_key:
+            if display:
+                self._thumbnail_popup.show_loading()
+                self._position_thumbnail_popup(editor)
+            return
+        if active is not None:
+            active.cancel()
+
+        config = self._settings.make_config(timestamp, timestamp + timedelta(seconds=1), "600x")
+        loader = _ThumbnailLoader(config, camera, timestamp, self)
+        self._thumbnail_loaders.add(loader)
+        self._active_thumbnail_loaders[boundary] = loader
+        loader.thumbnail_loaded.connect(partial(self._thumbnail_loaded, boundary, loader))
+        loader.load_failed.connect(partial(self._thumbnail_load_failed, boundary, loader))
+        loader.finished.connect(partial(self._thumbnail_loader_finished, boundary, loader))
+        if display:
+            self._thumbnail_popup.show_loading()
+            self._position_thumbnail_popup(editor)
+        loader.start()
+
+    def _position_thumbnail_popup(self, editor: QDateTimeEdit) -> None:
+        self._thumbnail_popup.adjustSize()
+        position = editor.mapToGlobal(QPoint(editor.width() + 8, 0))
+        screen = QApplication.screenAt(position)
+        if screen is not None:
+            available = screen.availableGeometry()
+            if position.x() + self._thumbnail_popup.width() > available.right():
+                position.setX(editor.mapToGlobal(QPoint(0, 0)).x() - self._thumbnail_popup.width() - 8)
+            position.setY(min(position.y(), available.bottom() - self._thumbnail_popup.height()))
+        self._thumbnail_popup.move(position)
+        self._thumbnail_popup.show()
+
+    def _thumbnail_loaded(self, boundary: str, loader: _ThumbnailLoader, payload: object) -> None:
+        if not isinstance(payload, CameraThumbnail):
+            self._thumbnail_load_failed(boundary, loader, "Protect returned invalid thumbnail data.")
+            return
+        if self._active_thumbnail_loaders.get(boundary) is not loader:
+            return
+        self._thumbnail_cache[loader.cache_key] = payload
+        if self._hovered_thumbnail_boundary == boundary:
+            self._thumbnail_popup.show_image(payload)
+
+    def _thumbnail_load_failed(self, boundary: str, loader: _ThumbnailLoader, message: str) -> None:
+        if self._active_thumbnail_loaders.get(boundary) is not loader:
+            return
+        self._thumbnail_failures[loader.cache_key] = message
+        if self._hovered_thumbnail_boundary == boundary:
+            self._thumbnail_popup.show_message(message)
+
+    def _thumbnail_loader_finished(self, boundary: str, loader: _ThumbnailLoader) -> None:
+        self._thumbnail_loaders.discard(loader)
+        if self._active_thumbnail_loaders.get(boundary) is loader:
+            self._active_thumbnail_loaders.pop(boundary, None)
+        loader.deleteLater()
+        self._finish_close_if_ready()
+
+    def _clear_thumbnail_previews(self) -> None:
+        self._hovered_thumbnail_boundary = None
+        self._thumbnail_popup.hide()
+        self._thumbnail_cache.clear()
+        self._thumbnail_failures.clear()
+        self._active_thumbnail_loaders.clear()
+        for loader in tuple(self._thumbnail_loaders):
+            loader.cancel()
 
     def _downloads_group(self) -> QGroupBox:
         group = QGroupBox("Jobs")
@@ -1243,6 +1489,7 @@ class _MainWindow(QMainWindow):
         self._settings = updated.settings
         self._cameras.clear()
         self._selected_cameras.clear()
+        self._clear_thumbnail_previews()
         self._update_profile_controls()
         self._update_camera_summary()
         self.statusBar().showMessage(f"Saved {updated.display_name}", 5000)
@@ -1275,6 +1522,7 @@ class _MainWindow(QMainWindow):
         self._settings = created.settings
         self._cameras.clear()
         self._selected_cameras.clear()
+        self._clear_thumbnail_previews()
         self._update_profile_controls()
         self._update_camera_summary()
         self.statusBar().showMessage(f"Saved {created.display_name}", 5000)
@@ -1301,6 +1549,7 @@ class _MainWindow(QMainWindow):
         self._settings = profile.settings
         self._cameras.clear()
         self._selected_cameras.clear()
+        self._clear_thumbnail_previews()
         self._update_profile_controls()
         self._update_camera_summary()
         self.statusBar().showMessage(f"Selected {profile.display_name}", 5000)
@@ -1408,8 +1657,12 @@ class _MainWindow(QMainWindow):
         dialog = _CameraSelectionDialog(self._cameras, selected_ids, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._selected_cameras = dialog.selected_cameras()
+            self._clear_thumbnail_previews()
             self._update_camera_summary()
             _LOGGER.info("Selected %d cameras", len(self._selected_cameras))
+            if self._selected_cameras:
+                self._show_thumbnail_preview("start", display=False)
+                self._show_thumbnail_preview("end", display=False)
 
     def _update_camera_summary(self) -> None:
         count = len(self._selected_cameras)
@@ -1922,12 +2175,12 @@ class _MainWindow(QMainWindow):
             item.setToolTip(tooltip)
 
     def _finish_close_if_ready(self) -> None:
-        if self._closing and self._camera_loader is None and not self._workers:
+        if self._closing and self._camera_loader is None and not self._workers and not self._thumbnail_loaders:
             QTimer.singleShot(0, self.close)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Cancel background work before allowing the native window to close."""
-        has_background_work = self._camera_loader is not None or bool(self._workers)
+        has_background_work = self._camera_loader is not None or bool(self._workers) or bool(self._thumbnail_loaders)
         if not has_background_work:
             self._daily_schedule = None
             self._preferences.setValue("output_directory", self._output_edit.text())
@@ -1941,8 +2194,8 @@ class _MainWindow(QMainWindow):
             return
         response = QMessageBox.question(
             self,
-            "Downloads Are Still Running",
-            "Cancel the active work and quit? Partial download files will be removed.",
+            "Background Work Is Still Running",
+            "Cancel the active work and quit? Any partial download files will be removed.",
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
@@ -1959,6 +2212,8 @@ class _MainWindow(QMainWindow):
             self._camera_loader.cancel()
         for worker in tuple(self._workers):
             worker.cancel()
+        for loader in tuple(self._thumbnail_loaders):
+            loader.cancel()
         event.ignore()
 
 

@@ -49,11 +49,31 @@
               <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <TextBlock Grid.Row="0" Text="Start" Foreground="#666" VerticalAlignment="Center" />
-            <DatePicker x:Name="StartDatePicker" Grid.Row="0" Grid.Column="1" Margin="0,0,8,8" SelectedDateChanged="StartDate_SelectedDateChanged" />
-            <TextBox x:Name="StartTimeText" Grid.Row="0" Grid.Column="2" Text="12:00 AM" Margin="0,0,0,8" VerticalContentAlignment="Center" />
+            <Border x:Name="StartDateTimeHoverTarget" Grid.Row="0" Grid.Column="1" Grid.ColumnSpan="2" Background="Transparent"
+                    Margin="0,0,0,8" Tag="start" MouseEnter="ThumbnailHover_MouseEnter" MouseLeave="ThumbnailHover_MouseLeave">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="190" />
+                  <ColumnDefinition Width="85" />
+                </Grid.ColumnDefinitions>
+                <DatePicker x:Name="StartDatePicker" Margin="0,0,8,0" SelectedDateChanged="StartDate_SelectedDateChanged" />
+                <TextBox x:Name="StartTimeText" Grid.Column="1" Text="12:00 AM" VerticalContentAlignment="Center"
+                         TextChanged="TimeText_TextChanged" />
+              </Grid>
+            </Border>
             <TextBlock Grid.Row="1" Text="End" Foreground="#666" VerticalAlignment="Center" />
-            <DatePicker x:Name="EndDatePicker" Grid.Row="1" Grid.Column="1" Margin="0,0,8,8" SelectedDateChanged="EndDate_SelectedDateChanged" />
-            <TextBox x:Name="EndTimeText" Grid.Row="1" Grid.Column="2" Text="12:00 AM" Margin="0,0,0,8" VerticalContentAlignment="Center" />
+            <Border x:Name="EndDateTimeHoverTarget" Grid.Row="1" Grid.Column="1" Grid.ColumnSpan="2" Background="Transparent"
+                    Margin="0,0,0,8" Tag="end" MouseEnter="ThumbnailHover_MouseEnter" MouseLeave="ThumbnailHover_MouseLeave">
+              <Grid>
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="190" />
+                  <ColumnDefinition Width="85" />
+                </Grid.ColumnDefinitions>
+                <DatePicker x:Name="EndDatePicker" Margin="0,0,8,0" SelectedDateChanged="EndDate_SelectedDateChanged" />
+                <TextBox x:Name="EndTimeText" Grid.Column="1" Text="12:00 AM" VerticalContentAlignment="Center"
+                         TextChanged="TimeText_TextChanged" />
+              </Grid>
+            </Border>
             <TextBlock Grid.Row="2" Text="Speed" Foreground="#666" VerticalAlignment="Center" />
             <ComboBox x:Name="SpeedCombo" Grid.Row="2" Grid.Column="1" Width="105" HorizontalAlignment="Left" SelectedIndex="3">
               <ComboBoxItem Content="60x" />
@@ -182,5 +202,23 @@
       </StackPanel>
       <TextBlock x:Name="StatusText" Text="Ready" Foreground="#666" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
     </DockPanel>
+
+    <Popup x:Name="ThumbnailPopup" Placement="Right" HorizontalOffset="8" AllowsTransparency="True"
+           PopupAnimation="Fade" StaysOpen="True" IsHitTestVisible="False">
+      <Border Background="White" BorderBrush="#B8B8BC" BorderThickness="1" CornerRadius="9" Padding="11">
+        <StackPanel Width="320">
+          <TextBlock x:Name="ThumbnailTitle" FontWeight="SemiBold" FontSize="14" />
+          <TextBlock x:Name="ThumbnailTime" Foreground="#666" Margin="0,3,0,8" />
+          <Grid Width="320" Height="180" Background="Black">
+            <Image x:Name="ThumbnailImage" Stretch="Uniform" />
+            <TextBlock x:Name="ThumbnailMessage" Foreground="White" TextAlignment="Center" TextWrapping="Wrap"
+                       VerticalAlignment="Center" HorizontalAlignment="Center" MaxWidth="260" />
+          </Grid>
+          <TextBlock x:Name="ThumbnailCamera" Foreground="#666" Margin="0,8,0,0" TextTrimming="CharacterEllipsis" />
+          <TextBlock x:Name="ThumbnailSource" Foreground="#B56800" FontWeight="SemiBold" Margin="0,4,0,0"
+                     TextWrapping="Wrap" />
+        </StackPanel>
+      </Border>
+    </Popup>
   </Grid>
 </Window>

@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 
@@ -21,8 +22,14 @@ public partial class MainWindow : Window
     private readonly List<CameraInfo> _cameras = [];
     private readonly HashSet<string> _selectedCameraIds = [];
     private readonly Dictionary<Guid, BackendProcess> _downloadProcesses = [];
+    private readonly HashSet<BackendProcess> _thumbnailProcesses = [];
+    private readonly Dictionary<string, CameraThumbnail> _thumbnailCache = [];
+    private readonly Dictionary<string, string> _thumbnailFailures = [];
+    private readonly Dictionary<string, BackendProcess> _thumbnailRequests = [];
     private readonly HashSet<string> _reservedOutputPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _dailyTimer = new() { Interval = TimeSpan.FromMinutes(1) };
+    private readonly DispatcherTimer _startThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
+    private readonly DispatcherTimer _endThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
     private ConnectionProfile? _selectedProfile;
     private BackendProcess? _cameraProcess;
     private string _outputDirectory;
@@ -32,6 +39,9 @@ public partial class MainWindow : Window
     private bool _allowClose;
     private bool _adjustingFullDay;
     private bool _updatingDailyToggle;
+    private string? _hoveredThumbnailBoundary;
+    private string? _visibleThumbnailKey;
+    private int _thumbnailGeneration;
     private DailySchedule? _dailySchedule;
 
     private sealed class DailySchedule
@@ -60,6 +70,8 @@ public partial class MainWindow : Window
         EndDatePicker.SelectedDate = end.Date;
         StartTimeText.Text = start.ToString("t", CultureInfo.CurrentCulture);
         EndTimeText.Text = end.ToString("t", CultureInfo.CurrentCulture);
+        _startThumbnailTimer.Tick += (_, _) => ThumbnailTimerElapsed("start", _startThumbnailTimer);
+        _endThumbnailTimer.Tick += (_, _) => ThumbnailTimerElapsed("end", _endThumbnailTimer);
         _dailyTimer.Tick += (_, _) => RunDailyScheduleIfDue();
         _dailyTimer.Start();
         UpdateDownloadsDisplay();
@@ -107,6 +119,7 @@ public partial class MainWindow : Window
         catch (Exception exception) { ShowError("Could Not Save Profile", exception.Message); return; }
         _cameras.Clear();
         _selectedCameraIds.Clear();
+        ClearThumbnailPreviews();
         UpdateConnectionDisplay();
         UpdateCameraSummary();
         StatusText.Text = $"Saved {replacement.DisplayName}";
@@ -121,6 +134,7 @@ public partial class MainWindow : Window
         catch (Exception exception) { ShowError("Could Not Select Profile", exception.Message); return; }
         _cameras.Clear();
         _selectedCameraIds.Clear();
+        ClearThumbnailPreviews();
         UpdateConnectionDisplay();
         UpdateCameraSummary();
         StatusText.Text = $"Selected {profile.DisplayName}";
@@ -162,15 +176,19 @@ public partial class MainWindow : Window
     {
         if (FullDayCheckBox.IsChecked == true && !_adjustingFullDay && StartDatePicker.SelectedDate is DateTime start)
             SetFullDayFromStart(start);
+        RefreshThumbnail("start");
     }
 
     private void EndDate_SelectedDateChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (FullDayCheckBox.IsChecked != true || _adjustingFullDay || EndDatePicker.SelectedDate is not DateTime end) return;
-        _adjustingFullDay = true;
-        EndDatePicker.SelectedDate = end.Date;
-        StartDatePicker.SelectedDate = end.Date.AddDays(-1);
-        _adjustingFullDay = false;
+        if (FullDayCheckBox.IsChecked == true && !_adjustingFullDay && EndDatePicker.SelectedDate is DateTime end)
+        {
+            _adjustingFullDay = true;
+            EndDatePicker.SelectedDate = end.Date;
+            StartDatePicker.SelectedDate = end.Date.AddDays(-1);
+            _adjustingFullDay = false;
+        }
+        RefreshThumbnail("end");
     }
 
     private void SetFullDayFromStart(DateTime value)
@@ -181,6 +199,238 @@ public partial class MainWindow : Window
         StartTimeText.Text = DateTime.Today.ToString("t", CultureInfo.CurrentCulture);
         EndTimeText.Text = DateTime.Today.ToString("t", CultureInfo.CurrentCulture);
         _adjustingFullDay = false;
+    }
+
+    private async void ThumbnailHover_MouseEnter(object sender, MouseEventArgs e)
+    {
+        if (sender is not FrameworkElement { Tag: string boundary } target) return;
+        _hoveredThumbnailBoundary = boundary;
+        await ShowThumbnailPreviewAsync(boundary, target);
+    }
+
+    private void ThumbnailHover_MouseLeave(object sender, MouseEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string boundary } && _hoveredThumbnailBoundary == boundary)
+        {
+            _hoveredThumbnailBoundary = null;
+            ThumbnailPopup.IsOpen = false;
+        }
+    }
+
+    private void TimeText_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (!IsLoaded) return;
+        var timer = ReferenceEquals(sender, StartTimeText) ? _startThumbnailTimer : _endThumbnailTimer;
+        timer.Stop();
+        timer.Start();
+    }
+
+    private void ThumbnailTimerElapsed(string boundary, DispatcherTimer timer)
+    {
+        timer.Stop();
+        RefreshThumbnail(boundary);
+    }
+
+    private void RefreshThumbnail(string boundary)
+    {
+        if (!IsLoaded) return;
+        var target = boundary == "start" ? StartDateTimeHoverTarget : EndDateTimeHoverTarget;
+        _ = ShowThumbnailPreviewAsync(boundary, target, display: _hoveredThumbnailBoundary == boundary);
+    }
+
+    private async Task ShowThumbnailPreviewAsync(string boundary, FrameworkElement target, bool display = true)
+    {
+        var generation = _thumbnailGeneration;
+        var picker = boundary == "start" ? StartDatePicker : EndDatePicker;
+        var timeBox = boundary == "start" ? StartTimeText : EndTimeText;
+        DateTime timestamp;
+        if (FullDayCheckBox.IsChecked == true && picker.SelectedDate is DateTime selectedDate)
+            timestamp = selectedDate.Date;
+        else if (!TryReadDateTime(picker, timeBox, out timestamp))
+        {
+            if (display)
+            {
+                _visibleThumbnailKey = null;
+                PrepareThumbnailPopup(boundary, DateTime.MinValue, "");
+                ShowThumbnailMessage("Enter a valid date and time to preview the recording.");
+                OpenThumbnailPopup(target);
+            }
+            return;
+        }
+
+        var selected = _cameras.Where(camera => _selectedCameraIds.Contains(camera.Id)).ToList();
+        var camera = selected.FirstOrDefault();
+        var cameraText = camera is null ? "" : selected.Count > 1 ? $"{camera.Name} · first selected camera" : camera.Name;
+        if (display)
+        {
+            PrepareThumbnailPopup(boundary, timestamp, cameraText);
+            OpenThumbnailPopup(target);
+        }
+        if (camera is null)
+        {
+            if (display)
+            {
+                _visibleThumbnailKey = null;
+                ShowThumbnailMessage("Select a camera to preview this time.");
+            }
+            return;
+        }
+
+        var localTimestamp = new DateTimeOffset(DateTime.SpecifyKind(timestamp, DateTimeKind.Local));
+        var cacheKey = $"{_selectedProfile!.Id}|{camera.Id}|{localTimestamp.ToUnixTimeSeconds()}";
+        if (display) _visibleThumbnailKey = cacheKey;
+        if (_thumbnailCache.TryGetValue(cacheKey, out var cachedImage))
+        {
+            if (display) ShowThumbnailImage(cachedImage);
+            return;
+        }
+        if (_thumbnailFailures.TryGetValue(cacheKey, out var cachedFailure))
+        {
+            if (display) ShowThumbnailMessage(cachedFailure);
+            return;
+        }
+        if (_thumbnailRequests.ContainsKey(cacheKey))
+        {
+            if (display) ShowThumbnailMessage("Loading thumbnail…");
+            return;
+        }
+
+        if (display) ShowThumbnailMessage("Loading thumbnail…");
+        var process = new BackendProcess();
+        _thumbnailProcesses.Add(process);
+        _thumbnailRequests[cacheKey] = process;
+        var requestId = Guid.NewGuid().ToString();
+        var receivedTerminal = false;
+        try
+        {
+            var request = new Dictionary<string, object>
+            {
+                ["id"] = requestId,
+                ["command"] = "thumbnail",
+                ["settings"] = _selectedProfile!.Settings,
+                ["camera"] = camera,
+                ["timestamp"] = localTimestamp.ToString("O"),
+            };
+            var completion = await process.RunAsync(request, backendEvent => Dispatcher.Invoke(() =>
+            {
+                if (backendEvent.Id is not null && backendEvent.Id != requestId) return;
+                switch (backendEvent.Event)
+                {
+                    case "thumbnail":
+                        receivedTerminal = true;
+                        try
+                        {
+                            var image = Convert.FromBase64String(backendEvent.ThumbnailBase64 ?? "");
+                            if (generation == _thumbnailGeneration)
+                            {
+                                var thumbnail = new CameraThumbnail(image, backendEvent.ThumbnailSource ?? "exact");
+                                _thumbnailCache[cacheKey] = thumbnail;
+                                if (_hoveredThumbnailBoundary == boundary && _visibleThumbnailKey == cacheKey)
+                                    ShowThumbnailImage(thumbnail);
+                            }
+                        }
+                        catch (FormatException)
+                        {
+                            var invalidImageMessage = "The thumbnail data could not be read.";
+                            if (generation == _thumbnailGeneration)
+                                _thumbnailFailures[cacheKey] = invalidImageMessage;
+                            if (_hoveredThumbnailBoundary == boundary && _visibleThumbnailKey == cacheKey)
+                                ShowThumbnailMessage(invalidImageMessage);
+                        }
+                        break;
+                    case "error":
+                        receivedTerminal = true;
+                        var message = backendEvent.Message ?? "No thumbnail is available for this time.";
+                        if (generation == _thumbnailGeneration) _thumbnailFailures[cacheKey] = message;
+                        if (_hoveredThumbnailBoundary == boundary && _visibleThumbnailKey == cacheKey)
+                            ShowThumbnailMessage(message);
+                        break;
+                    case "log": AppendLog(backendEvent.Level ?? "INFO", backendEvent.Message ?? ""); break;
+                }
+            }));
+            if (!receivedTerminal && !completion.WasCancelled)
+            {
+                var message = string.IsNullOrWhiteSpace(completion.StandardError)
+                    ? "No thumbnail is available for this time."
+                    : completion.StandardError.Trim();
+                if (generation == _thumbnailGeneration) _thumbnailFailures[cacheKey] = message;
+                if (_hoveredThumbnailBoundary == boundary && _visibleThumbnailKey == cacheKey)
+                    ShowThumbnailMessage(message);
+            }
+        }
+        catch (Exception exception)
+        {
+            if (generation == _thumbnailGeneration) _thumbnailFailures[cacheKey] = exception.Message;
+            if (_hoveredThumbnailBoundary == boundary && _visibleThumbnailKey == cacheKey)
+                ShowThumbnailMessage(exception.Message);
+        }
+        finally
+        {
+            if (_thumbnailRequests.TryGetValue(cacheKey, out var active) && ReferenceEquals(active, process))
+                _thumbnailRequests.Remove(cacheKey);
+            _thumbnailProcesses.Remove(process);
+            process.Dispose();
+        }
+    }
+
+    private void PrepareThumbnailPopup(string boundary, DateTime timestamp, string cameraText)
+    {
+        ThumbnailTitle.Text = $"{char.ToUpperInvariant(boundary[0])}{boundary[1..]} preview";
+        ThumbnailTime.Text = timestamp == DateTime.MinValue ? "" : timestamp.ToString("g", CultureInfo.CurrentCulture);
+        ThumbnailCamera.Text = cameraText;
+        ThumbnailSource.Text = "";
+        ThumbnailImage.Source = null;
+    }
+
+    private void OpenThumbnailPopup(FrameworkElement target)
+    {
+        ThumbnailPopup.PlacementTarget = target;
+        ThumbnailPopup.IsOpen = true;
+    }
+
+    private void ShowThumbnailMessage(string message)
+    {
+        ThumbnailImage.Source = null;
+        ThumbnailMessage.Text = message;
+        ThumbnailMessage.Visibility = Visibility.Visible;
+    }
+
+    private void ShowThumbnailImage(CameraThumbnail thumbnail)
+    {
+        try
+        {
+            using var stream = new MemoryStream(thumbnail.Image);
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit();
+            bitmap.CacheOption = BitmapCacheOption.OnLoad;
+            bitmap.StreamSource = stream;
+            bitmap.EndInit();
+            bitmap.Freeze();
+            ThumbnailImage.Source = bitmap;
+            ThumbnailMessage.Text = "";
+            ThumbnailMessage.Visibility = Visibility.Collapsed;
+            ThumbnailSource.Text = thumbnail.Source == "live"
+                ? "Live snapshot · exact selected-time frame unavailable"
+                : "";
+        }
+        catch (Exception exception) when (exception is ArgumentException or InvalidOperationException or NotSupportedException)
+        {
+            ShowThumbnailMessage("The thumbnail data could not be read.");
+        }
+    }
+
+    private void ClearThumbnailPreviews()
+    {
+        _startThumbnailTimer.Stop();
+        _endThumbnailTimer.Stop();
+        _thumbnailGeneration++;
+        _hoveredThumbnailBoundary = null;
+        _visibleThumbnailKey = null;
+        ThumbnailPopup.IsOpen = false;
+        _thumbnailCache.Clear();
+        _thumbnailFailures.Clear();
+        _thumbnailRequests.Clear();
+        foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();
     }
 
     private async void DailyAutomatic_Checked(object sender, RoutedEventArgs e)
@@ -359,8 +609,14 @@ public partial class MainWindow : Window
         if (dialog.ShowDialog() != true) return;
         _selectedCameraIds.Clear();
         _selectedCameraIds.UnionWith(dialog.SelectedIds);
+        ClearThumbnailPreviews();
         UpdateCameraSummary();
         AppendLog("INFO", $"Selected {_selectedCameraIds.Count} cameras");
+        if (_selectedCameraIds.Count > 0)
+        {
+            RefreshThumbnail("start");
+            RefreshThumbnail("end");
+        }
     }
 
     private void UpdateCameraSummary()
@@ -584,17 +840,18 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, CancelEventArgs e)
     {
-        if (_allowClose || (_cameraProcess is null && _downloadProcesses.Count == 0))
+        if (_allowClose || (_cameraProcess is null && _downloadProcesses.Count == 0 && _thumbnailProcesses.Count == 0))
         {
             _dailyTimer.Stop();
             return;
         }
-        if (MessageBox.Show(this, "Active downloads will be cancelled. Close TimeLapse?", "Close TimeLapse", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+        if (MessageBox.Show(this, "Active background work will be cancelled. Close TimeLapse?", "Close TimeLapse", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
         { e.Cancel = true; return; }
         _allowClose = true;
         _dailyTimer.Stop();
         _cameraProcess?.Cancel();
         foreach (var process in _downloadProcesses.Values.ToList()) process.Cancel();
+        foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();
     }
 
     private string ReserveOutputPath(

@@ -55,4 +55,15 @@ final class BackendProtocolTests: XCTestCase {
 
         XCTAssertEqual(event.cameras, [CameraInfo(id: "camera-1", name: "Front Door", state: nil, model: "G5")])
     }
+
+    func testThumbnailEventDecodesImageData() throws {
+        let data = Data(
+            #"{"id":"thumbnail-1","event":"thumbnail","thumbnail_base64":"anBlZw==","thumbnail_source":"live"}"#.utf8
+        )
+
+        let event = try JSONDecoder().decode(BackendEvent.self, from: data)
+
+        XCTAssertEqual(event.thumbnailBase64, "anBlZw==")
+        XCTAssertEqual(event.thumbnailSource, "live")
+    }
 }
