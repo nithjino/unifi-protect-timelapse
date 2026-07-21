@@ -1,0 +1,22 @@
+<div class="server-info-row">
+  <div class="connection-icon ready" aria-hidden="true">✓</div>
+  <div>
+    <strong>Server healthy</strong>
+    <p>{% if active_jobs %}{{ active_jobs }} active export{% if active_jobs != 1 %}s{% endif %}{% else %}No active exports{% endif %}</p>
+  </div>
+</div>
+<div class="server-info-row">
+  {% if settings.connection_ready %}
+    <div class="connection-icon ready" aria-hidden="true">✓</div>
+    <div>
+      <strong>Protect connection configured</strong>
+      <p>Exports save to <code>{{ settings.output_dir }}</code></p>
+    </div>
+  {% else %}
+    <div class="connection-icon warning" aria-hidden="true">!</div>
+    <div>
+      <strong>Configuration needed</strong>
+      <p>Add {{ settings.missing_connection_values | join(', ') }} and restart.</p>
+    </div>
+  {% endif %}
+</div>

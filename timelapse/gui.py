@@ -15,7 +15,7 @@ from functools import partial
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, Protocol, cast
 
 import keyring
 from dotenv import load_dotenv
@@ -251,6 +251,12 @@ class _ProfileStoreError(RuntimeError):
     pass
 
 
+class _SettingsStore(Protocol):
+    def value(self, key: str) -> object: ...
+
+    def setValue(self, key: str, value: object) -> None: ...  # noqa: N802
+
+
 def _profile_from_keyring(payload: str, expected_id: str) -> _ConnectionProfile:
     profile = _ConnectionProfile.from_json(payload)
     if profile.profile_id != expected_id:
@@ -260,7 +266,7 @@ def _profile_from_keyring(payload: str, expected_id: str) -> _ConnectionProfile:
 
 
 class _ProfileStore:
-    def __init__(self, preferences: QSettings | None = None) -> None:
+    def __init__(self, preferences: _SettingsStore | None = None) -> None:
         self._preferences = preferences or QSettings("TimeLapse", "UniFi Protect Timelapse")
 
     def load(self) -> _ProfileState:
@@ -1013,7 +1019,8 @@ class _MainWindow(QMainWindow):
         self._closing = False
         self._log_handler_attached = False
         self._notification_icon = QSystemTrayIcon(self)
-        self._notification_icon.setIcon(QApplication.instance().windowIcon())
+        application = cast("QApplication", QApplication.instance())
+        self._notification_icon.setIcon(application.windowIcon())
         self._notification_icon.setToolTip("UniFi Protect Timelapse")
         self.setWindowTitle("UniFi Protect Timelapse")
         self.resize(1400, 680)
@@ -2134,7 +2141,7 @@ class _MainWindow(QMainWindow):
     def _show_linux_notification(title: str, message: str) -> bool:
         """Use the freedesktop notification service when a Linux tray is unavailable."""
         try:
-            from PySide6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage  # noqa: PLC0415
+            from PySide6.QtDBus import QDBus, QDBusConnection, QDBusInterface, QDBusMessage  # noqa: PLC0415
 
             notifications = QDBusInterface(
                 "org.freedesktop.Notifications",
@@ -2145,6 +2152,7 @@ class _MainWindow(QMainWindow):
             if not notifications.isValid():
                 return False
             reply = notifications.call(
+                QDBus.CallMode.AutoDetect,
                 "Notify",
                 "UniFi Protect Timelapse",
                 0,

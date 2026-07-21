@@ -9,21 +9,30 @@ description = "CLI and desktop UniFi Protect timelapse exporter"
 requires-python = ">=3.11"
 dependencies = [
     "PySide6-Essentials>=6.10.1",
+    "fastapi>=0.116.1",
+    "jinja2>=3.1.6",
     "keyring>=25.6.0",
     "python-dotenv>=1.1.0",
+    "python-multipart>=0.0.20",
     "secretstorage>=3.3.3; sys_platform == 'linux'",
     "uiprotect>=15.4.3",
+    "uvicorn>=0.35.0",
 ]
 
 [project.scripts]
 timelapse = "timelapse.cli:main"
 timelapse-gui = "timelapse.gui:main"
+timelapse-web = "timelapse.web:main"
 
 [tool.setuptools.packages.find]
 include = ["timelapse*"]
 
+[tool.setuptools.package-data]
+timelapse = ["static/*", "templates/**/*.html"]
+
 [dependency-groups]
 dev = [
+    "httpx>=0.28.1",
     "pyinstaller>=6.21.0",
     "pyright>=1.1.410",
     "pytest>=9.0.3",

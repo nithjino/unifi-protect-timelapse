@@ -78,8 +78,7 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
     output.parent.mkdir(parents=True, exist_ok=True)
 
     _LOGGER.info(
-        "Requesting Protect video export: target=%s:%d%s, camera_id=%s, fps=%s, "
-        "request_timeout=%s, download_limit=%s",
+        "Requesting Protect video export: target=%s:%d%s, camera_id=%s, fps=%s, request_timeout=%s, download_limit=%s",
         connection.host,
         connection.port,
         connection.export_path,

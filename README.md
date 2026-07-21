@@ -219,6 +219,72 @@ The package can also be launched through Python's module interface:
 uv run python -m timelapse --start-date 07-13-2026
 ```
 
+## Web UI
+
+The web interface runs the existing exporter as a central FastAPI service, so phones, tablets, and other computers can
+use TimeLapse without installing the application. Protect credentials stay on the server and are never included in web
+pages or API responses. The browser interface supports camera discovery, exact or full-day ranges, boundary previews,
+concurrent exports, live progress, cancellation, retry, downloads, and persistent daily schedules.
+
+![TimeLapse web dashboard with camera selection, export controls, export activity, and daily automations](docs/screenshots/web-dashboard.jpg)
+
+### Run without Docker
+
+Copy and complete the environment file, then launch the server:
+
+```bash
+cp .env.example .env
+./start-web.sh
+```
+
+Open `http://127.0.0.1:8000`. The script installs locked dependencies with `uv` and starts Uvicorn. It listens only on
+the local machine by default.
+
+To use the interface from other devices on the same trusted network, add these values to `.env`, choosing a strong,
+unique password:
+
+```dotenv
+TIMELAPSE_WEB_HOST=0.0.0.0
+TIMELAPSE_WEB_USERNAME=timelapse
+TIMELAPSE_WEB_PASSWORD=replace-with-a-long-random-password
+```
+
+Restart the server, then browse to `http://SERVER-IP:8000`. TimeLapse refuses to start on a non-loopback address without
+an application password. The browser shows a dedicated login page and creates an HTTP-only, same-site session after a
+successful sign-in. This password protects the web interface; it is separate from the Protect account password.
+
+![TimeLapse web login page with private local access and server-side credential notice](docs/screenshots/web-login.jpg)
+
+Sessions last seven days by default. Change `TIMELAPSE_WEB_SESSION_HOURS` to use a different duration. When an HTTPS
+reverse proxy is terminating TLS for TimeLapse, set `TIMELAPSE_WEB_COOKIE_SECURE=true` so browsers send the session
+cookie only over HTTPS.
+
+Exports are stored in `./data/exports` by default. The export list is stored in `./data/web-jobs.json`, so completed,
+failed, and cancelled entries return after a server restart. An export interrupted by shutdown returns as cancelled and
+can be retried. Daily schedules are stored in `./data/web-schedules.json` and resume when the server restarts. Run one
+Uvicorn worker because export and schedule state is maintained by this process.
+
+### Run with Docker Compose
+
+Complete `.env`, including `TIMELAPSE_WEB_PASSWORD`, then run:
+
+```bash
+docker compose up --build -d
+```
+
+The Compose service publishes port `8000` for local-network access and mounts `./data` for exported videos, export
+history, and schedule state. Change `TIMELAPSE_WEB_BIND_ADDRESS` to `127.0.0.1` if the container should be reachable only
+from its host.
+
+Stop the service without deleting exports or schedules:
+
+```bash
+docker compose down
+```
+
+Do not expose this service directly to the public internet. For remote access, place it behind a trusted VPN or a
+TLS-enabled reverse proxy with its own access controls.
+
 ## Native macOS GUI
 
 The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, automatic thumbnail previews, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
@@ -304,6 +370,8 @@ The native macOS, native Windows, and Qt interfaces share the same preview behav
 - `.env` is ignored by Git, but it is still a plaintext file. Restrict its filesystem permissions and never commit it.
 - CLI profiles keep their connection details in the operating system credential store.
 - The desktop interfaces store connection secrets in the platform credential store instead of application preferences.
+- The web interface reads Protect credentials only from the server environment. LAN access requires a separate web
+  password, and the Docker configuration requires this password before it starts.
 - Export error bodies are size-limited and escaped before they are printed to a terminal.
 
 ## Troubleshooting
@@ -399,6 +467,8 @@ The main source areas are:
 | `timelapse/cli.py` | Interactive CLI workflow |
 | `timelapse/gui.py` | Qt desktop interface |
 | `timelapse/native_backend.py` | JSON-lines bridge used by native desktop shells |
+| `timelapse/web.py` | FastAPI routes, authentication, HTML responses, and Uvicorn entry point |
+| `timelapse/web_state.py` | Web export jobs, live progress, and persistent daily schedules |
 | `native-macos/` | Native SwiftUI macOS application |
 | `native-windows/` | Native WPF Windows application |
 | `tests/` | Python unit and GUI tests |

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="Create and schedule UniFi Protect timelapse exports from your browser.">
+    <title>TimeLapse Web</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+    <script src="{{ url_for('static', path='/htmx.min.js') }}" defer></script>
+    <script src="{{ url_for('static', path='/app.js') }}" defer></script>
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="topbar">
+        <a class="brand" href="/" aria-label="TimeLapse dashboard">
+          <span class="brand-mark" aria-hidden="true">TL</span>
+          <span>
+            <strong>TimeLapse</strong>
+            <small>Protect exporter</small>
+          </span>
+        </a>
+        <div class="topbar-actions">
+          <div class="server-state" aria-live="polite">
+            <span class="live-dot" id="live-dot"></span>
+            <span id="live-label">Connecting to server</span>
+          </div>
+          <button
+            class="info-button"
+            type="button"
+            id="server-info-button"
+            aria-label="Show server information"
+            aria-haspopup="dialog"
+          >i</button>
+          {% if authentication_enabled %}
+            <form method="post" action="/logout" class="logout-form">
+              <span>{{ web_username }}</span>
+              <button type="submit">Log out</button>
+            </form>
+          {% endif %}
+        </div>
+      </header>
+
+      <dialog class="server-info-dialog" id="server-info-dialog" aria-labelledby="server-info-title">
+        <div class="dialog-heading">
+          <div>
+            <p class="eyebrow">TimeLapse server</p>
+            <h2 id="server-info-title">Server information</h2>
+          </div>
+          <form method="dialog">
+            <button class="dialog-close" aria-label="Dismiss server information">×</button>
+          </form>
+        </div>
+        <div
+          class="server-info-content"
+          hx-get="/partials/status"
+          hx-trigger="load, every 30s"
+          hx-swap="innerHTML"
+        >
+          <span class="skeleton-line"></span>
+          <span class="skeleton-line short"></span>
+        </div>
+      </dialog>
+
+      <main>
+        <div id="notifications" class="notifications" aria-live="polite" aria-atomic="true"></div>
+
+        <div class="workspace-grid">
+          <section class="panel export-panel" aria-labelledby="new-export-title">
+            <div class="panel-heading">
+              <div>
+                <h2 id="new-export-title">New export</h2>
+              </div>
+              <span class="timezone-chip">{{ timezone_name }}</span>
+            </div>
+
+            <form id="export-form">
+              <fieldset class="form-section camera-section">
+                <div class="field-heading">
+                  <legend>Choose cameras</legend>
+                  <button
+                    class="text-button"
+                    type="button"
+                    hx-get="/partials/cameras?refresh=true"
+                    hx-target="#camera-picker"
+                    hx-indicator="#camera-loader"
+                  >Refresh</button>
+                </div>
+                <div
+                  id="camera-picker"
+                  class="camera-picker"
+                  hx-get="/partials/cameras"
+                  hx-trigger="load"
+                  hx-swap="innerHTML"
+                >
+                  <div class="loading-block" id="camera-loader">
+                    <span class="spinner" aria-hidden="true"></span>
+                    Discovering cameras…
+                  </div>
+                </div>
+              </fieldset>
+
+              <fieldset class="form-section">
+                <legend>Choose a range</legend>
+                <div class="segmented-control" role="radiogroup" aria-label="Export range type">
+                  <label>
+                    <input type="radio" name="range_mode" value="full-day" checked>
+                    <span>Full day</span>
+                  </label>
+                  <label>
+                    <input type="radio" name="range_mode" value="exact">
+                    <span>Exact range</span>
+                  </label>
+                </div>
+
+                <div id="full-day-fields" class="range-fields">
+                  <label class="field">
+                    <span>Date</span>
+                    <input type="date" name="day" value="{{ yesterday }}" max="{{ now_local[:10] }}">
+                  </label>
+                </div>
+
+                <div id="exact-fields" class="range-fields two-column" hidden>
+                  <label class="field">
+                    <span>Start</span>
+                    <input type="datetime-local" name="start" value="{{ day_ago_local }}">
+                  </label>
+                  <label class="field">
+                    <span>End</span>
+                    <input type="datetime-local" name="end" value="{{ now_local }}">
+                  </label>
+                </div>
+                <p class="field-note">Times are interpreted in the server’s {{ timezone_name }} timezone.</p>
+              </fieldset>
+
+              <fieldset class="form-section compact-section">
+                <legend>Set the pace</legend>
+                <div class="speed-row">
+                  {% for speed in speeds %}
+                    <label class="speed-option">
+                      <input type="radio" name="speed" value="{{ speed }}" {% if speed == '600x' %}checked{% endif %}>
+                      <span>{{ speed }}</span>
+                    </label>
+                  {% endfor %}
+                </div>
+              </fieldset>
+
+              <div class="preview-section">
+                <div class="field-heading">
+                  <div>
+                    <h3>Boundary preview</h3>
+                    <p>Check the first selected camera before exporting.</p>
+                  </div>
+                  <button class="text-button" type="button" id="load-previews">Load previews</button>
+                </div>
+                <div class="preview-grid">
+                  <figure class="preview-card" data-boundary="start">
+                    <div class="preview-frame"><span>Select a camera</span></div>
+                    <figcaption>Start frame</figcaption>
+                  </figure>
+                  <figure class="preview-card" data-boundary="end">
+                    <div class="preview-frame"><span>Select a camera</span></div>
+                    <figcaption>End frame</figcaption>
+                  </figure>
+                </div>
+              </div>
+
+              <div class="form-actions">
+                <button
+                  class="primary-button"
+                  type="button"
+                  hx-post="/actions/export"
+                  hx-include="closest form"
+                  hx-target="#notifications"
+                  hx-swap="innerHTML"
+                  hx-disabled-elt="this"
+                >
+                  <span>Start export</span>
+                  <span aria-hidden="true">→</span>
+                </button>
+                <button
+                  class="secondary-button"
+                  type="button"
+                  hx-post="/actions/schedules"
+                  hx-include="closest form"
+                  hx-target="#notifications"
+                  hx-swap="innerHTML"
+                  hx-disabled-elt="this"
+                >Enable daily exports</button>
+              </div>
+            </form>
+          </section>
+
+          <div class="activity-column">
+            <section class="panel" aria-labelledby="exports-title">
+              <div class="panel-heading">
+                <div>
+                  <h2 id="exports-title">Export activity</h2>
+                </div>
+                <span class="selection-count" id="selection-count">0 selected</span>
+              </div>
+              <div
+                id="jobs-list"
+                hx-get="/partials/jobs"
+                hx-trigger="load, stateChanged from:body, every 10s"
+                hx-swap="innerHTML"
+              >
+                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading jobs…</div>
+              </div>
+            </section>
+
+            <section class="panel" aria-labelledby="schedules-title">
+              <div class="panel-heading">
+                <div>
+                  <h2 id="schedules-title">Daily automations</h2>
+                </div>
+              </div>
+              <div
+                id="schedules-list"
+                hx-get="/partials/schedules"
+                hx-trigger="load, stateChanged from:body, every 30s"
+                hx-swap="innerHTML"
+              >
+                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading schedules…</div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </main>
+
+      <footer>
+        <span>TimeLapse runs on your machine. Protect credentials never leave the server.</span>
+      </footer>
+    </div>
+  </body>
+</html>

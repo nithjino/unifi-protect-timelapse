@@ -1,0 +1,22 @@
+{% if camera_error %}
+  <div class="inline-error">
+    <strong>Could not load cameras</strong>
+    <span>{{ camera_error }}</span>
+  </div>
+{% elif not cameras %}
+  <div class="empty-inline">No cameras are available to this Integration API token.</div>
+{% else %}
+  <div class="camera-grid">
+    {% for camera in cameras %}
+      <label class="camera-option">
+        <input type="checkbox" name="camera_ids" value="{{ camera.id }}">
+        <span class="camera-check" aria-hidden="true">✓</span>
+        <span class="camera-glyph" aria-hidden="true"><i></i></span>
+        <span class="camera-copy">
+          <strong>{{ camera.name }}</strong>
+          <small>{{ camera.model or 'Protect camera' }} · {{ camera.state or 'Status unknown' }}</small>
+        </span>
+      </label>
+    {% endfor %}
+  </div>
+{% endif %}

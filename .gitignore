@@ -9,5 +9,6 @@ timelapse.egg-info
 *.mp4
 build/
 dist/
+data/
 /native-windows/bin/
 /native-windows/obj/

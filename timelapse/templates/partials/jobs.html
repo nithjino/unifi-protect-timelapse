@@ -1,0 +1,82 @@
+{% if not jobs %}
+  <div class="empty-state">
+    <span class="empty-glyph" aria-hidden="true">▶</span>
+    <strong>No exports yet</strong>
+    <p>Your active and completed timelapses will appear here.</p>
+  </div>
+{% else %}
+  <div class="job-list">
+    {% for job in jobs %}
+      <article class="job-card status-{{ job.status }}">
+        <div class="job-topline">
+          <div>
+            <div class="job-title-row">
+              <strong>{{ job.camera.name }}</strong>
+              {% if job.daily %}<span class="mini-chip">Daily</span>{% endif %}
+            </div>
+            <p>{{ job.start | datetime }} — {{ job.end | datetime }}</p>
+          </div>
+          <span class="status-badge">{{ job | job_status }}</span>
+        </div>
+
+        {% if job.status == 'running' %}
+          <div class="progress-wrap">
+            {% if job.progress_percent is not none %}
+              <progress max="100" value="{{ job.progress_percent }}">{{ '%.1f' | format(job.progress_percent) }}%</progress>
+            {% else %}
+              <div class="indeterminate-progress"><span></span></div>
+            {% endif %}
+            <div class="progress-copy">
+              <span>{{ job.downloaded_bytes | bytes }}{% if job.total_bytes %} / {{ job.total_bytes | bytes }}{% endif %}</span>
+              <span>{{ job.bytes_per_second | int | bytes }}/s</span>
+            </div>
+          </div>
+        {% elif job.error %}
+          <p class="job-error">{{ job.error }}</p>
+        {% endif %}
+
+        <div class="job-footer">
+          <span>{{ job.speed }} · {{ job.output.name }}</span>
+          <div class="job-actions">
+            {% if job.status == 'completed' %}
+              <a class="small-button primary" href="/exports/{{ job.id }}">Download</a>
+              <button
+                class="small-button"
+                hx-delete="/actions/jobs/{{ job.id }}"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Remove</button>
+            {% elif job.status in ('queued', 'running') %}
+              <button
+                class="small-button danger"
+                hx-delete="/actions/jobs/{{ job.id }}"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Cancel</button>
+            {% elif job.status in ('failed', 'cancelled') %}
+              <button
+                class="small-button primary"
+                hx-post="/actions/jobs/{{ job.id }}/retry"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Retry</button>
+              <button
+                class="small-button"
+                hx-delete="/actions/jobs/{{ job.id }}"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Remove</button>
+            {% else %}
+              <button
+                class="small-button"
+                hx-delete="/actions/jobs/{{ job.id }}"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Remove</button>
+            {% endif %}
+          </div>
+        </div>
+      </article>
+    {% endfor %}
+  </div>
+{% endif %}

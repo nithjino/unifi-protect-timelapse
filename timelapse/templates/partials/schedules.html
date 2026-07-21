@@ -1,0 +1,29 @@
+{% if not schedules %}
+  <div class="empty-state compact">
+    <span class="empty-glyph calendar" aria-hidden="true">31</span>
+    <div>
+      <strong>No daily exports</strong>
+      <p>Select cameras, then enable daily exports to archive each completed day.</p>
+    </div>
+  </div>
+{% else %}
+  <div class="schedule-list">
+    {% for schedule in schedules %}
+      <article class="schedule-card">
+        <span class="schedule-mark" aria-hidden="true">↻</span>
+        <div class="schedule-copy">
+          <strong>{{ schedule.cameras | map(attribute='name') | join(', ') }}</strong>
+          <p>Next run {{ schedule | next_run }} · {{ schedule.speed }}</p>
+          <small>Last completed day: {{ schedule.last_run_day | date }}</small>
+          {% if schedule.last_error %}<small class="schedule-error">Retrying after: {{ schedule.last_error }}</small>{% endif %}
+        </div>
+        <button
+          class="small-button danger"
+          hx-delete="/actions/schedules/{{ schedule.id }}"
+          hx-target="#notifications"
+          hx-swap="innerHTML"
+        >Stop</button>
+      </article>
+    {% endfor %}
+  </div>
+{% endif %}
