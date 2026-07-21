@@ -16,6 +16,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 - Exact date/time ranges or daylight-saving-aware local calendar days
 - Daily automatic exports for the most recently completed day
 - Multiple concurrent per-camera jobs in the desktop interfaces
+- Desktop notifications when downloads complete, fail, or are interrupted
 - Job tables show the requested start and end date/time for every timelapse
 - Automatic start/end thumbnail previews with exact-time and live-snapshot fallback
 - Streaming downloads with progress, cancellation, and atomic finalization
@@ -222,6 +223,8 @@ uv run python -m timelapse --start-date 07-13-2026
 
 The macOS interface is built with SwiftUI and uses the Python exporter as an embedded helper. It supports reusable connection profiles, multi-camera exports, full-day mode, daily automations, automatic thumbnail previews, requested time ranges in the job list, per-download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in the macOS login Keychain.
 
+Closing the macOS window leaves active downloads running. Quitting the app while downloads are active asks for confirmation before interrupting them.
+
 ![Native macOS TimeLapse interface showing a start-time thumbnail preview](docs/screenshots/macos-native-ui.png)
 
 Build and launch the native app on macOS:
@@ -236,6 +239,8 @@ The build requires macOS 15 or newer, the Swift/Xcode command-line toolchain, an
 ## Cross-platform Qt GUI (macOS, Linux, and Windows)
 
 The PySide6 interface—often referred to as the PyQt GUI—runs on macOS, Linux, and Windows. macOS and Windows also have native interfaces. The Qt interface provides connection profiles, camera selection, exact or 24-hour ranges, automatic thumbnail previews, requested time ranges in the job list, multiple download jobs, daily automations, progress reporting, cancellation, and logs. Secrets are stored through `keyring` in the macOS Keychain, Windows Credential Manager, or the Linux desktop Secret Service.
+
+The Linux Qt interface asks for confirmation before quitting while downloads are active.
 
 ![Qt TimeLapse interface showing a start-time thumbnail preview](docs/screenshots/pyqt-ui.png)
 
@@ -256,6 +261,8 @@ The Linux build is written to `dist/linux/`. Build on the oldest Linux distribut
 ## Native Windows GUI
 
 The Windows interface is built with WPF and uses the same embedded Python export backend as the native macOS application. It supports connection profiles, multi-camera exports, exact or 24-hour ranges, daily automations, automatic thumbnail previews, requested time ranges in the job list, download progress, cancellation, restart actions, and a separate logs window. Credentials are stored in Windows Credential Manager.
+
+The native Windows interface asks for confirmation before quitting while downloads are active.
 
 Build it from PowerShell on Windows with the .NET 8 SDK and `uv` installed:
 

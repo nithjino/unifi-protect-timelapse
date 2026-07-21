@@ -597,6 +597,77 @@ def test_cancelled_job_can_restart_and_be_removed(
     assert main_window._downloads.rowCount() == 0
 
 
+def test_download_terminal_states_send_desktop_notifications(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+    notifications: list[tuple[str, str, object]] = []
+    monkeypatch.setattr(
+        main_window,
+        "_show_notification",
+        lambda title, message, icon: notifications.append((title, message, icon)),
+    )
+
+    completed = main_window._add_download_row(
+        1,
+        camera,
+        tmp_path / "completed.mp4",
+        gui_module._DownloadWorker(config, camera, tmp_path / "completed.mp4", main_window),
+    )
+    failed = main_window._add_download_row(
+        2,
+        camera,
+        tmp_path / "failed.mp4",
+        gui_module._DownloadWorker(config, camera, tmp_path / "failed.mp4", main_window),
+    )
+    cancelled = main_window._add_download_row(
+        3,
+        camera,
+        tmp_path / "cancelled.mp4",
+        gui_module._DownloadWorker(config, camera, tmp_path / "cancelled.mp4", main_window),
+    )
+
+    main_window._download_succeeded(completed, str(completed.output))
+    main_window._download_failed(failed, "Connection lost")
+    main_window._download_cancelled(cancelled)
+
+    assert [title for title, _message, _icon in notifications] == [
+        "Download complete",
+        "Download failed",
+        "Download interrupted",
+    ]
+    assert "Connection lost" in notifications[1][1]
+
+
+def test_linux_notifications_fall_back_to_freedesktop_service(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    delivered: list[tuple[str, str]] = []
+    monkeypatch.setattr(gui_module.sys, "platform", "linux")
+    monkeypatch.setattr(gui_module.QSystemTrayIcon, "isSystemTrayAvailable", lambda: False)
+    monkeypatch.setattr(
+        main_window,
+        "_show_linux_notification",
+        lambda title, message: delivered.append((title, message)) or True,
+    )
+
+    main_window._show_notification(
+        "Download complete",
+        "Front Door: completed.mp4",
+        gui_module.QSystemTrayIcon.MessageIcon.Information,
+    )
+
+    assert delivered == [("Download complete", "Front Door: completed.mp4")]
+
+
 def test_double_click_completed_job_opens_video(
     main_window: gui_module._MainWindow,
     monkeypatch: pytest.MonkeyPatch,

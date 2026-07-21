@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 
 @MainActor
 final class AppModel: ObservableObject {
@@ -46,8 +47,10 @@ final class AppModel: ObservableObject {
     private var editingProfileID: UUID?
     private var dailySchedule: DailySchedule?
     private var dailyTimer: Timer?
+    private var didReportNotificationIssue = false
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
+    var hasActiveDownloadJobs: Bool { !downloadProcesses.isEmpty }
     var hasActiveBackendProcesses: Bool {
         cameraProcess != nil || !downloadProcesses.isEmpty || !thumbnailProcesses.isEmpty
     }
@@ -607,6 +610,14 @@ final class AppModel: ObservableObject {
         logs.removeAll()
     }
 
+    func reportNotificationIssue(_ message: String) {
+        appendLog(level: "WARNING", message: message)
+        guard !didReportNotificationIssue else { return }
+        didReportNotificationIssue = true
+        statusMessage = "Notifications unavailable"
+        alert = AppAlert(title: "Notifications Are Disabled", message: message)
+    }
+
     func shutdown(completion: @escaping () -> Void) {
         guard !isShuttingDown else { return }
         isShuttingDown = true
@@ -784,6 +795,10 @@ final class AppModel: ObservableObject {
             downloadProcesses.removeValue(forKey: job.id)
             releaseOutputURL(job.outputURL)
             appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(error.localizedDescription)")
+            sendDownloadNotification(
+                title: "Download Failed",
+                message: "\(job.camera.name): \(error.localizedDescription)"
+            )
         }
     }
 
@@ -802,17 +817,26 @@ final class AppModel: ObservableObject {
             job.bytesPerSecond = 0
             downloadReceivedTerminal.insert(job.id)
             appendLog(level: "INFO", message: "Completed camera download: \(job.camera.name)")
+            sendDownloadNotification(
+                title: "Download Complete",
+                message: "\(job.camera.name): \(job.outputURL.lastPathComponent)"
+            )
         case "cancelled":
             job.state = .cancelled
             job.bytesPerSecond = 0
             downloadReceivedTerminal.insert(job.id)
             appendLog(level: "INFO", message: "Cancelled camera download: \(job.camera.name)")
+            sendDownloadNotification(
+                title: "Download Interrupted",
+                message: "The download for \(job.camera.name) was cancelled."
+            )
         case "error":
             let message = event.message ?? "An unknown backend error occurred."
             job.state = .failed(message)
             job.bytesPerSecond = 0
             downloadReceivedTerminal.insert(job.id)
             appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(message)")
+            sendDownloadNotification(title: "Download Failed", message: "\(job.camera.name): \(message)")
         case "log":
             appendLog(level: event.level ?? "INFO", message: event.message ?? "")
         default:
@@ -825,12 +849,17 @@ final class AppModel: ObservableObject {
             if completion.wasCancelled {
                 job.state = .cancelled
                 appendLog(level: "INFO", message: "Cancelled camera download: \(job.camera.name)")
+                sendDownloadNotification(
+                    title: "Download Interrupted",
+                    message: "The download for \(job.camera.name) was cancelled."
+                )
             } else {
                 let detail = completion.stderr.isEmpty
                     ? "The backend exited with status \(completion.exitCode) without a completion event."
                     : completion.stderr
                 job.state = .failed(detail)
                 appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(detail)")
+                sendDownloadNotification(title: "Download Failed", message: "\(job.camera.name): \(detail)")
             }
         }
         job.bytesPerSecond = 0
@@ -876,6 +905,37 @@ final class AppModel: ObservableObject {
         }
         if logs.count > 2_000 {
             logs.removeFirst(logs.count - 2_000)
+        }
+    }
+
+    private func sendDownloadNotification(title: String, message: String) {
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = message
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let notificationCenter = UNUserNotificationCenter.current()
+            let settings = await notificationCenter.notificationSettings()
+            guard settings.authorizationStatus == .authorized
+                    || settings.authorizationStatus == .provisional,
+                  settings.alertSetting == .enabled else {
+                reportNotificationIssue(
+                    "Enable notifications and banners for TimeLapse in System Settings → Notifications so download results can be shown."
+                )
+                NSApplication.shared.requestUserAttention(.informationalRequest)
+                return
+            }
+            do {
+                try await notificationCenter.add(request)
+            } catch {
+                reportNotificationIssue("Could not send the download notification: \(error.localizedDescription)")
+            }
         }
     }
 

@@ -9,6 +9,7 @@ def test_windows_project_is_native_wpf() -> None:
     project = (ROOT / "native-windows" / "TimeLapseNative.csproj").read_text(encoding="utf-8")
 
     assert "<UseWPF>true</UseWPF>" in project
+    assert "<UseWindowsForms>true</UseWindowsForms>" in project
     assert "<TargetFramework>net8.0-windows</TargetFramework>" in project
     assert "timelapse.ico" in project
 
@@ -39,6 +40,8 @@ def test_windows_native_gui_includes_full_day_and_daily_controls() -> None:
     assert 'RefreshThumbnail("start")' in main_code
     assert 'RefreshThumbnail("end")' in main_code
     assert "Select cameras and a destination" in daily_dialog
+    assert "NotifyDownloadFinished" in main_code
+    assert "Download Jobs Are Still Running" in main_code
 
 
 def test_windows_build_packages_native_app_and_backend() -> None:

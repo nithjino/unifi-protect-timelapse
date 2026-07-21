@@ -9,6 +9,8 @@ using System.Windows.Input;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
+using Drawing = System.Drawing;
+using Forms = System.Windows.Forms;
 
 namespace TimeLapseNative;
 
@@ -22,6 +24,7 @@ public partial class MainWindow : Window
     private readonly List<CameraInfo> _cameras = [];
     private readonly HashSet<string> _selectedCameraIds = [];
     private readonly Dictionary<Guid, BackendProcess> _downloadProcesses = [];
+    private readonly Forms.NotifyIcon _notificationIcon;
     private readonly HashSet<BackendProcess> _thumbnailProcesses = [];
     private readonly Dictionary<string, CameraThumbnail> _thumbnailCache = [];
     private readonly Dictionary<string, string> _thumbnailFailures = [];
@@ -57,6 +60,12 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        _notificationIcon = new Forms.NotifyIcon
+        {
+            Icon = Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? "") ?? Drawing.SystemIcons.Application,
+            Text = "UniFi Protect Timelapse",
+            Visible = true,
+        };
         JobsTabControl.SelectionChanged += JobsTabControl_SelectionChanged;
         DataContext = this;
         ProfileCombo.ItemsSource = _profiles;
@@ -201,14 +210,14 @@ public partial class MainWindow : Window
         _adjustingFullDay = false;
     }
 
-    private async void ThumbnailHover_MouseEnter(object sender, MouseEventArgs e)
+    private async void ThumbnailHover_MouseEnter(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (sender is not FrameworkElement { Tag: string boundary } target) return;
         _hoveredThumbnailBoundary = boundary;
         await ShowThumbnailPreviewAsync(boundary, target);
     }
 
-    private void ThumbnailHover_MouseLeave(object sender, MouseEventArgs e)
+    private void ThumbnailHover_MouseLeave(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (sender is FrameworkElement { Tag: string boundary } && _hoveredThumbnailBoundary == boundary)
         {
@@ -716,9 +725,25 @@ public partial class MainWindow : Window
                         if (backendEvent.TotalBytes.HasValue) job.TotalBytes = backendEvent.TotalBytes;
                         if (backendEvent.BytesPerSecond.HasValue) job.BytesPerSecond = backendEvent.BytesPerSecond.Value;
                         break;
-                    case "complete": job.State = DownloadState.Completed; receivedTerminal = true; AppendLog("INFO", $"Completed camera download: {job.Camera.Name}"); break;
-                    case "cancelled": job.State = DownloadState.Cancelled; receivedTerminal = true; AppendLog("INFO", $"Cancelled camera download: {job.Camera.Name}"); break;
-                    case "error": job.Error = backendEvent.Message ?? "An unknown backend error occurred."; job.State = DownloadState.Failed; receivedTerminal = true; AppendLog("ERROR", $"Download failed for {job.Camera.Name}: {job.Error}"); break;
+                    case "complete":
+                        job.State = DownloadState.Completed;
+                        receivedTerminal = true;
+                        AppendLog("INFO", $"Completed camera download: {job.Camera.Name}");
+                        NotifyDownloadFinished(job);
+                        break;
+                    case "cancelled":
+                        job.State = DownloadState.Cancelled;
+                        receivedTerminal = true;
+                        AppendLog("INFO", $"Cancelled camera download: {job.Camera.Name}");
+                        NotifyDownloadFinished(job);
+                        break;
+                    case "error":
+                        job.Error = backendEvent.Message ?? "An unknown backend error occurred.";
+                        job.State = DownloadState.Failed;
+                        receivedTerminal = true;
+                        AppendLog("ERROR", $"Download failed for {job.Camera.Name}: {job.Error}");
+                        NotifyDownloadFinished(job);
+                        break;
                     case "log": AppendLog(backendEvent.Level ?? "INFO", backendEvent.Message ?? ""); break;
                     default: AppendLog("WARNING", $"Unknown backend event: {backendEvent.Event}"); break;
                 }
@@ -727,9 +752,16 @@ public partial class MainWindow : Window
             {
                 if (completion.WasCancelled) job.State = DownloadState.Cancelled;
                 else { job.Error = string.IsNullOrWhiteSpace(completion.StandardError) ? $"Backend exited with status {completion.ExitCode}." : completion.StandardError.Trim(); job.State = DownloadState.Failed; }
+                NotifyDownloadFinished(job);
             }
         }
-        catch (Exception exception) { job.Error = exception.Message; job.State = DownloadState.Failed; AppendLog("ERROR", exception.Message); }
+        catch (Exception exception)
+        {
+            job.Error = exception.Message;
+            job.State = DownloadState.Failed;
+            AppendLog("ERROR", exception.Message);
+            NotifyDownloadFinished(job);
+        }
         finally
         {
             job.BytesPerSecond = 0;
@@ -843,15 +875,40 @@ public partial class MainWindow : Window
         if (_allowClose || (_cameraProcess is null && _downloadProcesses.Count == 0 && _thumbnailProcesses.Count == 0))
         {
             _dailyTimer.Stop();
+            _notificationIcon.Visible = false;
+            _notificationIcon.Dispose();
             return;
         }
-        if (MessageBox.Show(this, "Active background work will be cancelled. Close TimeLapse?", "Close TimeLapse", MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
-        { e.Cancel = true; return; }
+        if (_downloadProcesses.Count > 0
+            && MessageBox.Show(
+                this,
+                "One or more download jobs are still running. Quit and interrupt them? Any partial download files will be removed.",
+                "Download Jobs Are Still Running",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Warning) != MessageBoxResult.Yes)
+        {
+            e.Cancel = true;
+            return;
+        }
         _allowClose = true;
         _dailyTimer.Stop();
         _cameraProcess?.Cancel();
         foreach (var process in _downloadProcesses.Values.ToList()) process.Cancel();
         foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();
+        _notificationIcon.Visible = false;
+        _notificationIcon.Dispose();
+    }
+
+    private void NotifyDownloadFinished(DownloadJob job)
+    {
+        var (title, message, icon) = job.State switch
+        {
+            DownloadState.Completed => ("Download complete", $"{job.Camera.Name}: {job.OutputName}", Forms.ToolTipIcon.Info),
+            DownloadState.Cancelled => ("Download interrupted", $"The download for {job.Camera.Name} was cancelled.", Forms.ToolTipIcon.Warning),
+            _ => ("Download failed", $"{job.Camera.Name}: {job.Error}", Forms.ToolTipIcon.Error),
+        };
+        if (message.Length > 240) message = message[..237] + "…";
+        _notificationIcon.ShowBalloonTip(10_000, title, message, icon);
     }
 
     private string ReserveOutputPath(
@@ -876,7 +933,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool TryReadDateTime(DatePicker picker, TextBox timeBox, out DateTime value)
+    private static bool TryReadDateTime(DatePicker picker, System.Windows.Controls.TextBox timeBox, out DateTime value)
     {
         value = default;
         if (picker.SelectedDate is not DateTime date || !DateTime.TryParse(timeBox.Text, CultureInfo.CurrentCulture, DateTimeStyles.NoCurrentDateDefault, out var time)) return false;

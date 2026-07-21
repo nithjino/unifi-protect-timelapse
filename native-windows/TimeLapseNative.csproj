@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <ApplicationIcon>..\assets\icons\timelapse.ico</ApplicationIcon>
@@ -10,6 +11,11 @@
     <RootNamespace>TimeLapseNative</RootNamespace>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
+
+  <ItemGroup>
+    <Using Remove="System.Drawing" />
+    <Using Remove="System.Windows.Forms" />
+  </ItemGroup>
 
   <ItemGroup Condition="'$(BackendExecutable)' != ''">
     <EmbeddedResource Include="$(BackendExecutable)" LogicalName="TimeLapseNative.timelapse-backend.exe" />

@@ -61,6 +61,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSizePolicy,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -1011,6 +1012,9 @@ class _MainWindow(QMainWindow):
         self._adjusting_full_day = False
         self._closing = False
         self._log_handler_attached = False
+        self._notification_icon = QSystemTrayIcon(self)
+        self._notification_icon.setIcon(QApplication.instance().windowIcon())
+        self._notification_icon.setToolTip("UniFi Protect Timelapse")
         self.setWindowTitle("UniFi Protect Timelapse")
         self.resize(1400, 680)
         self.setMinimumSize(1250, 560)
@@ -2074,6 +2078,11 @@ class _MainWindow(QMainWindow):
         self._set_action_button(entry, "Show", partial(self._show_output_folder, entry.output))
         self._update_bulk_buttons()
         _LOGGER.info("Completed camera download: %s -> %s", entry.camera_name, entry.output)
+        self._show_notification(
+            "Download complete",
+            f"{entry.camera_name}: {entry.output.name}",
+            QSystemTrayIcon.MessageIcon.Information,
+        )
 
     def _download_failed(self, entry: _DownloadEntry, message: str) -> None:
         entry.terminal = True
@@ -2084,6 +2093,11 @@ class _MainWindow(QMainWindow):
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
         self._update_bulk_buttons()
         _LOGGER.error("Camera download failed for %s: %s", entry.camera_name, message)
+        self._show_notification(
+            "Download failed",
+            f"{entry.camera_name}: {message}",
+            QSystemTrayIcon.MessageIcon.Critical,
+        )
 
     def _download_cancelled(self, entry: _DownloadEntry) -> None:
         entry.terminal = True
@@ -2094,6 +2108,56 @@ class _MainWindow(QMainWindow):
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
         self._update_bulk_buttons()
         _LOGGER.info("Camera download cancelled: %s", entry.camera_name)
+        self._show_notification(
+            "Download interrupted",
+            f"The download for {entry.camera_name} was cancelled.",
+            QSystemTrayIcon.MessageIcon.Warning,
+        )
+
+    def _show_notification(
+        self,
+        title: str,
+        message: str,
+        icon: QSystemTrayIcon.MessageIcon,
+    ) -> None:
+        """Send a native desktop notification through the platform service."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            if sys.platform.startswith("linux") and self._show_linux_notification(title, message):
+                return
+            _LOGGER.warning("Desktop notification unavailable: %s — %s", title, message)
+            return
+        if not self._notification_icon.isVisible():
+            self._notification_icon.show()
+        self._notification_icon.showMessage(title, message, icon, 10_000)
+
+    @staticmethod
+    def _show_linux_notification(title: str, message: str) -> bool:
+        """Use the freedesktop notification service when a Linux tray is unavailable."""
+        try:
+            from PySide6.QtDBus import QDBusConnection, QDBusInterface, QDBusMessage  # noqa: PLC0415
+
+            notifications = QDBusInterface(
+                "org.freedesktop.Notifications",
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                QDBusConnection.sessionBus(),
+            )
+            if not notifications.isValid():
+                return False
+            reply = notifications.call(
+                "Notify",
+                "UniFi Protect Timelapse",
+                0,
+                "timelapse",
+                title,
+                message,
+                [],
+                {},
+                10_000,
+            )
+            return reply.type() != QDBusMessage.MessageType.ErrorMessage
+        except Exception:
+            return False
 
     def _set_action_button(
         self,
@@ -2185,6 +2249,7 @@ class _MainWindow(QMainWindow):
             self._daily_schedule = None
             self._preferences.setValue("output_directory", self._output_edit.text())
             self._logs_window.close()
+            self._notification_icon.hide()
             _LOGGER.info("Application closed")
             self._remove_log_handler()
             event.accept()
@@ -2192,10 +2257,18 @@ class _MainWindow(QMainWindow):
         if self._closing:
             event.ignore()
             return
+        has_active_downloads = any(not entry.terminal for entry in self._workers.values())
+        title = "Download Jobs Are Still Running" if has_active_downloads else "Background Work Is Still Running"
+        message = (
+            "One or more download jobs are still running. Quit and interrupt them? "
+            "Any partial download files will be removed."
+            if has_active_downloads
+            else "Cancel the active background work and quit?"
+        )
         response = QMessageBox.question(
             self,
-            "Background Work Is Still Running",
-            "Cancel the active work and quit? Any partial download files will be removed.",
+            title,
+            message,
             QMessageBox.StandardButton.Cancel | QMessageBox.StandardButton.Yes,
             QMessageBox.StandardButton.Cancel,
         )
