@@ -27,7 +27,7 @@ class _CameraClient:
     "url",
     [
         "http://protect.local",
-        "https://user:password@protect.local",
+        "https://user:password@protect.local",  # trufflehog:ignore
         "https://protect.local?token=secret",
         "https://protect.local#fragment",
         "https://protect.local:invalid",

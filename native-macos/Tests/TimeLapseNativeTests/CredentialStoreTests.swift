@@ -59,7 +59,7 @@ final class CredentialStoreTests: XCTestCase {
         XCTAssertNil(settings.validationError)
         XCTAssertEqual(settings.normalized.instanceURL, "https://protect.local/proxy/protect/integration/v1")
 
-        settings.instanceURL = "https://user:password@protect.local/proxy/protect/integration/v1"
+        settings.instanceURL = "https://user:password@protect.local/proxy/protect/integration/v1" // trufflehog:ignore
         XCTAssertEqual(
             settings.validationError,
             "The Protect URL must not contain a username or password. Use the dedicated credential fields instead."

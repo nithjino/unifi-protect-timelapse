@@ -1,0 +1,15 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Ignore empty UniFi Protect placeholders"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "match"
+regexes = [
+  '''(?m)^UNIFI_PROTECT_(?:TOKEN|PASSWORD)=\r?\nUNIFI_PROTECT_VERIFY_SSL=true$''',
+]
+paths = [
+  '''^\.env\.example$''',
+  '''^timelapse/gui\.py$''',
+]
