@@ -67,10 +67,14 @@ def _app(tmp_path: Path, *, web_password: str | None = None, configured: bool = 
     return create_app(settings, state=state), state
 
 
+def _client(app: FastAPI, *, host: str = "127.0.0.1") -> TestClient:
+    return TestClient(app, base_url="http://localhost", client=(host, 50000))
+
+
 def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     app, _state = _app(tmp_path)
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         response = client.get("/")
         javascript = client.get("/static/htmx.min.js")
 
@@ -92,7 +96,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
 def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     app, _state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         health = client.get("/healthz")
         denied = client.get("/", follow_redirects=False)
         login_page = client.get(denied.headers["location"])
@@ -136,7 +140,7 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
 def test_login_rejects_external_return_path_and_throttles_failures(tmp_path: Path) -> None:
     app, _state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         for _attempt in range(5):
             response = client.post(
                 "/login",
@@ -155,10 +159,10 @@ def test_login_rejects_external_return_path_and_throttles_failures(tmp_path: Pat
     assert 'name="next" value="/"' in throttled.text
 
 
-def test_authenticated_mutation_accepts_forwarded_public_origin(tmp_path: Path) -> None:
+def test_authenticated_mutation_rejects_untrusted_forwarded_public_origin(tmp_path: Path) -> None:
     app, _state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         client.post(
             "/login",
             data={"username": "viewer", "password": "web-secret", "next": "/"},
@@ -174,13 +178,13 @@ def test_authenticated_mutation_accepts_forwarded_public_origin(tmp_path: Path) 
             follow_redirects=False,
         )
 
-    assert response.status_code == 303
+    assert response.status_code == 403
 
 
 def test_cross_origin_mutation_is_rejected(tmp_path: Path) -> None:
     app, state = _app(tmp_path)
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         response = client.post(
             "/actions/export",
             headers={"Origin": "https://malicious.example"},
@@ -196,7 +200,7 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
     start = datetime(2026, 7, 20, 8, tzinfo=UTC)
     end = start + timedelta(hours=2)
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         camera_response = client.get("/partials/cameras")
         created = client.post(
             "/actions/export",
@@ -233,7 +237,7 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
 def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:
     app, state = _app(tmp_path)
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         response = client.post(
             "/actions/export",
             data={"range_mode": "full-day", "day": "2026-07-20", "speed": "600x"},
@@ -247,7 +251,7 @@ def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:
 def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:
     app, _state = _app(tmp_path, configured=False)
 
-    with TestClient(app) as client:
+    with _client(app) as client:
         status = client.get("/partials/status")
         cameras = client.get("/partials/cameras")
 
@@ -360,3 +364,34 @@ def test_network_binding_requires_web_password(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(SystemExit, match="TIMELAPSE_WEB_PASSWORD is required"):
         main()
+
+
+def test_passwordless_app_rejects_remote_clients_and_host_rebinding(tmp_path: Path) -> None:
+    app, _state = _app(tmp_path)
+
+    with _client(app, host="192.0.2.10") as remote_client:
+        remote = remote_client.get("/")
+    with _client(app) as local_client:
+        rebound = local_client.get("/", headers={"Host": "attacker.example"})
+
+    assert remote.status_code == 403
+    assert rebound.status_code == 400
+
+
+def test_same_origin_check_ignores_forwarded_host_headers(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+
+    with _client(app) as client:
+        response = client.post(
+            "/actions/export",
+            headers={
+                "Host": "localhost",
+                "Origin": "https://timelapse.example",
+                "X-Forwarded-Host": "timelapse.example",
+                "X-Forwarded-Proto": "https",
+            },
+            data={"range_mode": "full-day", "day": "2026-07-20", "speed": "600x"},
+        )
+
+    assert response.status_code == 403
+    assert not state.jobs

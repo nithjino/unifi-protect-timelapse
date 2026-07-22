@@ -177,7 +177,7 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client is not None else "unknown"
 
 
-def _is_same_origin(request: Request) -> bool:
+def _is_same_origin(request: Request, trusted_hosts: frozenset[str]) -> bool:
     fetch_site = request.headers.get("Sec-Fetch-Site", "").casefold()
     if fetch_site == "same-origin":
         return True
@@ -187,16 +187,10 @@ def _is_same_origin(request: Request) -> bool:
     if not origin:
         return True
     actual = _normalized_origin(origin)
-    if actual is None:
+    if actual is None or actual[1] not in trusted_hosts:
         return False
-    expected = {
-        _origin_from_parts(request.url.scheme, request.headers.get("Host")),
-        _origin_from_parts(
-            request.headers.get("X-Forwarded-Proto", "").split(",", 1)[0].strip(),
-            request.headers.get("X-Forwarded-Host", "").split(",", 1)[0].strip(),
-        ),
-    }
-    return actual in expected
+    expected = _origin_from_parts(request.url.scheme, request.headers.get("Host"))
+    return actual == expected
 
 
 def _normalized_origin(value: str) -> tuple[str, str, int | None] | None:
@@ -215,6 +209,35 @@ def _origin_from_parts(scheme: str, host: str | None) -> tuple[str, str, int | N
     if not scheme or not host:
         return None
     return _normalized_origin(f"{scheme}://{host}")
+
+
+def _hostname(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = urlsplit(f"//{value}")
+        _ = parsed.port
+    except ValueError:
+        return None
+    return parsed.hostname.casefold() if parsed.hostname else None
+
+
+def _trusted_hosts(settings: WebSettings) -> frozenset[str]:
+    hosts = {"localhost", "127.0.0.1", "::1"}
+    hosts.update(filter(None, (_hostname(host) for host in settings.web_trusted_hosts)))
+    configured_host = _hostname(settings.web_host)
+    if configured_host is not None and configured_host not in {
+        "0.0.0.0",  # noqa: S104 - wildcard bind value is intentionally excluded from trusted hosts
+        "::",
+    }:
+        hosts.add(configured_host)
+    return frozenset(hosts)
+
+
+def _is_loopback_client(request: Request) -> bool:
+    if request.client is None:
+        return False
+    return _is_loopback_host(request.client.host)
 
 
 def _add_security_headers(response: Response) -> Response:
@@ -292,9 +315,13 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     session_seconds = configured_settings.web_session_hours * SECONDS_PER_HOUR
     sessions = _SessionStore(session_seconds)
     login_throttle = _LoginThrottle()
+    trusted_hosts = _trusted_hosts(configured_settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        if configured_settings.web_password is None and not _is_loopback_host(configured_settings.web_host):
+            message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
+            raise RuntimeError(message)
         await web_state.start()
         try:
             yield
@@ -320,13 +347,17 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     templates.env.filters["next_run"] = _schedule_next_run
 
     @application.middleware("http")
-    async def require_web_authentication(
+    async def require_web_authentication(  # noqa: PLR0911 - ordered security exits keep the boundary explicit
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
+        if _hostname(request.headers.get("Host")) not in trusted_hosts:
+            return _add_security_headers(PlainTextResponse("Untrusted host", status_code=400))
+        if configured_settings.web_password is None and not _is_loopback_client(request):
+            return _add_security_headers(PlainTextResponse("Passwordless access is local-only", status_code=403))
         public = request.url.path in {"/healthz", "/login"} or request.url.path.startswith("/static/")
         unsafe_request = request.method not in {"GET", "HEAD", "OPTIONS"}
-        if unsafe_request and request.url.path != "/login" and not _is_same_origin(request):
+        if unsafe_request and request.url.path != "/login" and not _is_same_origin(request, trusted_hosts):
             return _add_security_headers(PlainTextResponse("Cross-origin request rejected", status_code=403))
         if public or configured_settings.web_password is None:
             return _add_security_headers(await call_next(request))
@@ -591,8 +622,8 @@ app = create_app()
 
 def main() -> None:
     """Run the web server using environment-backed host and port settings."""
-    host = os.environ.get("TIMELAPSE_WEB_HOST", "127.0.0.1")
     settings = WebSettings.from_environment()
+    host = settings.web_host
     if not _is_loopback_host(host) and settings.web_password is None:
         message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
         raise SystemExit(message)

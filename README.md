@@ -245,13 +245,16 @@ unique password:
 
 ```dotenv
 TIMELAPSE_WEB_HOST=0.0.0.0
+TIMELAPSE_WEB_TRUSTED_HOSTS=SERVER-IP
 TIMELAPSE_WEB_USERNAME=timelapse
 TIMELAPSE_WEB_PASSWORD=replace-with-a-long-random-password
 ```
 
-Restart the server, then browse to `http://SERVER-IP:8000`. TimeLapse refuses to start on a non-loopback address without
-an application password. The browser shows a dedicated login page and creates an HTTP-only, same-site session after a
-successful sign-in. This password protects the web interface; it is separate from the Protect account password.
+Replace `SERVER-IP` with the exact IP address or hostname used in the browser. Multiple trusted hosts can be separated
+with commas. Restart the server, then browse to `http://SERVER-IP:8000`. TimeLapse refuses to start on a non-loopback
+address without an application password and rejects request hosts outside this allowlist. The browser shows a dedicated
+login page and creates an HTTP-only, same-site session after a successful sign-in. This password protects the web
+interface; it is separate from the Protect account password.
 
 ![TimeLapse web login page with private local access and server-side credential notice](docs/screenshots/web-login.jpg)
 
@@ -266,7 +269,7 @@ Uvicorn worker because export and schedule state is maintained by this process.
 
 ### Run with Docker Compose
 
-Complete `.env`, including `TIMELAPSE_WEB_PASSWORD`, then run:
+Complete `.env`, including `TIMELAPSE_WEB_PASSWORD` and `TIMELAPSE_WEB_TRUSTED_HOSTS`, then run:
 
 ```bash
 docker compose up --build -d

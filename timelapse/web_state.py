@@ -94,6 +94,8 @@ class WebSettings:
     web_password: str | None = None
     web_session_hours: int = 168
     web_cookie_secure: bool = False
+    web_host: str = "127.0.0.1"
+    web_trusted_hosts: tuple[str, ...] = ()
 
     @classmethod
     def from_environment(cls) -> WebSettings:
@@ -101,6 +103,12 @@ class WebSettings:
         data_dir = Path(os.environ.get("TIMELAPSE_WEB_DATA_DIR", "data")).expanduser().resolve()
         output_dir = Path(os.environ.get("TIMELAPSE_WEB_OUTPUT_DIR", str(data_dir / "exports"))).expanduser().resolve()
         web_password = os.environ.get("TIMELAPSE_WEB_PASSWORD") or None
+        web_host = os.environ.get("TIMELAPSE_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
+        web_trusted_hosts = tuple(
+            host.strip().casefold()
+            for host in os.environ.get("TIMELAPSE_WEB_TRUSTED_HOSTS", "").split(",")
+            if host.strip()
+        )
         return cls(
             instance_url=os.environ.get("UNIFI_PROTECT_URL", "").strip().rstrip("/"),
             token=os.environ.get("UNIFI_PROTECT_TOKEN", ""),
@@ -117,6 +125,8 @@ class WebSettings:
             web_password=web_password,
             web_session_hours=max(_environment_integer("TIMELAPSE_WEB_SESSION_HOURS", 168), 1),
             web_cookie_secure=_environment_boolean("TIMELAPSE_WEB_COOKIE_SECURE", default=False),
+            web_host=web_host,
+            web_trusted_hosts=web_trusted_hosts,
         )
 
     @property
