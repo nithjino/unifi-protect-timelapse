@@ -209,11 +209,27 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         message = f"could not write {output}: {exc}"
         raise TimelapseError(message) from exc
     finally:
-        response.release()
+        _release_response(response)
         if temp_output is not None:
-            if temp_output.exists():
-                _LOGGER.info("Removing temporary export file: %s", temp_output)
-            temp_output.unlink(missing_ok=True)
+            _remove_temporary_output(temp_output)
+
+
+def _release_response(response: ClientResponse) -> None:
+    """Release the response without replacing the primary operation error."""
+    try:
+        response.release()
+    except Exception:
+        _LOGGER.warning("Could not release the Protect export response", exc_info=True)
+
+
+def _remove_temporary_output(path: Path) -> None:
+    """Remove a partial export without replacing the primary operation error."""
+    try:
+        if path.exists():
+            _LOGGER.info("Removing temporary export file: %s", path)
+        path.unlink(missing_ok=True)
+    except OSError:
+        _LOGGER.warning("Could not remove temporary export file: %s", path, exc_info=True)
 
 
 def _validate_mp4(path: Path, downloaded_bytes: int) -> None:

@@ -160,7 +160,7 @@ The configured timeout is passed to the export request, but upstream authenticat
 
 **Recommendation:** Wrap the complete logical operation in one monotonic deadline, pass the remaining budget to each subrequest, and document distinct connect/read/whole-operation timeouts if all three are needed.
 
-### LOW-2: Cleanup exceptions can mask the original operational error
+### ~~LOW-2: Cleanup exceptions can mask the original operational error~~ — Resolved
 
 **Affected code:** `timelapse/service.py:201-221`, `timelapse/download.py:194-199`
 

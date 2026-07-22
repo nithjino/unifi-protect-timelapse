@@ -52,6 +52,12 @@ class _LiveFallbackClient(_FakeClient):
         return b"live-jpeg"
 
 
+class _CleanupFailureClient(_FakeClient):
+    async def close_session(self) -> None:
+        message = "cleanup failed"
+        raise OSError(message)
+
+
 def _config(tmp_path: Path) -> Config:
     start = datetime(2026, 7, 18, 15, 35, tzinfo=UTC)
     return Config(
@@ -137,3 +143,13 @@ def test_camera_discovery_timeout_covers_the_complete_operation(
         asyncio.run(service.list_available_cameras(config))
 
     assert client.closed is True
+
+
+def test_cleanup_failure_does_not_replace_thumbnail_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    client = _CleanupFailureClient(error=NotAuthorized("Unauthorized request"))
+    config = _config(tmp_path)
+    camera = CameraInfo(id="camera-1", name="Garage Door", state=None, model=None)
+    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+
+    with pytest.raises(TimelapseError, match="readmedia/livestream"):
+        asyncio.run(service.fetch_camera_thumbnail(config, camera, config.start))

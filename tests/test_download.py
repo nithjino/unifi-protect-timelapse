@@ -231,3 +231,34 @@ def test_download_rejects_invalid_video_responses(
     assert not output.exists()
     assert response.released is True
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
+
+
+def test_partial_file_cleanup_failure_does_not_replace_export_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "invalid.mp4"
+    response = _FakeResponse(_FakeContent([b"not an mp4"]), {})
+    client = cast("ProtectApiClient", _FakeClient(response))
+    original_unlink = download_module.Path.unlink
+
+    def fail_part_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path.suffix == ".part":
+            message = "cleanup failed"
+            raise OSError(message)
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(download_module.Path, "unlink", fail_part_unlink)
+
+    with pytest.raises(TimelapseError, match="valid MP4 file signature"):
+        asyncio.run(
+            download_timelapse(
+                _config(),
+                parse_connection(_config().instance_url),
+                client,
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                output,
+            )
+        )
+
+    assert response.released is True

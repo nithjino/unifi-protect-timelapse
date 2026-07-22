@@ -253,6 +253,14 @@ async def _close_client(client: ProtectApiClient, *, operation: str) -> None:
             perf_counter() - started_at,
         )
         return
+    except Exception:
+        _LOGGER.warning(
+            "Protect client cleanup failed after %s (elapsed=%.2fs)",
+            operation,
+            perf_counter() - started_at,
+            exc_info=True,
+        )
+        return
     _LOGGER.info(
         "Protect client cleanup completed after %s (elapsed=%.2fs)",
         operation,
