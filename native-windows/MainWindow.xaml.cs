@@ -541,6 +541,7 @@ public partial class MainWindow : Window
                     schedule.Speed,
                     schedule.OutputDirectory,
                     daily: true,
+                    fullDay: true,
                     requestSettings: schedule.Settings);
                 schedule.ActiveJobIds.Add(job.Id);
             }
@@ -691,6 +692,7 @@ public partial class MainWindow : Window
                 speed,
                 _outputDirectory,
                 daily: false,
+                fullDay: FullDayCheckBox.IsChecked == true,
                 requestSettings: _selectedProfile.Settings);
         StatusText.Text = $"Started job {group} with {selected.Count} downloads";
         AppendLog("INFO", StatusText.Text);
@@ -725,13 +727,14 @@ public partial class MainWindow : Window
         string speed,
         string outputDirectory,
         bool daily,
+        bool fullDay,
         ConnectionSettings requestSettings)
     {
         var job = new DownloadJob
         {
             GroupNumber = group,
             Camera = camera,
-            OutputPath = ReserveOutputPath(camera, start, end, speed, outputDirectory, daily),
+            OutputPath = ReserveOutputPath(camera, start, end, speed, outputDirectory, daily, fullDay),
             RequestSettings = requestSettings,
             RequestStart = new DateTimeOffset(DateTime.SpecifyKind(start, DateTimeKind.Local)).ToString("O"),
             RequestEnd = new DateTimeOffset(DateTime.SpecifyKind(end, DateTimeKind.Local)).ToString("O"),
@@ -969,10 +972,11 @@ public partial class MainWindow : Window
         DateTime end,
         string speed,
         string outputDirectory,
-        bool daily)
+        bool daily,
+        bool fullDay)
     {
         CleanupStalePartialExports(outputDirectory);
-        var expected = ExpectedOutputPath(camera, start, end, speed, outputDirectory, daily);
+        var expected = ExpectedOutputPath(camera, start, end, speed, outputDirectory, daily, fullDay);
         if (daily)
         {
             if (_reservedOutputPaths.Add(expected)) return expected;
@@ -993,17 +997,18 @@ public partial class MainWindow : Window
         DateTime end,
         string speed,
         string outputDirectory,
-        bool daily)
+        bool daily,
+        bool fullDay = false)
     {
         var invalid = Path.GetInvalidFileNameChars().Concat([' ', '\t', '\r', '\n']).ToHashSet();
         var safe = string.Concat(camera.Name.Select(character => invalid.Contains(character) ? '_' : character)).Trim('.', '_', '-');
         if (string.IsNullOrWhiteSpace(safe)) safe = "camera";
         if (safe.Length > 48) safe = safe[..48].Trim('.', '_', '-');
         var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(camera.Id))).ToLowerInvariant()[..12];
-        var prefix = daily ? "daily_timelapse" : "timelapse";
-        return Path.Combine(
-            outputDirectory,
-            $"{prefix}_{safe}_{digest}_{start:yyyyMMdd_HHmmss}_{end:yyyyMMdd_HHmmss}_{speed}.mp4");
+        var filename = fullDay || daily
+            ? $"timelapse_{safe}_{start:yyyy_MM_dd}_{end:yyyy_MM_dd}_{speed}_{digest}.mp4"
+            : $"timelapse_{safe}_{start:yyyy_MM_dd}_{start:HH_mm_ss}_{end:yyyy_MM_dd}_{end:HH_mm_ss}_{speed}__{digest}.mp4";
+        return Path.Combine(outputDirectory, filename);
     }
 
     private static bool IsValidExport(string path)

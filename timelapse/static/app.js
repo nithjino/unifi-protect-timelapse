@@ -12,6 +12,8 @@
   const selectionCount = document.querySelector("#selection-count");
   const fullDayFields = document.querySelector("#full-day-fields");
   const exactFields = document.querySelector("#exact-fields");
+  const fullDayStartDate = document.querySelector("#full-day-start-date");
+  const fullDayEndDate = document.querySelector("#full-day-end-date");
   const previewButton = document.querySelector("#load-previews");
   const liveDot = document.querySelector("#live-dot");
   const liveLabel = document.querySelector("#live-label");
@@ -40,6 +42,13 @@
       fullDayFields.hidden = mode !== "full-day";
       exactFields.hidden = mode !== "exact";
     }
+  }
+
+  function updateFullDayEnd() {
+    if (!fullDayStartDate?.value || !fullDayEndDate) return;
+    const [year, month, day] = fullDayStartDate.value.split("-").map(Number);
+    const end = new Date(Date.UTC(year, month - 1, day + 1));
+    fullDayEndDate.value = end.toISOString().slice(0, 10);
   }
 
   function boundaryTimestamps() {
@@ -174,12 +183,18 @@
       schedulePreview("start");
       schedulePreview("end");
     }
+    if (event.target.matches('input[name="day"]')) {
+      updateFullDayEnd();
+    }
     if (previewBoundariesForInput(event.target).length) {
       markPreviewDirty(event.target);
     }
   });
 
   document.addEventListener("input", (event) => {
+    if (event.target.matches('input[name="day"]')) {
+      updateFullDayEnd();
+    }
     markPreviewDirty(event.target);
   });
 
@@ -210,6 +225,7 @@
     if (event.target === serverInfoDialog) serverInfoDialog.close();
   });
   updateRangeMode();
+  updateFullDayEnd();
   updateSelectionCount();
 
   const events = new EventSource("/api/events");

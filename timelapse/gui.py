@@ -151,7 +151,7 @@ class _ConnectionSettings:
         }
         return [label for label, value in values.items() if not value.strip()]
 
-    def make_config(self, start: datetime, end: datetime, speed: str) -> Config:
+    def make_config(self, start: datetime, end: datetime, speed: str, *, full_day: bool = False) -> Config:
         return Config(
             instance_url=self.instance_url.strip().rstrip("/"),
             token=self.token,
@@ -164,6 +164,7 @@ class _ConnectionSettings:
             output=None,
             request_timeout_seconds=self.request_timeout_seconds,
             max_download_mib=self.max_download_mib,
+            full_day=full_day,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -1868,7 +1869,7 @@ class _MainWindow(QMainWindow):
             QMessageBox.warning(self, "Invalid Output Folder", "The selected output location is not a folder.")
             return
         speed = self._speed_combo.currentText()
-        config = self._settings.make_config(start, end, speed)
+        config = self._settings.make_config(start, end, speed, full_day=self._full_day_checkbox.isChecked())
         job_number = self._next_job_number
         self._next_job_number += 1
         for camera in self._selected_cameras:

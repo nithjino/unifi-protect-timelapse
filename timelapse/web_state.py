@@ -178,7 +178,15 @@ class WebSettings:
         """Return whether all Protect credentials are configured."""
         return not self.missing_connection_values
 
-    def config(self, start: datetime, end: datetime, speed: str, *, daily: bool = False) -> Config:
+    def config(
+        self,
+        start: datetime,
+        end: datetime,
+        speed: str,
+        *,
+        daily: bool = False,
+        full_day: bool = False,
+    ) -> Config:
         """Build an export configuration without leaking connection values."""
         if self.missing_connection_values:
             missing = ", ".join(self.missing_connection_values)
@@ -197,6 +205,7 @@ class WebSettings:
             request_timeout_seconds=self.request_timeout_seconds,
             max_download_mib=self.max_download_mib,
             daily=daily,
+            full_day=full_day or daily,
         )
 
 
@@ -211,6 +220,7 @@ class ExportJob:
     speed: str
     output: Path
     daily: bool = False
+    full_day: bool = False
     status: JobStatus = "queued"
     downloaded_bytes: int = 0
     total_bytes: int | None = None
@@ -343,6 +353,7 @@ class WebState:
         speed: str,
         *,
         daily: bool = False,
+        full_day: bool = False,
     ) -> list[ExportJob]:
         """Durably queue one bounded export job per selected camera."""
         if end <= start:
@@ -360,7 +371,14 @@ class WebState:
             raise ValueError(message)
         async with self._job_mutation_lock:
             await self._ensure_export_capacity(len(selected))
-            jobs, planned_keys = self._plan_export_jobs(selected, start, end, speed, daily=daily)
+            jobs, planned_keys = self._plan_export_jobs(
+                selected,
+                start,
+                end,
+                speed,
+                daily=daily,
+                full_day=full_day,
+            )
             previous_jobs = dict(self.jobs)
             previous_reservations = set(self._reserved_output_paths)
             self._reserved_output_paths.update(planned_keys)
@@ -398,8 +416,9 @@ class WebState:
         speed: str,
         *,
         daily: bool,
+        full_day: bool,
     ) -> tuple[list[ExportJob], set[str]]:
-        base_config = self.settings.config(start, end, speed, daily=daily)
+        base_config = self.settings.config(start, end, speed, daily=daily, full_day=full_day)
         jobs: list[ExportJob] = []
         planned_keys: set[str] = set()
         for camera in cameras:
@@ -423,6 +442,7 @@ class WebState:
                     speed=speed,
                     output=output,
                     daily=daily,
+                    full_day=full_day or daily,
                 )
             )
         return jobs, planned_keys
@@ -453,7 +473,16 @@ class WebState:
         if job is None or job.status not in {"failed", "cancelled"}:
             message = "Only failed or cancelled exports can be retried."
             raise ValueError(message)
-        return (await self.create_jobs([job.camera.id], job.start, job.end, job.speed, daily=job.daily))[0]
+        return (
+            await self.create_jobs(
+                [job.camera.id],
+                job.start,
+                job.end,
+                job.speed,
+                daily=job.daily,
+                full_day=job.full_day,
+            )
+        )[0]
 
     async def create_schedule(self, camera_ids: list[str], speed: str) -> DailySchedule:
         """Persist and start a daily schedule for selected cameras."""
@@ -534,7 +563,13 @@ class WebState:
                         job.error = "A file already exists for this camera and time range."
                         return
 
-                    config = self.settings.config(job.start, job.end, job.speed, daily=job.daily)
+                    config = self.settings.config(
+                        job.start,
+                        job.end,
+                        job.speed,
+                        daily=job.daily,
+                        full_day=job.full_day,
+                    )
 
                     def report_progress(progress: DownloadProgress) -> None:
                         job.downloaded_bytes = progress.downloaded_bytes
@@ -706,6 +741,10 @@ class WebState:
         if not isinstance(daily, bool):
             message = "stored daily flag must be a boolean"
             raise TypeError(message)
+        full_day = item.get("full_day", daily)
+        if not isinstance(full_day, bool):
+            message = "stored full-day flag must be a boolean"
+            raise TypeError(message)
         total_value = item.get("total_bytes")
         total_bytes = None if total_value is None else _stored_nonnegative_integer(total_value)
         error_value = item.get("error")
@@ -725,6 +764,7 @@ class WebState:
             speed=speed,
             output=output,
             daily=daily,
+            full_day=full_day,
             status=status,
             downloaded_bytes=_stored_nonnegative_integer(item.get("downloaded_bytes")),
             total_bytes=total_bytes,
@@ -790,6 +830,7 @@ class WebState:
                         "speed": job.speed,
                         "output_name": job.output.name,
                         "daily": job.daily,
+                        "full_day": job.full_day,
                         "status": job.status,
                         "downloaded_bytes": job.downloaded_bytes,
                         "total_bytes": job.total_bytes,

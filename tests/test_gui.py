@@ -182,7 +182,7 @@ def test_daily_schedule_adds_list_row_and_daily_downloads(
     assert main_window._daily_automations.rowCount() == 1
     assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Scheduled daily"
     assert len(started) == 1
-    assert started[0].output.name.startswith("daily_timelapse_Front_Door_")
+    assert started[0].output.name.startswith("timelapse_Front_Door_2026_07_12_2026_07_13_600x_")
     assert main_window._downloads.rowCount() == 1
 
     main_window._stop_daily_schedule()

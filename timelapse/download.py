@@ -52,12 +52,18 @@ ProgressCallback = Callable[[DownloadProgress], None]
 
 def default_output_path(config: Config, camera: CameraInfo) -> Path:
     """Build a safe, descriptive output filename."""
-    start = config.start.strftime("%Y%m%d_%H%M%S")
-    end = config.end.strftime("%Y%m%d_%H%M%S")
+    start_date = config.start.strftime("%Y_%m_%d")
+    end_date = config.end.strftime("%Y_%m_%d")
     safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", camera_name(camera)).strip("._-") or "camera"
     safe_name = safe_name[:MAX_CAMERA_FILENAME_CHARACTERS].rstrip("._-") or "camera"
     camera_digest = hashlib.sha256(camera_id(camera).encode()).hexdigest()[:CAMERA_ID_DIGEST_CHARACTERS]
-    return Path(f"timelapse_{safe_name}_{camera_digest}_{start}_{end}_{config.speed}.mp4")
+    if config.full_day:
+        return Path(f"timelapse_{safe_name}_{start_date}_{end_date}_{config.speed}_{camera_digest}.mp4")
+    start_time = config.start.strftime("%H_%M_%S")
+    end_time = config.end.strftime("%H_%M_%S")
+    return Path(
+        f"timelapse_{safe_name}_{start_date}_{start_time}_{end_date}_{end_time}_{config.speed}__{camera_digest}.mp4"
+    )
 
 
 async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-download lifecycle

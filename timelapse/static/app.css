@@ -475,6 +475,15 @@ main {
   padding-top: 25px;
 }
 
+.form-section.range-section {
+  padding-top: 31px;
+}
+
+.range-section > legend {
+  position: relative;
+  top: 8px;
+}
+
 .form-section legend,
 .field-heading h3 {
   padding: 0;
@@ -622,11 +631,15 @@ main {
 
 .segmented-control {
   width: fit-content;
-  margin: 15px 0;
+  margin: 9px 0 15px;
   padding: 4px;
   border: 1px solid var(--line);
   border-radius: 11px;
   background: #0c111a;
+}
+
+.range-section .segmented-control {
+  margin-top: 0;
 }
 
 .segmented-control label,
@@ -662,11 +675,18 @@ main {
   gap: 10px;
 }
 
+.field .date-time-inputs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(120px, 0.65fr);
+  gap: 8px;
+  margin: 0;
+}
+
 .range-fields[hidden] {
   display: none;
 }
 
-.field span {
+.field > span:first-child {
   display: block;
   margin-bottom: 7px;
   color: var(--muted-strong);
@@ -682,10 +702,18 @@ main {
   color: var(--ink);
   color-scheme: dark;
   background: #0c111a;
+  font: inherit;
 }
 
 .field input:focus {
   border-color: rgb(89 216 231 / 60%);
+}
+
+.field input:disabled {
+  color: var(--muted);
+  background: rgb(12 17 26 / 72%);
+  cursor: not-allowed;
+  opacity: 0.78;
 }
 
 .field-note {

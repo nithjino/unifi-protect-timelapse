@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, cast
 
@@ -95,6 +96,28 @@ def test_default_output_path_preserves_safe_unicode_camera_name() -> None:
     output = default_output_path(_config(), camera)
 
     assert "玄関_📷" in output.name
+
+
+def test_default_output_path_formats_exact_range_with_hash_last() -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+
+    output = default_output_path(_config(), camera)
+
+    assert output.name == ("timelapse_Front_Door_2026_07_11_08_00_00_2026_07_11_09_00_00_120x__6bf6f341d9a3.mp4")
+
+
+def test_default_output_path_formats_full_day_without_times() -> None:
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    config = replace(
+        _config(),
+        start=datetime(2026, 7, 11, tzinfo=UTC),
+        end=datetime(2026, 7, 12, tzinfo=UTC),
+        full_day=True,
+    )
+
+    output = default_output_path(config, camera)
+
+    assert output.name == "timelapse_Front_Door_2026_07_11_2026_07_12_120x_6bf6f341d9a3.mp4"
 
 
 def test_default_output_path_distinguishes_cameras_with_colliding_names() -> None:

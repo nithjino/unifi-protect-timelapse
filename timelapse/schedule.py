@@ -29,14 +29,14 @@ def latest_complete_local_day(now: datetime | None = None) -> date:
 
 
 def daily_output_path(config: Config, camera: CameraInfo, directory: Path) -> Path:
-    """Build a daily-prefixed output path in the requested directory."""
-    return directory / f"daily_{default_output_path(config, camera).name}"
+    """Build an output path for a completed local calendar day."""
+    return directory / default_output_path(replace(config, full_day=True), camera).name
 
 
 def config_for_local_day(config: Config, day: date) -> Config:
     """Copy runtime settings with one completed local calendar day as the range."""
     start, end = local_day_bounds(day)
-    return replace(config, start=start, end=end, output=None)
+    return replace(config, start=start, end=end, output=None, full_day=True)
 
 
 def seconds_until_next_local_day(now: datetime | None = None) -> float:

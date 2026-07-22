@@ -35,7 +35,9 @@ def test_local_day_helpers_create_calendar_day_and_daily_prefix(tmp_path: Path) 
 
     assert config.start == start
     assert config.end == end
-    assert daily_output_path(config, camera, tmp_path).name.startswith("daily_timelapse_Front_Door_")
+    assert daily_output_path(config, camera, tmp_path).name == (
+        "timelapse_Front_Door_2026_07_11_2026_07_12_600x_6bf6f341d9a3.mp4"
+    )
 
 
 def test_latest_complete_local_day_uses_previous_calendar_date() -> None:

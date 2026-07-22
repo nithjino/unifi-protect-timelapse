@@ -40,6 +40,7 @@ class Config:
     request_timeout_seconds: int
     max_download_mib: int
     daily: bool = False
+    full_day: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,24 +142,31 @@ def _date_range(
     end: _ParsedDate | None,
     *,
     daily: bool,
-) -> tuple[datetime, datetime]:
+) -> tuple[datetime, datetime, bool]:
     if daily:
         if start is not None or end is not None:
             parser.error("--daily cannot be combined with --start-date or --end-date")
         now = datetime.now().astimezone()
-        return now, now + timedelta(seconds=1)
+        return now, now + timedelta(seconds=1), True
     if start is None and end is None:
         parser.error("provide --start-date, --end-date, or --daily")
     if start is not None and end is None:
-        return _full_local_day(start.value) if start.date_only else (start.value, start.value + timedelta(days=1))
+        range_start, range_end = (
+            _full_local_day(start.value) if start.date_only else (start.value, start.value + timedelta(days=1))
+        )
+        return range_start, range_end, start.date_only
     if start is None and end is not None:
-        return _full_local_day(end.value) if end.date_only else (end.value - timedelta(days=1), end.value)
+        range_start, range_end = (
+            _full_local_day(end.value) if end.date_only else (end.value - timedelta(days=1), end.value)
+        )
+        return range_start, range_end, end.date_only
     if start is None or end is None:
         message = "unreachable missing date boundary"
         raise AssertionError(message)
     if start.date_only and end.date_only and start.value.date() == end.value.date():
-        return _full_local_day(start.value)
-    return start.value, end.value
+        range_start, range_end = _full_local_day(start.value)
+        return range_start, range_end, True
+    return start.value, end.value, False
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -348,7 +356,7 @@ def parse_args() -> Config | CreateProfile:
         verify_ssl=args.verify_ssl,
         prompt_for_missing=dotenv_path.is_file(),
     )
-    start, end = _date_range(parser, args.start_date, args.end_date, daily=args.daily)
+    start, end, full_day = _date_range(parser, args.start_date, args.end_date, daily=args.daily)
     if end <= start:
         parser.error("--end-date must be after --start-date")
 
@@ -365,4 +373,5 @@ def parse_args() -> Config | CreateProfile:
         request_timeout_seconds=args.request_timeout_seconds,
         max_download_mib=args.max_download_mib,
         daily=args.daily,
+        full_day=full_day,
     )

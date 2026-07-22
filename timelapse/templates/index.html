@@ -100,23 +100,33 @@
                 </div>
               </fieldset>
 
-              <fieldset class="form-section">
+              <fieldset class="form-section range-section">
                 <legend>Choose a range</legend>
                 <div class="segmented-control" role="radiogroup" aria-label="Export range type">
                   <label>
                     <input type="radio" name="range_mode" value="full-day" checked>
-                    <span>Full day</span>
+                    <span>Full Day</span>
                   </label>
                   <label>
                     <input type="radio" name="range_mode" value="exact">
-                    <span>Exact range</span>
+                    <span>Exact Range</span>
                   </label>
                 </div>
 
-                <div id="full-day-fields" class="range-fields">
+                <div id="full-day-fields" class="range-fields two-column">
                   <label class="field">
-                    <span>Date</span>
-                    <input type="date" name="day" value="{{ yesterday }}" max="{{ now_local[:10] }}">
+                    <span>Start</span>
+                    <span class="date-time-inputs">
+                      <input id="full-day-start-date" type="date" name="day" value="{{ yesterday }}" max="{{ now_local[:10] }}" aria-label="Full Day start date">
+                      <input type="time" value="00:00" disabled aria-label="Full Day start time, locked at midnight">
+                    </span>
+                  </label>
+                  <label class="field">
+                    <span>End</span>
+                    <span class="date-time-inputs">
+                      <input id="full-day-end-date" type="date" value="{{ today }}" disabled aria-label="Full Day end date, set automatically">
+                      <input type="time" value="00:00" disabled aria-label="Full Day end time, locked at midnight">
+                    </span>
                   </label>
                 </div>
 

@@ -294,7 +294,7 @@ def _parse_local_datetime(raw: str, label: str) -> datetime:
     return parsed.astimezone()
 
 
-def _parse_export_range(form: FormData) -> tuple[datetime, datetime]:
+def _parse_export_range(form: FormData) -> tuple[datetime, datetime, bool]:
     mode = str(form.get("range_mode", "full-day"))
     if mode == "full-day":
         raw = _required_form_value(form, "day", "Export date")
@@ -305,7 +305,7 @@ def _parse_export_range(form: FormData) -> tuple[datetime, datetime]:
             raise ValueError(message) from exc
         start = datetime.combine(selected_day, datetime.min.time()).astimezone()
         end = datetime.combine(selected_day + timedelta(days=1), datetime.min.time()).astimezone()
-        return start, end
+        return start, end, True
     if mode != "exact":
         message = "Choose a full day or an exact time range."
         raise ValueError(message)
@@ -314,7 +314,7 @@ def _parse_export_range(form: FormData) -> tuple[datetime, datetime]:
     if end <= start:
         message = "End time must be after start time."
         raise ValueError(message)
-    return start, end
+    return start, end, False
 
 
 def _parse_speed(form: FormData) -> str:
@@ -520,6 +520,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
                 "speeds": SPEED_TO_FPS,
                 "timezone_name": now.tzname() or "local time",
                 "yesterday": (now.date() - timedelta(days=1)).isoformat(),
+                "today": now.date().isoformat(),
                 "now_local": now.strftime("%Y-%m-%dT%H:%M"),
                 "day_ago_local": (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M"),
                 "authentication_enabled": configured_settings.web_password is not None,
@@ -593,9 +594,9 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         try:
             form = await request.form()
             camera_ids = _form_values(form, "camera_ids")
-            start, end = _parse_export_range(form)
+            start, end, full_day = _parse_export_range(form)
             speed = _parse_speed(form)
-            created = await web_state.create_jobs(camera_ids, start, end, speed)
+            created = await web_state.create_jobs(camera_ids, start, end, speed, full_day=full_day)
         except WebCapacityError as exc:
             return message_response(request, str(exc), kind="error", status_code=429)
         except OperationTimeoutError as exc:

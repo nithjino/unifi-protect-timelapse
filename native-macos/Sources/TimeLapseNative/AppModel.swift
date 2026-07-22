@@ -461,7 +461,8 @@ final class AppModel: ObservableObject {
                     end: end,
                     speed: schedule.speed,
                     outputDirectory: schedule.outputDirectory,
-                    daily: true
+                    daily: true,
+                    fullDay: true
                 ))
             }
             if missing.isEmpty {
@@ -546,7 +547,8 @@ final class AppModel: ObservableObject {
                 end: endDate,
                 speed: speed,
                 outputDirectory: outputDirectory,
-                requestSettings: BackendSettings(settings)
+                requestSettings: BackendSettings(settings),
+                fullDay: fullDayMode
             )
         }
         statusMessage = "Started job \(group) with \(selectedCameras.count) downloads"
@@ -774,7 +776,8 @@ final class AppModel: ObservableObject {
         speed: String,
         outputDirectory: URL,
         requestSettings: BackendSettings,
-        daily: Bool = false
+        daily: Bool = false,
+        fullDay: Bool = false
     ) -> DownloadJob {
         let outputURL = reserveOutputURL(
             camera: camera,
@@ -782,7 +785,8 @@ final class AppModel: ObservableObject {
             end: end,
             speed: speed,
             outputDirectory: outputDirectory,
-            daily: daily
+            daily: daily,
+            fullDay: fullDay
         )
         let job = DownloadJob(
             groupNumber: group,
@@ -911,7 +915,8 @@ final class AppModel: ObservableObject {
         end: Date,
         speed: String,
         outputDirectory: URL,
-        daily: Bool
+        daily: Bool,
+        fullDay: Bool
     ) -> URL {
         let expected = Self.expectedOutputURL(
             camera: camera,
@@ -919,7 +924,8 @@ final class AppModel: ObservableObject {
             end: end,
             speed: speed,
             outputDirectory: outputDirectory,
-            daily: daily
+            daily: daily,
+            fullDay: fullDay
         )
         if daily {
             reservedOutputPaths.insert(expected.path.lowercased())
@@ -949,14 +955,20 @@ final class AppModel: ObservableObject {
         end: Date,
         speed: String,
         outputDirectory: URL,
-        daily: Bool
+        daily: Bool,
+        fullDay: Bool
     ) -> URL {
-        let prefix = daily ? "daily_timelapse" : "timelapse"
         let digest = SHA256.hash(data: Data(camera.id.utf8))
             .map { String(format: "%02x", $0) }
             .joined()
             .prefix(12)
-        let name = "\(prefix)_\(safeFilename(camera.name))_\(digest)_\(filenameDate(start))_\(filenameDate(end))_\(speed).mp4"
+        let safeName = safeFilename(camera.name)
+        let name: String
+        if fullDay || daily {
+            name = "timelapse_\(safeName)_\(filenameDay(start))_\(filenameDay(end))_\(speed)_\(digest).mp4"
+        } else {
+            name = "timelapse_\(safeName)_\(filenameDay(start))_\(filenameTime(start))_\(filenameDay(end))_\(filenameTime(end))_\(speed)__\(digest).mp4"
+        }
         return outputDirectory.appendingPathComponent(name)
     }
 
@@ -1033,8 +1045,12 @@ final class AppModel: ObservableObject {
         return formatter.string(from: date)
     }
 
-    private static func filenameDate(_ date: Date) -> String {
-        filenameDateFormatter.string(from: date)
+    private static func filenameDay(_ date: Date) -> String {
+        filenameDayFormatter.string(from: date)
+    }
+
+    private static func filenameTime(_ date: Date) -> String {
+        filenameTimeFormatter.string(from: date)
     }
 
     private static func calendarDay(_ date: Date) -> String {
@@ -1051,11 +1067,19 @@ final class AppModel: ObservableObject {
         return limited.isEmpty ? "camera" : limited
     }
 
-    private static let filenameDateFormatter: DateFormatter = {
+    private static let filenameDayFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = .current
-        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        formatter.dateFormat = "yyyy_MM_dd"
+        return formatter
+    }()
+
+    private static let filenameTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "HH_mm_ss"
         return formatter
     }()
 

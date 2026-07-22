@@ -142,6 +142,7 @@ def test_one_date_only_boundary_creates_full_local_day(
     assert config.start.hour == 0
     assert config.start.minute == 0
     assert config.end.date() == config.start.date() + timedelta(days=1)
+    assert config.full_day is True
 
 
 def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -166,6 +167,7 @@ def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_
     config = _parse_config()
 
     assert config.daily is True
+    assert config.full_day is True
     assert config.output == tmp_path
 
 

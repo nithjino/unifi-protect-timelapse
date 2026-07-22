@@ -94,6 +94,12 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert 'section-number">02' not in response.text
     assert 'section-number">03' not in response.text
     assert 'href="/healthz"' not in response.text
+    assert ">Full Day<" in response.text
+    assert ">Exact Range<" in response.text
+    assert 'id="full-day-start-date"' in response.text
+    assert 'id="full-day-end-date"' in response.text
+    assert 'id="full-day-end-date" type="date"' in response.text
+    assert response.text.count('type="time" value="00:00" disabled') == 2
     assert javascript.status_code == 200
     assert "htmx" in javascript.text
 
@@ -237,6 +243,32 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
     assert preview.headers["x-timelapse-thumbnail-source"] == "exact"
     assert download.status_code == 200
     assert download.content == b"video"
+    assert job.full_day is False
+    assert job.output.name.endswith("_120x__6bf6f341d9a3.mp4")
+
+
+def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+
+    with _client(app) as client:
+        created = client.post(
+            "/actions/export",
+            data={
+                "camera_ids": ["camera-1"],
+                "range_mode": "full-day",
+                "day": "2026-07-20",
+                "speed": "600x",
+            },
+        )
+        for _attempt in range(10):
+            if all(job.status == "completed" for job in state.jobs.values()):
+                break
+            client.get("/partials/jobs")
+
+    job = next(iter(state.jobs.values()))
+    assert created.status_code == 200
+    assert job.full_day is True
+    assert job.output.name == "timelapse_Front_Door_2026_07_20_2026_07_21_600x_6bf6f341d9a3.mp4"
 
 
 def test_same_name_cameras_receive_distinct_reserved_outputs(tmp_path: Path) -> None:
