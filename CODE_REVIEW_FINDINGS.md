@@ -13,8 +13,7 @@ Scope: Python CLI, web application, Qt desktop application, macOS SwiftUI applic
 | Medium | 7 |
 | Low | 6 |
 
-Resolution status (2026-07-22): all HIGH and MEDIUM findings are handled. Their headings are crossed out below; LOW
-findings remain open.
+Resolution status (2026-07-22): all HIGH, MEDIUM, and LOW findings are handled. Their headings are crossed out below.
 
 The most consequential risks are in the web application's trust boundary and in unattended export workflows. In particular, an alternate ASGI launch can expose the application without authentication, Windows cancellation can leave very large partial files behind, colliding camera names can overwrite or suppress exports, and all three desktop schedulers can permanently skip failed daily exports.
 
@@ -200,7 +199,7 @@ The Python and `uv` build images are selected by mutable tags. The application d
 
 **Recommendation:** Pin production and build images by digest, update them through an audited dependency bot, and retain the readable tag alongside the digest.
 
-### LOW-6: The test suite relies on a deprecated Starlette/httpx test-client path
+### ~~LOW-6: The test suite relies on a deprecated Starlette/httpx test-client path~~ — Resolved
 
 **Affected code:** `pyproject.toml`, `tests/test_web.py`
 
