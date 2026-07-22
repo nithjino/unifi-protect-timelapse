@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import UserNotifications
 
@@ -878,8 +879,19 @@ final class AppModel: ObservableObject {
         outputDirectory: URL,
         daily: Bool
     ) -> URL {
-        let prefix = daily ? "daily_timelapse" : "timelapse"
-        let base = "\(prefix)_\(Self.safeFilename(camera.name))_\(Self.filenameDate(start))_\(Self.filenameDate(end))_\(speed)"
+        let expected = Self.expectedOutputURL(
+            camera: camera,
+            start: start,
+            end: end,
+            speed: speed,
+            outputDirectory: outputDirectory,
+            daily: daily
+        )
+        if daily {
+            reservedOutputPaths.insert(expected.path.lowercased())
+            return expected
+        }
+        let base = expected.deletingPathExtension().lastPathComponent
         var counter = 1
         while true {
             let suffix = counter == 1 ? "" : "_\(counter)"
@@ -895,6 +907,29 @@ final class AppModel: ObservableObject {
 
     private func releaseOutputURL(_ url: URL) {
         reservedOutputPaths.remove(url.path.lowercased())
+    }
+
+    private static func expectedOutputURL(
+        camera: CameraInfo,
+        start: Date,
+        end: Date,
+        speed: String,
+        outputDirectory: URL,
+        daily: Bool
+    ) -> URL {
+        let prefix = daily ? "daily_timelapse" : "timelapse"
+        let digest = SHA256.hash(data: Data(camera.id.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+            .prefix(12)
+        let name = "\(prefix)_\(safeFilename(camera.name))_\(digest)_\(filenameDate(start))_\(filenameDate(end))_\(speed).mp4"
+        return outputDirectory.appendingPathComponent(name)
+    }
+
+    private static func isValidExport(_ url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              let size = attributes[.size] as? NSNumber else { return false }
+        return size.int64Value > 0
     }
 
     private func appendLog(level: String, message: String) {

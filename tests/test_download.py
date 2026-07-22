@@ -97,6 +97,18 @@ def test_default_output_path_preserves_safe_unicode_camera_name() -> None:
     assert "玄関_📷" in output.name
 
 
+def test_default_output_path_distinguishes_cameras_with_colliding_names() -> None:
+    first = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    second = CameraInfo(id="camera-2", name="Front Door", state=None, model=None)
+
+    first_output = default_output_path(_config(), first)
+    second_output = default_output_path(_config(), second)
+
+    assert first_output != second_output
+    assert first_output.name.startswith("timelapse_Front_Door_")
+    assert second_output.name.startswith("timelapse_Front_Door_")
+
+
 @pytest.mark.parametrize(("content_length", "expected_total"), [("6", 6), (None, None)])
 def test_download_emits_initial_throttled_and_final_progress(
     monkeypatch: pytest.MonkeyPatch,

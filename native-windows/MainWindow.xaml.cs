@@ -2,6 +2,8 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
@@ -684,7 +686,7 @@ public partial class MainWindow : Window
         {
             GroupNumber = group,
             Camera = camera,
-            OutputPath = ReserveOutputPath(camera.Name, start, end, speed, outputDirectory, daily),
+            OutputPath = ReserveOutputPath(camera, start, end, speed, outputDirectory, daily),
             RequestSettings = requestSettings,
             RequestStart = new DateTimeOffset(DateTime.SpecifyKind(start, DateTimeKind.Local)).ToString("O"),
             RequestEnd = new DateTimeOffset(DateTime.SpecifyKind(end, DateTimeKind.Local)).ToString("O"),
@@ -916,7 +918,31 @@ public partial class MainWindow : Window
     }
 
     private string ReserveOutputPath(
-        string cameraName,
+        CameraInfo camera,
+        DateTime start,
+        DateTime end,
+        string speed,
+        string outputDirectory,
+        bool daily)
+    {
+        CleanupStalePartialExports(outputDirectory);
+        var expected = ExpectedOutputPath(camera, start, end, speed, outputDirectory, daily);
+        if (daily)
+        {
+            if (_reservedOutputPaths.Add(expected)) return expected;
+            throw new InvalidOperationException($"An export is already writing {Path.GetFileName(expected)}.");
+        }
+        var baseName = Path.GetFileNameWithoutExtension(expected);
+        for (var counter = 1; ; counter++)
+        {
+            var suffix = counter == 1 ? "" : $"_{counter}";
+            var candidate = Path.Combine(outputDirectory, baseName + suffix + ".mp4");
+            if (!File.Exists(candidate) && _reservedOutputPaths.Add(candidate)) return candidate;
+        }
+    }
+
+    private static string ExpectedOutputPath(
+        CameraInfo camera,
         DateTime start,
         DateTime end,
         string speed,
@@ -924,17 +950,21 @@ public partial class MainWindow : Window
         bool daily)
     {
         var invalid = Path.GetInvalidFileNameChars().Concat([' ', '\t', '\r', '\n']).ToHashSet();
-        var safe = string.Concat(cameraName.Select(character => invalid.Contains(character) ? '_' : character)).Trim('.', '_', '-');
+        var safe = string.Concat(camera.Name.Select(character => invalid.Contains(character) ? '_' : character)).Trim('.', '_', '-');
         if (string.IsNullOrWhiteSpace(safe)) safe = "camera";
         if (safe.Length > 48) safe = safe[..48].Trim('.', '_', '-');
+        var digest = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(camera.Id))).ToLowerInvariant()[..12];
         var prefix = daily ? "daily_timelapse" : "timelapse";
-        var baseName = $"{prefix}_{safe}_{start:yyyyMMdd_HHmmss}_{end:yyyyMMdd_HHmmss}_{speed}";
-        for (var counter = 1; ; counter++)
-        {
-            var suffix = counter == 1 ? "" : $"_{counter}";
-            var candidate = Path.Combine(outputDirectory, baseName + suffix + ".mp4");
-            if (!File.Exists(candidate) && _reservedOutputPaths.Add(candidate)) return candidate;
-        }
+        return Path.Combine(
+            outputDirectory,
+            $"{prefix}_{safe}_{digest}_{start:yyyyMMdd_HHmmss}_{end:yyyyMMdd_HHmmss}_{speed}.mp4");
+    }
+
+    private static bool IsValidExport(string path)
+    {
+        try { return File.Exists(path) && new FileInfo(path).Length > 0; }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 
     private void CleanupStalePartialExports(string directory)

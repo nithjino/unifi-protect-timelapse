@@ -237,6 +237,7 @@ class WebState:
         self._cameras: list[CameraInfo] = []
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
+        self._reserved_output_paths: set[str] = set()
         self._schedule_persist_lock = asyncio.Lock()
         self._job_persist_lock = asyncio.Lock()
         self._schedule_state_file = settings.data_dir / "web-schedules.json"
@@ -314,11 +315,25 @@ class WebState:
             message = "Select at least one available camera."
             raise ValueError(message)
         base_config = self.settings.config(start, end, speed, daily=daily)
-        jobs: list[ExportJob] = []
+        planned_outputs: list[tuple[CameraInfo, Path]] = []
+        planned_keys: set[str] = set()
         for camera in selected:
             output = self.settings.output_dir / default_output_path(base_config, camera).name
             if daily:
                 output = daily_output_path(base_config, camera, self.settings.output_dir)
+            key = self._output_key(output)
+            if key in planned_keys:
+                message = "Selected cameras resolve to the same output path. No exports were started."
+                raise ValueError(message)
+            if key in self._reserved_output_paths:
+                message = f"An export is already writing {output.name}."
+                raise ValueError(message)
+            planned_keys.add(key)
+            planned_outputs.append((camera, output))
+
+        self._reserved_output_paths.update(planned_keys)
+        jobs: list[ExportJob] = []
+        for camera, output in planned_outputs:
             job = ExportJob(
                 id=secrets.token_urlsafe(9),
                 camera=camera,
@@ -386,39 +401,43 @@ class WebState:
         self._changed()
 
     async def _run_job(self, job: ExportJob) -> None:
-        job.status = "running"
-        job.started_at = datetime.now().astimezone()
-        self._changed()
-        if job.output.exists():
-            job.status = "skipped" if job.daily else "failed"
-            job.error = "A file already exists for this camera and time range."
-            job.finished_at = datetime.now().astimezone()
-            self._changed()
-            await self._persist_jobs()
-            return
-
-        config = self.settings.config(job.start, job.end, job.speed, daily=job.daily)
-
-        def report_progress(progress: DownloadProgress) -> None:
-            job.downloaded_bytes = progress.downloaded_bytes
-            job.total_bytes = progress.total_bytes
-            job.bytes_per_second = progress.bytes_per_second
-            job.elapsed_seconds = progress.elapsed_seconds
-            self._changed()
-
         try:
-            await self._exporter(config, job.camera, job.output, report_progress)
-        except asyncio.CancelledError:
-            job.status = "cancelled"
-        except Exception as exc:
-            job.status = "failed"
-            job.error = str(exc) or type(exc).__name__
-        else:
-            job.status = "completed"
-        finally:
-            job.finished_at = datetime.now().astimezone()
+            job.status = "running"
+            job.started_at = datetime.now().astimezone()
             self._changed()
-            await self._persist_jobs()
+            if job.output.exists():
+                valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
+                job.status = "skipped" if job.daily and valid_existing_export else "failed"
+                job.error = "A file already exists for this camera and time range."
+                job.finished_at = datetime.now().astimezone()
+                self._changed()
+                await self._persist_jobs()
+                return
+
+            config = self.settings.config(job.start, job.end, job.speed, daily=job.daily)
+
+            def report_progress(progress: DownloadProgress) -> None:
+                job.downloaded_bytes = progress.downloaded_bytes
+                job.total_bytes = progress.total_bytes
+                job.bytes_per_second = progress.bytes_per_second
+                job.elapsed_seconds = progress.elapsed_seconds
+                self._changed()
+
+            try:
+                await self._exporter(config, job.camera, job.output, report_progress)
+            except asyncio.CancelledError:
+                job.status = "cancelled"
+            except Exception as exc:
+                job.status = "failed"
+                job.error = str(exc) or type(exc).__name__
+            else:
+                job.status = "completed"
+            finally:
+                job.finished_at = datetime.now().astimezone()
+                self._changed()
+                await self._persist_jobs()
+        finally:
+            self._reserved_output_paths.discard(self._output_key(job.output))
 
     async def _run_schedule(self, schedule: DailySchedule) -> None:
         try:
@@ -470,6 +489,10 @@ class WebState:
         )
         for job in terminal[: max(len(self.jobs) - MAX_VISIBLE_JOBS, 0)]:
             self.jobs.pop(job.id, None)
+
+    @staticmethod
+    def _output_key(path: Path) -> str:
+        return str(path.resolve()).casefold()
 
     def _changed(self) -> None:
         self.version += 1

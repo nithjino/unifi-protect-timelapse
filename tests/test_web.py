@@ -234,6 +234,29 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
     assert download.content == b"video"
 
 
+def test_same_name_cameras_receive_distinct_reserved_outputs(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    async def colliding_cameras(_config: Config) -> list[CameraInfo]:
+        return [
+            CameraInfo(id="camera-1", name="Same Name", state=None, model=None),
+            CameraInfo(id="camera-2", name="Same Name", state=None, model=None),
+        ]
+
+    state = WebState(settings, camera_loader=colliding_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    async def exercise() -> None:
+        await state.start()
+        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+        jobs = await state.create_jobs(["camera-1", "camera-2"], start, start + timedelta(hours=1), "120x")
+        assert len({job.output for job in jobs}) == 2
+        await asyncio.gather(*(job.task for job in jobs if job.task is not None))
+        assert all(job.status == "completed" for job in jobs)
+        await state.close()
+
+    asyncio.run(exercise())
+
+
 def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:
     app, state = _app(tmp_path)
 
