@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
@@ -81,6 +82,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
         javascript = client.get("/static/htmx.min.js")
 
     assert response.status_code == 200
+    assert response.headers["x-request-id"]
     assert "Turn recorded days into" not in response.text
     assert "Local control center" not in response.text
     assert "htmx.min.js" in response.text
@@ -271,6 +273,59 @@ def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:
     assert response.status_code == 400
     assert "Select at least one available camera" in response.text
     assert not state.jobs
+
+
+@pytest.mark.parametrize(
+    ("error", "status_code"),
+    [
+        (TimelapseError("Protect unavailable"), 502),
+        (OperationTimeoutError("Protect timed out"), 504),
+    ],
+)
+def test_camera_service_failures_return_non_success_status(
+    tmp_path: Path,
+    error: TimelapseError,
+    status_code: int,
+) -> None:
+    async def failed_cameras(_config: Config) -> list[CameraInfo]:
+        raise error
+
+    settings = _settings(tmp_path)
+    state = WebState(settings, camera_loader=failed_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
+
+    with _client(app) as client:
+        response = client.get("/partials/cameras")
+
+    assert response.status_code == status_code
+    assert str(error) in response.text
+
+
+def test_unexpected_camera_failure_returns_correlated_server_error(tmp_path: Path) -> None:
+    async def failed_cameras(_config: Config) -> list[CameraInfo]:
+        message = "database failure"
+        raise OSError(message)
+
+    settings = _settings(tmp_path)
+    state = WebState(settings, camera_loader=failed_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
+
+    with _client(app) as client:
+        response = client.get("/partials/cameras")
+
+    assert response.status_code == 500
+    assert response.headers["x-request-id"]
+    assert response.headers["x-request-id"] in response.text
+    assert "database failure" not in response.text
+
+
+def test_missing_job_action_returns_not_found(tmp_path: Path) -> None:
+    app, _state = _app(tmp_path)
+
+    with _client(app) as client:
+        response = client.delete("/actions/jobs/missing01")
+
+    assert response.status_code == 404
 
 
 def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:

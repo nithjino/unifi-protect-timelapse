@@ -1,6 +1,13 @@
 (() => {
   "use strict";
 
+  document.body.addEventListener("htmx:beforeSwap", (event) => {
+    const status = event.detail.xhr.status;
+    if (status >= 400 && status < 600 && event.detail.xhr.responseText) {
+      event.detail.shouldSwap = true;
+    }
+  });
+
   const form = document.querySelector("#export-form");
   const selectionCount = document.querySelector("#selection-count");
   const fullDayFields = document.querySelector("#full-day-fields");

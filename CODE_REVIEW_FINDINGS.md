@@ -170,7 +170,7 @@ Client-session cleanup catches only a narrow timeout case, and temporary-file un
 
 **Recommendation:** Preserve the primary exception, log cleanup failures separately, and make cleanup best-effort unless resource integrity requires escalation.
 
-### LOW-3: Web action failures are commonly returned as HTTP 200
+### ~~LOW-3: Web action failures are commonly returned as HTTP 200~~ — Resolved
 
 **Affected code:** `timelapse/web.py:453-544`
 

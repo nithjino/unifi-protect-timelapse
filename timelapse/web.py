@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
@@ -29,6 +30,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
+from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.config import SPEED_TO_FPS
 from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
 
@@ -50,6 +52,7 @@ JOB_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
 SCHEDULE_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
 TIMESTAMP_QUERY = Annotated[str, Query(min_length=10, max_length=40)]
 NEXT_QUERY = Annotated[str | None, Query(alias="next")]
+_LOGGER = logging.getLogger(__name__)
 
 load_dotenv(override=False)
 
@@ -351,6 +354,30 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     templates.env.filters["next_run"] = _schedule_next_run
 
     @application.middleware("http")
+    async def identify_and_log_requests(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        request_id = secrets.token_hex(8)
+        request.state.request_id = request_id
+        try:
+            response = await call_next(request)
+        except Exception:
+            _LOGGER.exception(
+                "Unhandled web request failure: request_id=%s method=%s path=%s",
+                request_id,
+                request.method,
+                request.url.path,
+            )
+            return PlainTextResponse(
+                f"Internal server error. Request ID: {request_id}",
+                status_code=500,
+                headers={"X-Request-ID": request_id},
+            )
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+    @application.middleware("http")
     async def require_web_authentication(  # noqa: PLR0911 - ordered security exits keep the boundary explicit
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
@@ -507,15 +534,24 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         refresh: Annotated[bool, Query()] = False,  # noqa: FBT002 - boolean query parameter
     ) -> Response:
         camera_error = None
+        status_code = 200
         loaded_cameras = []
         try:
             loaded_cameras = await web_state.cameras(refresh=refresh)
-        except Exception as exc:
+        except OperationTimeoutError as exc:
+            camera_error = str(exc)
+            status_code = 504
+        except TimelapseError as exc:
             camera_error = str(exc) or type(exc).__name__
+            status_code = 502
+        except ValueError as exc:
+            camera_error = str(exc)
+            status_code = 400
         return templates.TemplateResponse(
             request=request,
             name="partials/cameras.html",
             context={"cameras": loaded_cameras, "camera_error": camera_error},
+            status_code=status_code,
         )
 
     @application.get("/partials/jobs", response_class=HTMLResponse)
@@ -546,6 +582,10 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             created = await web_state.create_jobs(camera_ids, start, end, speed)
         except WebCapacityError as exc:
             return message_response(request, str(exc), kind="error", status_code=429)
+        except OperationTimeoutError as exc:
+            return message_response(request, str(exc), kind="error", status_code=504)
+        except TimelapseError as exc:
+            return message_response(request, str(exc), kind="error", status_code=502)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=400)
         noun = "export" if len(created) == 1 else "exports"
@@ -558,6 +598,10 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             camera_ids = _form_values(form, "camera_ids")
             speed = _parse_speed(form)
             schedule = await web_state.create_schedule(camera_ids, speed)
+        except OperationTimeoutError as exc:
+            return message_response(request, str(exc), kind="error", status_code=504)
+        except TimelapseError as exc:
+            return message_response(request, str(exc), kind="error", status_code=502)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=400)
         count = len(schedule.cameras)
@@ -569,7 +613,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         try:
             action = await web_state.cancel_or_remove_job(job_id)
         except ValueError as exc:
-            return message_response(request, str(exc), kind="error")
+            return message_response(request, str(exc), kind="error", status_code=404)
         message = "Cancellation requested." if action == "cancelled" else "Export removed from the list."
         return message_response(request, message)
 
@@ -596,7 +640,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         try:
             await web_state.remove_schedule(schedule_id)
         except ValueError as exc:
-            return message_response(request, str(exc), kind="error")
+            return message_response(request, str(exc), kind="error", status_code=404)
         return message_response(request, "Daily schedule stopped.")
 
     @application.get("/api/thumbnails/{camera_id}")
@@ -604,8 +648,12 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         try:
             requested_time = _parse_local_datetime(timestamp, "Preview time")
             result = await web_state.thumbnail(camera_id, requested_time)
-        except Exception as exc:
-            return PlainTextResponse(str(exc) or type(exc).__name__, status_code=400)
+        except OperationTimeoutError as exc:
+            return PlainTextResponse(str(exc), status_code=504)
+        except TimelapseError as exc:
+            return PlainTextResponse(str(exc), status_code=502)
+        except ValueError as exc:
+            return PlainTextResponse(str(exc), status_code=400)
         return Response(
             content=result.image,
             media_type="image/jpeg",
