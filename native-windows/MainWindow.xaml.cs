@@ -71,6 +71,7 @@ public partial class MainWindow : Window
         ProfileCombo.ItemsSource = _profiles;
         var videos = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos);
         _outputDirectory = Path.Combine(string.IsNullOrWhiteSpace(videos) ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile) : videos, "TimeLapse");
+        CleanupStalePartialExports(_outputDirectory);
         OutputDirectoryText.Text = _outputDirectory;
         OutputDirectoryText.ToolTip = _outputDirectory;
         var end = DateTime.Now;
@@ -700,6 +701,7 @@ public partial class MainWindow : Window
         _downloadProcesses[job.Id] = process;
         SetBusyState();
         var receivedTerminal = false;
+        var cancellationPath = $"{job.OutputPath}.{job.Id:N}.cancel";
         AppendLog("INFO", $"Started camera download: {job.Camera.Name} -> {job.OutputPath}");
         try
         {
@@ -713,6 +715,7 @@ public partial class MainWindow : Window
                 ["end"] = job.RequestEnd,
                 ["speed"] = job.RequestSpeed,
                 ["output"] = job.OutputPath,
+                ["cancel_path"] = cancellationPath,
             };
             var completion = await process.RunAsync(request, backendEvent => Dispatcher.Invoke(() =>
             {
@@ -747,7 +750,7 @@ public partial class MainWindow : Window
                     case "log": AppendLog(backendEvent.Level ?? "INFO", backendEvent.Message ?? ""); break;
                     default: AppendLog("WARNING", $"Unknown backend event: {backendEvent.Event}"); break;
                 }
-            }));
+            }), cancellationPath: cancellationPath);
             if (!receivedTerminal)
             {
                 if (completion.WasCancelled) job.State = DownloadState.Cancelled;
@@ -767,6 +770,7 @@ public partial class MainWindow : Window
             job.BytesPerSecond = 0;
             _downloadProcesses.Remove(job.Id);
             _reservedOutputPaths.Remove(job.OutputPath);
+            CleanupPartialFilesForOutput(job.OutputPath);
             process.Dispose();
             StatusText.Text = _downloadProcesses.Count == 0 ? "Ready" : $"{_downloadProcesses.Count} downloads active";
             UpdateDownloadsDisplay();
@@ -930,6 +934,40 @@ public partial class MainWindow : Window
             var suffix = counter == 1 ? "" : $"_{counter}";
             var candidate = Path.Combine(outputDirectory, baseName + suffix + ".mp4");
             if (!File.Exists(candidate) && _reservedOutputPaths.Add(candidate)) return candidate;
+        }
+    }
+
+    private void CleanupStalePartialExports(string directory)
+    {
+        try
+        {
+            if (!Directory.Exists(directory)) return;
+            var cutoff = DateTime.UtcNow - TimeSpan.FromHours(1);
+            foreach (var path in Directory.EnumerateFiles(directory, ".*.part"))
+            {
+                if (File.GetLastWriteTimeUtc(path) >= cutoff) continue;
+                File.Delete(path);
+                AppendLog("INFO", $"Removed stale partial export: {path}");
+            }
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            AppendLog("WARNING", $"Could not clean stale partial exports in {directory}: {exception.Message}");
+        }
+    }
+
+    private void CleanupPartialFilesForOutput(string outputPath)
+    {
+        try
+        {
+            var directory = Path.GetDirectoryName(outputPath);
+            if (directory is null || !Directory.Exists(directory)) return;
+            foreach (var path in Directory.EnumerateFiles(directory, $".{Path.GetFileName(outputPath)}.*.part"))
+                File.Delete(path);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            AppendLog("WARNING", $"Could not remove partial export for {outputPath}: {exception.Message}");
         }
     }
 

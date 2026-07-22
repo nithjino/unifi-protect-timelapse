@@ -57,4 +57,7 @@ def test_windows_build_packages_native_app_and_backend() -> None:
     assert "EmbeddedResource" in project
     assert "TimeLapseNative.timelapse-backend.exe" in project
     assert "GetManifestResourceStream" in backend_process
+    assert "CancellationGracePeriod" in backend_process
+    assert "File.WriteAllText(_cancellationPath" in backend_process
+    assert "CleanupStalePartialExports" in (ROOT / "native-windows" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
     assert "PySide6" not in project

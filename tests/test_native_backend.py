@@ -36,6 +36,33 @@ def test_health_command_emits_complete(monkeypatch: pytest.MonkeyPatch) -> None:
     assert events == [{"id": "health-1", "event": "complete", "status": "ok"}]
 
 
+def test_cancellation_sentinel_cancels_running_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[dict[str, object]] = []
+    started = asyncio.Event()
+
+    async def blocking_dispatch(_request: object) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(backend, "_dispatch", blocking_dispatch)
+    monkeypatch.setattr(backend, "_write_event", events.append)
+    cancel_path = tmp_path / "download.cancel"
+
+    async def exercise() -> int:
+        task = asyncio.create_task(
+            backend._run({"id": "download-1", "command": "download", "cancel_path": str(cancel_path)})
+        )
+        await started.wait()
+        cancel_path.touch()
+        return await task
+
+    assert asyncio.run(exercise()) == 0
+    assert events[-1] == {"id": "download-1", "event": "cancelled"}
+
+
 def test_list_cameras_emits_detached_camera_data(monkeypatch: pytest.MonkeyPatch) -> None:
     events: list[dict[str, object]] = []
 

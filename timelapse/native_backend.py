@@ -246,6 +246,12 @@ async def _dispatch(request: Mapping[str, object]) -> None:
     raise _ProtocolError(message, code="unsupported_command")
 
 
+async def _cancel_when_requested(cancel_path: Path, task: asyncio.Task[object]) -> None:
+    while not cancel_path.exists():  # noqa: ASYNC110, ASYNC240 - local sentinel poll
+        await asyncio.sleep(0.1)
+    task.cancel()
+
+
 def _read_request() -> dict[str, object]:
     raw = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
     if not raw:
@@ -276,9 +282,16 @@ async def _run(request: Mapping[str, object]) -> int:
     _LOGGER.info("Backend command started: command=%s, request_id=%s", command, request_id)
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
+    cancel_watcher: asyncio.Task[None] | None = None
     if task is not None:
         with suppress(NotImplementedError, RuntimeError):
             loop.add_signal_handler(signal.SIGTERM, task.cancel)
+        cancel_path = _optional_string(request, "cancel_path")
+        if cancel_path:
+            cancel_watcher = asyncio.create_task(
+                _cancel_when_requested(Path(cancel_path), task),
+                name=f"cancel-{request_id}",
+            )
     try:
         await _dispatch(request)
     except asyncio.CancelledError:
@@ -309,6 +322,10 @@ async def _run(request: Mapping[str, object]) -> int:
         )
         raise
     finally:
+        if cancel_watcher is not None:
+            cancel_watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await cancel_watcher
         with suppress(NotImplementedError, RuntimeError):
             loop.remove_signal_handler(signal.SIGTERM)
     _LOGGER.info(
