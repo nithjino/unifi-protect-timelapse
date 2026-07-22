@@ -467,11 +467,17 @@ class WebState:
             message = "Choose a supported timelapse speed."
             raise ValueError(message)
         schedule = DailySchedule(id=secrets.token_urlsafe(9), cameras=selected, speed=speed)
-        self.schedules[schedule.id] = schedule
-        await self._persist_schedules()
-        schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
-        self._changed()
-        return schedule
+        async with self._schedule_mutation_lock:
+            self.schedules[schedule.id] = schedule
+            try:
+                await self._persist_schedules()
+                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
+            except Exception:
+                self.schedules.pop(schedule.id, None)
+                await self._persist_schedules()
+                raise
+            self._changed()
+            return schedule
 
     async def remove_schedule(self, schedule_id: str) -> None:
         """Stop and remove a persistent daily schedule."""
