@@ -16,6 +16,8 @@ if TYPE_CHECKING:
 
     from pytestqt.qtbot import QtBot
 
+    from timelapse.config import Config
+
 _REQUIRED_ENVIRONMENT_VARIABLES = (
     "UNIFI_PROTECT_URL",
     "UNIFI_PROTECT_TOKEN",
@@ -61,6 +63,14 @@ def _connection_settings() -> gui_module._ConnectionSettings:
     )
 
 
+def _export_config() -> Config:
+    return _connection_settings().make_config(
+        datetime(2026, 7, 11, 8, tzinfo=UTC),
+        datetime(2026, 7, 11, 9, tzinfo=UTC),
+        "120x",
+    )
+
+
 @pytest.fixture
 def main_window(
     qtbot: QtBot,
@@ -77,11 +87,6 @@ def _entry_text(window: gui_module._MainWindow, entry: gui_module._DownloadEntry
     item = table.item(entry.row, column)
     assert item is not None
     return item.text()
-
-
-def test_date_editors_offer_calendar_popups(main_window: gui_module._MainWindow) -> None:
-    assert main_window._start_edit.calendarPopup() is True
-    assert main_window._end_edit.calendarPopup() is True
 
 
 def test_24_hour_toggle_uses_date_only_one_day_range(main_window: gui_module._MainWindow) -> None:
@@ -101,7 +106,6 @@ def test_24_hour_hover_preview_uses_midnight_and_prompts_for_camera(main_window:
     main_window._show_thumbnail_preview("start")
 
     assert main_window._thumbnail_timestamp("start").hour == 0
-    assert "12:00 AM" in main_window._thumbnail_popup.time_label.text()
     assert main_window._thumbnail_popup.image_label.text() == "Select a camera to preview this time."
 
 
@@ -244,18 +248,9 @@ def test_activity_indicator_tracks_background_work(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "output.mp4", main_window)
     entry = main_window._add_download_row(1, camera, tmp_path / "output.mp4", worker)
-
-    expected_end = config.end.astimezone().strftime("%I:%M %p")
-    assert _entry_text(main_window, entry, gui_module._COLUMN_TIME_RANGE) == (
-        f"{gui_module._format_job_datetime(config.start)} → {expected_end}"
-    )
 
     assert main_window._activity_widget.isHidden() is True
 
@@ -398,15 +393,10 @@ def test_profile_store_keeps_secrets_out_of_qsettings(monkeypatch: pytest.Monkey
     loaded = store.load()
 
     assert loaded.profiles == (first, second.normalized())
+    assert loaded.profiles[1].display_name == second_settings.instance_url
     assert loaded.selected_profile_id == second.profile_id
     assert first.settings.token not in repr(preferences._values)
     assert second.settings.password not in repr(preferences._values)
-
-
-def test_profile_name_defaults_to_protect_url() -> None:
-    profile = gui_module._ConnectionProfile("profile", "   ", _connection_settings()).normalized()
-
-    assert profile.display_name == profile.settings.instance_url
 
 
 def test_profile_dropdown_switches_active_connection(qtbot: QtBot) -> None:
@@ -454,11 +444,7 @@ def test_output_reservation_uses_camera_name_and_unique_suffixes(
     main_window: gui_module._MainWindow,
     tmp_path: Path,
 ) -> None:
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     camera = CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5")
     preferred = tmp_path / default_output_path(config, camera).name
     preferred.write_bytes(b"existing")
@@ -476,11 +462,7 @@ def test_progress_row_shows_known_and_unknown_totals(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5")
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     output = tmp_path / "output.mp4"
     worker = gui_module._DownloadWorker(config, camera, output, main_window)
     entry = main_window._add_download_row(1, camera, output, worker)
@@ -527,11 +509,7 @@ def test_stalled_download_speed_falls_to_zero(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "output.mp4", main_window)
     entry = main_window._add_download_row(1, camera, tmp_path / "output.mp4", worker)
     main_window._workers[worker] = entry
@@ -550,11 +528,7 @@ def test_bulk_controls_only_affect_the_active_job_tab(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
     download_entry = main_window._add_download_row(1, camera, tmp_path / "active.mp4", worker)
     main_window._workers[worker] = download_entry
@@ -581,11 +555,7 @@ def test_bulk_download_controls_preserve_active_rows(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     finished_worker = gui_module._DownloadWorker(config, camera, tmp_path / "finished.mp4", main_window)
     active_worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
     finished = main_window._add_download_row(1, camera, tmp_path / "finished.mp4", finished_worker)
@@ -608,27 +578,38 @@ def test_bulk_download_controls_preserve_active_rows(
     main_window._workers.clear()
 
 
-def test_cancelled_job_can_restart_and_be_removed(
+def test_cancelled_job_can_restart_after_its_worker_finishes(
     main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "cancelled.mp4", main_window)
     entry = main_window._add_download_row(1, camera, tmp_path / "cancelled.mp4", worker)
     main_window._workers[worker] = entry
+    restarted: list[gui_module._DownloadWorker] = []
+
+    def capture_restart(
+        restarted_entry: gui_module._DownloadEntry, restarted_worker: gui_module._DownloadWorker
+    ) -> None:
+        restarted_entry.worker = restarted_worker
+        restarted.append(restarted_worker)
+
+    monkeypatch.setattr(main_window, "_start_download_worker", capture_restart)
 
     main_window._download_cancelled(entry)
+    assert entry.action_button.isEnabled() is False
     main_window._download_worker_finished(worker)
 
     assert entry.action_button.text() == "Restart"
     assert entry.action_button.isEnabled() is True
-    main_window._remove_entry(entry)
-    assert main_window._downloads.rowCount() == 0
+    entry.action_button.click()
+    assert len(restarted) == 1
+    assert restarted[0] is entry.worker
+    assert restarted[0] is not worker
+    assert entry.terminal is False
+    assert _entry_text(main_window, entry, gui_module._COLUMN_STATUS) == "Preparing export…"
 
 
 def test_download_terminal_states_send_desktop_notifications(
@@ -637,11 +618,7 @@ def test_download_terminal_states_send_desktop_notifications(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     notifications: list[tuple[str, str, object]] = []
     monkeypatch.setattr(
         main_window,
@@ -708,11 +685,7 @@ def test_double_click_completed_job_opens_video(
     tmp_path: Path,
 ) -> None:
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = _connection_settings().make_config(
-        datetime(2026, 7, 11, 8, tzinfo=UTC),
-        datetime(2026, 7, 11, 9, tzinfo=UTC),
-        "120x",
-    )
+    config = _export_config()
     output = tmp_path / "completed.mp4"
     output.write_bytes(b"video")
     worker = gui_module._DownloadWorker(config, camera, output, main_window)

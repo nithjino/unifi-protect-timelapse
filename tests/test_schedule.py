@@ -28,15 +28,16 @@ def _config() -> Config:
     )
 
 
-def test_local_day_helpers_create_calendar_day_and_daily_prefix(tmp_path: Path) -> None:
+def test_local_day_helpers_create_calendar_day_and_daily_output(tmp_path: Path) -> None:
     start, end = local_day_bounds(date(2026, 7, 11))
     config = config_for_local_day(_config(), date(2026, 7, 11))
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
 
     assert config.start == start
     assert config.end == end
-    assert daily_output_path(config, camera, tmp_path).name == (
-        "timelapse_Front_Door_2026_07_11_2026_07_12_600x_6bf6f341d9a3.mp4"
+    assert config.full_day is True
+    assert daily_output_path(config, camera, tmp_path) == (
+        tmp_path / "timelapse_Front_Door_2026_07_11_2026_07_12_600x_6bf6f341d9a3.mp4"
     )
 
 

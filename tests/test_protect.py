@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+import timelapse.protect as protect_module
 from timelapse import TimelapseError
 from timelapse.config import Config
 from timelapse.protect import CameraInfo, create_client, load_cameras, parse_connection
@@ -46,7 +47,7 @@ def test_parse_connection_builds_export_path() -> None:
     assert connection.export_path == "/proxy/protect/api/video/export"
 
 
-def test_create_client_supports_public_and_private_authentication() -> None:
+def test_create_client_passes_public_and_private_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     config = Config(
         instance_url="https://protect.local",
         token="test-token",  # noqa: S106
@@ -61,9 +62,31 @@ def test_create_client_supports_public_and_private_authentication() -> None:
         max_download_mib=10240,
     )
 
+    sentinel = object()
+    received: list[tuple[str, int, dict[str, object]]] = []
+
+    def fake_client(host: str, port: int, **kwargs: object) -> object:
+        received.append((host, port, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(protect_module, "ProtectApiClient", fake_client)
+
     client = create_client(config, parse_connection(config.instance_url))
 
-    assert client.is_public_only is False
+    assert client is sentinel
+    assert received == [
+        (
+            "protect.local",
+            443,
+            {
+                "username": "timelapse-user",
+                "password": "test-password",
+                "api_key": "test-token",
+                "verify_ssl": True,
+                "store_sessions": False,
+            },
+        )
+    ]
 
 
 def test_load_cameras_returns_sorted_detached_camera_info() -> None:

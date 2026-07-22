@@ -14,6 +14,8 @@ from timelapse.service import CameraThumbnail
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from timelapse.config import Config
+
 
 def _settings() -> dict[str, object]:
     return {
@@ -86,13 +88,18 @@ def test_list_cameras_emits_detached_camera_data(monkeypatch: pytest.MonkeyPatch
 def test_download_emits_progress_and_complete(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events: list[dict[str, object]] = []
     output = tmp_path / "output.mp4"
+    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model="G5")
+    start = datetime(2026, 7, 11, 8, tzinfo=UTC)
+    end = datetime(2026, 7, 11, 9, tzinfo=UTC)
 
     async def fake_export(
-        _config: object,
-        _camera: object,
+        config: Config,
+        requested_camera: CameraInfo,
         requested_output: Path,
         progress_callback: object,
     ) -> None:
+        assert (config.start, config.end, config.speed) == (start, end, "120x")
+        assert requested_camera == camera
         callback = progress_callback
         assert callable(callback)
         callback(DownloadProgress(1024, 4096, 512.0, 2.0))
@@ -102,9 +109,9 @@ def test_download_emits_progress_and_complete(monkeypatch: pytest.MonkeyPatch, t
         "id": "download-1",
         "command": "download",
         "settings": _settings(),
-        "camera": {"id": "camera-1", "name": "Front Door", "state": None, "model": "G5"},
-        "start": datetime(2026, 7, 11, 8, tzinfo=UTC).isoformat(),
-        "end": datetime(2026, 7, 11, 9, tzinfo=UTC).isoformat(),
+        "camera": {"id": camera.id, "name": camera.name, "state": camera.state, "model": camera.model},
+        "start": start.isoformat(),
+        "end": end.isoformat(),
         "speed": "120x",
         "output": str(output),
     }
@@ -178,15 +185,3 @@ def test_thumbnail_emits_base64_image(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_requests_raise_protocol_errors(payload: dict[str, object], message: str) -> None:
     with pytest.raises(backend._ProtocolError, match=message):
         asyncio.run(backend._dispatch(payload))
-
-
-def test_config_dates_are_timezone_aware() -> None:
-    request = {"settings": _settings()}
-    start = datetime(2026, 7, 11, 8, tzinfo=UTC)
-    end = datetime(2026, 7, 11, 9, tzinfo=UTC)
-
-    config = backend._config(request, start=start, end=end, speed="600x", output=None)
-
-    assert config.start == start
-    assert config.end == end
-    assert config.speed == "600x"

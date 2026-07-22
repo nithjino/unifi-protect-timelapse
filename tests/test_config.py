@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -35,9 +35,13 @@ def _parse_config() -> Config:
     return command
 
 
-def test_parse_args_loads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.fixture(autouse=True)
+def _clear_configuration_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ENVIRONMENT_VARIABLES:
         monkeypatch.delenv(name, raising=False)
+
+
+def test_parse_args_loads_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     (tmp_path / ".env").write_text(
         """UNIFI_PROTECT_URL=https://protect.local/proxy/protect/integration/v1
 UNIFI_PROTECT_TOKEN=test-token
@@ -139,9 +143,9 @@ def test_one_date_only_boundary_creates_full_local_day(
 
     config = _parse_config()
 
-    assert config.start.hour == 0
-    assert config.start.minute == 0
-    assert config.end.date() == config.start.date() + timedelta(days=1)
+    assert (config.start.date(), config.end.date()) == (date(2026, 7, 11), date(2026, 7, 12))
+    assert (config.start.hour, config.start.minute, config.start.second) == (0, 0, 0)
+    assert (config.end.hour, config.end.minute, config.end.second) == (0, 0, 0)
     assert config.full_day is True
 
 
@@ -169,26 +173,7 @@ def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_
     assert config.daily is True
     assert config.full_day is True
     assert config.output == tmp_path
-
-
-def test_speed_defaults_to_600x(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
-    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
-    arguments = [
-        "timelapse",
-        "--instance",
-        "https://protect.local",
-        "--token",
-        "test-token",
-        "--start-date",
-        "07-11-2026-08-00-00",
-        "--end-date",
-        "07-11-2026-09-00-00",
-    ]
-    monkeypatch.setattr(sys, "argv", arguments)
-
-    assert _parse_config().speed == "600x"
+    assert config.speed == "600x"
 
 
 def test_private_credentials_can_be_passed_on_command_line(
@@ -217,8 +202,6 @@ def test_private_credentials_can_be_passed_on_command_line(
 
 
 def test_create_profile_uses_dotenv_connection_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    for name in ENVIRONMENT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
     (tmp_path / ".env").write_text(
         """UNIFI_PROTECT_URL=https://protect.local
 UNIFI_PROTECT_TOKEN=test-token
@@ -243,8 +226,6 @@ UNIFI_PROTECT_VERIFY_SSL=false
 
 
 def test_named_profile_supplies_connection_details(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    for name in ENVIRONMENT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         "timelapse.profiles.load_profile",
@@ -261,7 +242,6 @@ def test_named_profile_supplies_connection_details(monkeypatch: pytest.MonkeyPat
 
     config = _parse_config()
 
-    assert isinstance(config, Config)
     assert config.instance_url == "https://profile.local"
     assert config.token == "profile-token"  # noqa: S105
     assert config.username == "profile-user"
@@ -269,9 +249,11 @@ def test_named_profile_supplies_connection_details(monkeypatch: pytest.MonkeyPat
     assert config.verify_ssl is False
 
 
-def test_dotenv_is_used_instead_of_named_profile(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    for name in ENVIRONMENT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
+def test_profile_is_rejected_when_dotenv_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     (tmp_path / ".env").write_text(
         """UNIFI_PROTECT_URL=https://protect.local
 UNIFI_PROTECT_TOKEN=test-token
@@ -283,16 +265,17 @@ UNIFI_PROTECT_PASSWORD=test-password
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["timelapse", "--profile", "home", *REQUIRED_ARGUMENTS])
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as error:
         parse_args()
+
+    assert error.value.code == 2
+    assert "--profile cannot be used while .env exists" in capsys.readouterr().err
 
 
 def test_incomplete_dotenv_prompts_for_missing_connection_values(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    for name in ENVIRONMENT_VARIABLES:
-        monkeypatch.delenv(name, raising=False)
     (tmp_path / ".env").write_text(
         """UNIFI_PROTECT_URL=https://protect.local
 UNIFI_PROTECT_VERIFY_SSL=true
@@ -307,7 +290,6 @@ UNIFI_PROTECT_VERIFY_SSL=true
 
     config = _parse_config()
 
-    assert isinstance(config, Config)
     assert config.instance_url == "https://protect.local"
     assert config.token == "prompted-token"  # noqa: S105
     assert config.username == "prompted-user"

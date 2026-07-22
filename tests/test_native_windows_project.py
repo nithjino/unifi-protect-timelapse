@@ -1,69 +1,81 @@
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
+XAML_NAMESPACE = "{http://schemas.microsoft.com/winfx/2006/xaml/presentation}"
+XAML_NAME = "{http://schemas.microsoft.com/winfx/2006/xaml}Name"
+
+
+def _named_xaml_elements(path: Path) -> dict[str, ET.Element]:
+    return {
+        name: element
+        for element in ET.parse(path).iter()  # noqa: S314 - repository-owned XAML
+        if (name := element.get(XAML_NAME)) is not None
+    }
 
 
 def test_windows_project_is_native_wpf() -> None:
-    project = (ROOT / "native-windows" / "TimeLapseNative.csproj").read_text(encoding="utf-8")
+    project = ET.parse(ROOT / "native-windows" / "TimeLapseNative.csproj")  # noqa: S314 - repository-owned XML
+    properties = {element.tag: element.text for element in project.findall("./PropertyGroup/*")}
+    expected = {
+        "TargetFramework": "net8.0-windows",
+        "UseWPF": "true",
+        "UseWindowsForms": "true",
+        "EnableWindowsTargeting": "true",
+        "ApplicationIcon": r"..\assets\icons\timelapse.ico",
+    }
 
-    assert "<UseWPF>true</UseWPF>" in project
-    assert "<UseWindowsForms>true</UseWindowsForms>" in project
-    assert "<TargetFramework>net8.0-windows</TargetFramework>" in project
-    assert "timelapse.ico" in project
+    assert {name: properties.get(name) for name in expected} == expected
 
 
-def test_windows_native_gui_includes_full_day_and_daily_controls() -> None:
-    main_xaml = (ROOT / "native-windows" / "MainWindow.xaml").read_text(encoding="utf-8")
-    main_code = (ROOT / "native-windows" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
-    daily_dialog = (ROOT / "native-windows" / "DailyScheduleDialog.xaml").read_text(encoding="utf-8")
+def test_windows_native_gui_declares_core_controls_and_bindings() -> None:
+    elements = _named_xaml_elements(ROOT / "native-windows" / "MainWindow.xaml")
 
-    assert "24-hour timelapse" in main_xaml
-    assert "Daily automatic timelapses" in main_xaml
-    assert 'Header="Downloads"' in main_xaml
-    assert 'Header="Daily Automations"' in main_xaml
-    assert 'ItemsSource="{Binding DownloadJobs}"' in main_xaml
-    assert 'ItemsSource="{Binding DailyAutomationJobs}"' in main_xaml
-    assert main_xaml.count('Header="Time Range" Binding="{Binding TimeRangeText}"') == 2
-    assert "public string TimeRangeText" in (ROOT / "native-windows" / "Models.cs").read_text(encoding="utf-8")
-    assert "RunDailyScheduleIfDue" in main_code
-    assert "start:yyyy_MM_dd}_{end:yyyy_MM_dd}_{speed}_{digest}" in main_code
-    assert "start:HH_mm_ss}" in main_code
-    assert "{speed}__{digest}" in main_code
-    assert "ShowingDailyAutomations" in main_code
-    assert 'x:Name="ThumbnailPopup"' in main_xaml
-    assert 'MouseEnter="ThumbnailHover_MouseEnter"' in main_xaml
-    assert '["command"] = "thumbnail"' in main_code
-    assert "ThumbnailBase64" in (ROOT / "native-windows" / "Models.cs").read_text(encoding="utf-8")
-    assert "_thumbnailRequests.ContainsKey(cacheKey)" in main_code
-    assert "_thumbnailFailures.TryGetValue(cacheKey" in main_code
-    assert 'TextChanged="TimeText_TextChanged"' in main_xaml
-    assert 'RefreshThumbnail("start")' in main_code
-    assert 'RefreshThumbnail("end")' in main_code
-    assert "Select cameras and a destination" in daily_dialog
-    assert "NotifyDownloadFinished" in main_code
-    assert "Download Jobs Are Still Running" in main_code
-    assert "ActiveJobIds" in main_code
-    assert "IsValidExport" in main_code
+    assert {
+        "FullDayCheckBox",
+        "DailyAutomaticCheckBox",
+        "DownloadsGrid",
+        "DailyAutomationsGrid",
+        "ThumbnailPopup",
+    } <= elements.keys()
+    assert elements["FullDayCheckBox"].get("Checked") == "FullDay_Checked"
+    assert elements["DailyAutomaticCheckBox"].get("Checked") == "DailyAutomatic_Checked"
+    assert elements["DownloadsGrid"].get("ItemsSource") == "{Binding DownloadJobs}"
+    assert elements["DailyAutomationsGrid"].get("ItemsSource") == "{Binding DailyAutomationJobs}"
+
+    time_range_columns = [
+        element
+        for element in ET.parse(ROOT / "native-windows" / "MainWindow.xaml").iter()  # noqa: S314
+        if element.tag == f"{XAML_NAMESPACE}DataGridTextColumn" and element.get("Header") == "Time Range"
+    ]
+    assert [column.get("Binding") for column in time_range_columns] == [
+        "{Binding TimeRangeText}",
+        "{Binding TimeRangeText}",
+    ]
 
 
 def test_windows_build_packages_native_app_and_backend() -> None:
     script = (ROOT / "build-windows.ps1").read_text(encoding="utf-8")
-    project = (ROOT / "native-windows" / "TimeLapseNative.csproj").read_text(encoding="utf-8")
+    project = ET.parse(ROOT / "native-windows" / "TimeLapseNative.csproj")  # noqa: S314 - repository-owned XML
     backend_process = (ROOT / "native-windows" / "BackendProcess.cs").read_text(encoding="utf-8")
 
-    assert "dotnet publish" in script
-    assert "timelapse-backend.exe" in script
-    assert "BackendExecutable" in script
-    assert "PublishedFiles.Count -ne 1" in script
-    assert "ConvertFrom-Json" in script
-    assert '$_.id -eq "build-health" -and $_.event -eq "complete"' in script
-    assert "timelapse\\gui.py" not in script
-    assert "EmbeddedResource" in project
-    assert "TimeLapseNative.timelapse-backend.exe" in project
-    assert "GetManifestResourceStream" in backend_process
-    assert "CancellationGracePeriod" in backend_process
-    assert "File.WriteAllText(_cancellationPath" in backend_process
-    assert "CleanupStalePartialExports" in (ROOT / "native-windows" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
-    assert "PySide6" not in project
+    assert all(
+        requirement in script
+        for requirement in (
+            '"--onefile"',
+            '"--exclude-module", "PySide6"',
+            '"id":"build-health","command":"health"',
+            '$_.id -eq "build-health" -and $_.event -eq "complete"',
+            "dotnet publish",
+            "-p:PublishSingleFile=true",
+            '"-p:BackendExecutable=$BuiltBackend"',
+            "PublishedFiles.Count -ne 1",
+        )
+    )
+    resource = project.find("./ItemGroup/EmbeddedResource")
+    assert resource is not None
+    assert resource.get("Include") == "$(BackendExecutable)"
+    assert resource.get("LogicalName") == "TimeLapseNative.timelapse-backend.exe"
+    assert 'EmbeddedBackendName = "TimeLapseNative.timelapse-backend.exe"' in backend_process

@@ -132,15 +132,14 @@ def test_default_output_path_distinguishes_cameras_with_colliding_names() -> Non
     assert second_output.name.startswith("timelapse_Front_Door_")
 
 
-@pytest.mark.parametrize(("content_length", "expected_total"), [("16", 16), (None, None)])
+@pytest.mark.parametrize("content_length", [16, None])
 def test_download_emits_initial_throttled_and_final_progress(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    content_length: str | None,
-    expected_total: int | None,
+    content_length: int | None,
 ) -> None:
     video = b"\x00\x00\x00\x18ftypisomdata"
-    headers = {} if content_length is None else {"Content-Length": str(len(video))}
+    headers = {} if content_length is None else {"Content-Length": str(content_length)}
     response = _FakeResponse(_FakeContent([video[:8], video[8:]]), headers)
     client = cast("ProtectApiClient", _FakeClient(response))
     camera = CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5")
@@ -163,7 +162,7 @@ def test_download_emits_initial_throttled_and_final_progress(
     assert output.read_bytes() == video
     assert response.released is True
     assert [event.downloaded_bytes for event in progress] == [0, len(video), len(video)]
-    assert [event.total_bytes for event in progress] == [expected_total, expected_total, expected_total]
+    assert [event.total_bytes for event in progress] == [content_length, content_length, content_length]
     assert progress[0].elapsed_seconds == 0
     assert progress[0].bytes_per_second == 0
     assert progress[1].bytes_per_second == pytest.approx(80)
@@ -200,7 +199,7 @@ def test_download_cancellation_releases_response_and_removes_partial_file(tmp_pa
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
 
 
-def test_download_does_not_overwrite_output_created_during_export(tmp_path: Path) -> None:
+def test_download_preserves_an_existing_output(tmp_path: Path) -> None:
     output = tmp_path / "existing.mp4"
     output.write_bytes(b"keep me")
     response = _FakeResponse(_FakeContent([b"\x00\x00\x00\x18ftypisomnew data"]), {})

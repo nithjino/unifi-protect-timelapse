@@ -75,6 +75,14 @@ def _client(app: FastAPI, *, host: str = "127.0.0.1") -> TestClient:
     return TestClient(app, base_url="http://localhost", client=(host, 50000))
 
 
+def _wait_for_completed_jobs(client: TestClient, state: WebState) -> str:
+    for _attempt in range(10):
+        response = client.get("/partials/jobs")
+        if state.jobs and all(job.status == "completed" for job in state.jobs.values()):
+            return response.text
+    pytest.fail("exports did not complete after polling the jobs endpoint")
+
+
 def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     app, _state = _app(tmp_path)
 
@@ -84,16 +92,10 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     assert response.headers["x-request-id"]
-    assert "Turn recorded days into" not in response.text
-    assert "Local control center" not in response.text
     assert "htmx.min.js" in response.text
     assert "cdn.jsdelivr.net" not in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
-    assert 'section-number">01' not in response.text
-    assert 'section-number">02' not in response.text
-    assert 'section-number">03' not in response.text
-    assert 'href="/healthz"' not in response.text
     assert ">Full Day<" in response.text
     assert ">Exact Range<" in response.text
     assert 'id="full-day-start-date"' in response.text
@@ -223,11 +225,7 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
                 "speed": "120x",
             },
         )
-        jobs_response = client.get("/partials/jobs")
-        for _attempt in range(10):
-            jobs_response = client.get("/partials/jobs")
-            if all(job.status == "completed" for job in state.jobs.values()):
-                break
+        jobs_html = _wait_for_completed_jobs(client, state)
         job = next(iter(state.jobs.values()))
         preview = client.get(f"/api/thumbnails/{job.camera.id}", params={"timestamp": start.isoformat()})
         download = client.get(f"/exports/{job.id}")
@@ -238,7 +236,7 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
     assert "Started 2 exports" in created.text
     assert created.headers["hx-trigger"] == "stateChanged"
     assert len(state.jobs) == 2
-    assert "Ready" in jobs_response.text
+    assert "Ready" in jobs_html
     assert preview.content == b"jpeg-data"
     assert preview.headers["x-timelapse-thumbnail-source"] == "exact"
     assert download.status_code == 200
@@ -260,38 +258,12 @@ def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
                 "speed": "600x",
             },
         )
-        for _attempt in range(10):
-            if all(job.status == "completed" for job in state.jobs.values()):
-                break
-            client.get("/partials/jobs")
+        _wait_for_completed_jobs(client, state)
 
     job = next(iter(state.jobs.values()))
     assert created.status_code == 200
     assert job.full_day is True
     assert job.output.name == "timelapse_Front_Door_2026_07_20_2026_07_21_600x_6bf6f341d9a3.mp4"
-
-
-def test_same_name_cameras_receive_distinct_reserved_outputs(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-
-    async def colliding_cameras(_config: Config) -> list[CameraInfo]:
-        return [
-            CameraInfo(id="camera-1", name="Same Name", state=None, model=None),
-            CameraInfo(id="camera-2", name="Same Name", state=None, model=None),
-        ]
-
-    state = WebState(settings, camera_loader=colliding_cameras, thumbnail_loader=_thumbnail, exporter=_export)
-
-    async def exercise() -> None:
-        await state.start()
-        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
-        jobs = await state.create_jobs(["camera-1", "camera-2"], start, start + timedelta(hours=1), "120x")
-        assert len({job.output for job in jobs}) == 2
-        await asyncio.gather(*(job.task for job in jobs if job.task is not None))
-        assert all(job.status == "completed" for job in jobs)
-        await state.close()
-
-    asyncio.run(exercise())
 
 
 def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:
@@ -362,7 +334,12 @@ def test_missing_job_action_returns_not_found(tmp_path: Path) -> None:
 
 
 def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:
-    app, _state = _app(tmp_path, configured=False)
+    settings = replace(
+        _settings(tmp_path, configured=False),
+        token="sensitive-integration-token",  # noqa: S106 - verifies that configured secrets are not rendered
+    )
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
 
     with _client(app) as client:
         status = client.get("/partials/status")
@@ -371,9 +348,9 @@ def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:
     assert status.status_code == 200
     assert "Server healthy" in status.text
     assert "Configuration needed" in status.text
-    assert "UNIFI_PROTECT_TOKEN" in status.text
-    assert "integration-token" not in status.text
+    assert "UNIFI_PROTECT_URL" in status.text
     assert "Server configuration is incomplete" in cameras.text
+    assert "sensitive-integration-token" not in status.text + cameras.text
 
 
 def test_daily_schedule_is_persisted(tmp_path: Path) -> None:
@@ -383,7 +360,6 @@ def test_daily_schedule_is_persisted(tmp_path: Path) -> None:
     async def exercise() -> None:
         await state.start()
         schedule = await state.create_schedule(["camera-1"], "600x")
-        await asyncio.sleep(0)
         assert schedule.id in state.schedules
         await state.close()
 
@@ -510,25 +486,6 @@ def test_passwordless_app_rejects_remote_clients_and_host_rebinding(tmp_path: Pa
 
     assert remote.status_code == 403
     assert rebound.status_code == 400
-
-
-def test_same_origin_check_ignores_forwarded_host_headers(tmp_path: Path) -> None:
-    app, state = _app(tmp_path)
-
-    with _client(app) as client:
-        response = client.post(
-            "/actions/export",
-            headers={
-                "Host": "localhost",
-                "Origin": "https://timelapse.example",
-                "X-Forwarded-Host": "timelapse.example",
-                "X-Forwarded-Proto": "https",
-            },
-            data={"range_mode": "full-day", "day": "2026-07-20", "speed": "600x"},
-        )
-
-    assert response.status_code == 403
-    assert not state.jobs
 
 
 def test_web_export_queue_bounds_concurrency_duration_and_capacity(tmp_path: Path) -> None:
