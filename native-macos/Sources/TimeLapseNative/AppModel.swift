@@ -91,6 +91,8 @@ final class AppModel: ObservableObject {
         let speed: String
         let jobID: UUID
         var lastRunDay: Date?
+        var activeDay: Date?
+        var activeJobIDs: Set<UUID>
     }
 
     init() {
@@ -400,7 +402,9 @@ final class AppModel: ObservableObject {
             settings: BackendSettings(settings),
             speed: speed,
             jobID: job.id,
-            lastRunDay: nil
+            lastRunDay: nil,
+            activeDay: nil,
+            activeJobIDs: []
         )
         dailyAutomaticEnabled = true
         showingDailyScheduleSheet = false
@@ -432,6 +436,17 @@ final class AppModel: ObservableObject {
 
     private func runDailyScheduleIfDue() {
         guard var schedule = dailySchedule else { return }
+        if !schedule.activeJobIDs.isEmpty {
+            if schedule.activeJobIDs.contains(where: { downloadProcesses[$0] != nil }) { return }
+            let tracked = jobs.filter { schedule.activeJobIDs.contains($0.id) }
+            let completed = tracked.count == schedule.activeJobIDs.count
+                && tracked.allSatisfy { $0.state == .completed && Self.isValidExport($0.outputURL) }
+            if completed { schedule.lastRunDay = schedule.activeDay }
+            schedule.activeDay = nil
+            schedule.activeJobIDs.removeAll()
+            dailySchedule = schedule
+            if !completed { return }
+        }
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
         let firstDay = schedule.lastRunDay.flatMap { calendar.date(byAdding: .day, value: 1, to: $0) }
@@ -439,10 +454,27 @@ final class AppModel: ObservableObject {
         guard var day = firstDay else { return }
         while day < today {
             guard let end = calendar.date(byAdding: .day, value: 1, to: day) else { break }
+            let missing = schedule.cameras.filter {
+                !Self.isValidExport(Self.expectedOutputURL(
+                    camera: $0,
+                    start: day,
+                    end: end,
+                    speed: schedule.speed,
+                    outputDirectory: schedule.outputDirectory,
+                    daily: true
+                ))
+            }
+            if missing.isEmpty {
+                schedule.lastRunDay = day
+                dailySchedule = schedule
+                day = end
+                continue
+            }
             let group = nextGroupNumber
             nextGroupNumber += 1
-            for camera in schedule.cameras {
-                startDownload(
+            schedule.activeDay = day
+            for camera in missing {
+                let job = startDownload(
                     camera: camera,
                     group: group,
                     start: day,
@@ -452,12 +484,12 @@ final class AppModel: ObservableObject {
                     requestSettings: schedule.settings,
                     daily: true
                 )
+                schedule.activeJobIDs.insert(job.id)
             }
-            schedule.lastRunDay = day
             dailySchedule = schedule
             statusMessage = "Started daily job \(group) for \(Self.calendarDay(day))"
             appendLog(level: "INFO", message: statusMessage)
-            day = end
+            return
         }
     }
 
@@ -733,6 +765,7 @@ final class AppModel: ObservableObject {
         finishShutdownIfReady()
     }
 
+    @discardableResult
     private func startDownload(
         camera: CameraInfo,
         group: Int,
@@ -742,7 +775,7 @@ final class AppModel: ObservableObject {
         outputDirectory: URL,
         requestSettings: BackendSettings,
         daily: Bool = false
-    ) {
+    ) -> DownloadJob {
         let outputURL = reserveOutputURL(
             camera: camera,
             start: start,
@@ -762,6 +795,7 @@ final class AppModel: ObservableObject {
         )
         jobs.append(job)
         launchDownload(job)
+        return job
     }
 
     private func launchDownload(_ job: DownloadJob) {

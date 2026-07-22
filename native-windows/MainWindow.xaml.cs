@@ -57,6 +57,8 @@ public partial class MainWindow : Window
         public required string Speed { get; init; }
         public required DownloadJob Job { get; init; }
         public DateTime? LastRunDay { get; set; }
+        public DateTime? ActiveDay { get; set; }
+        public HashSet<Guid> ActiveJobIds { get; } = [];
     }
 
     public MainWindow()
@@ -503,13 +505,36 @@ public partial class MainWindow : Window
     {
         var schedule = _dailySchedule;
         if (schedule is null) return;
+        if (schedule.ActiveJobIds.Count > 0)
+        {
+            if (schedule.ActiveJobIds.Any(_downloadProcesses.ContainsKey)) return;
+            var tracked = DownloadJobs.Where(job => schedule.ActiveJobIds.Contains(job.Id)).ToList();
+            var completed = tracked.Count == schedule.ActiveJobIds.Count
+                && tracked.All(job => job.State == DownloadState.Completed && IsValidExport(job.OutputPath));
+            if (completed) schedule.LastRunDay = schedule.ActiveDay;
+            schedule.ActiveDay = null;
+            schedule.ActiveJobIds.Clear();
+            if (!completed) return;
+        }
         var today = DateTime.Today;
         var day = schedule.LastRunDay?.AddDays(1) ?? today.AddDays(-1);
         while (day < today)
         {
+            var missing = schedule.Cameras
+                .Where(camera => !IsValidExport(ExpectedOutputPath(
+                    camera, day, day.AddDays(1), schedule.Speed, schedule.OutputDirectory, daily: true)))
+                .ToList();
+            if (missing.Count == 0)
+            {
+                schedule.LastRunDay = day;
+                day = day.AddDays(1);
+                continue;
+            }
             var group = _nextGroupNumber++;
-            foreach (var camera in schedule.Cameras)
-                StartDownload(
+            schedule.ActiveDay = day;
+            foreach (var camera in missing)
+            {
+                var job = StartDownload(
                     camera,
                     group,
                     day,
@@ -518,10 +543,11 @@ public partial class MainWindow : Window
                     schedule.OutputDirectory,
                     daily: true,
                     requestSettings: schedule.Settings);
-            schedule.LastRunDay = day;
+                schedule.ActiveJobIds.Add(job.Id);
+            }
             StatusText.Text = $"Started daily job {group} for {day:yyyy-MM-dd}";
             AppendLog("INFO", StatusText.Text);
-            day = day.AddDays(1);
+            return;
         }
     }
 
@@ -672,7 +698,7 @@ public partial class MainWindow : Window
         AppendLog("INFO", StatusText.Text);
     }
 
-    private void StartDownload(
+    private DownloadJob StartDownload(
         CameraInfo camera,
         int group,
         DateTime start,
@@ -695,6 +721,7 @@ public partial class MainWindow : Window
         DownloadJobs.Add(job);
         UpdateDownloadsDisplay();
         _ = LaunchDownloadAsync(job);
+        return job;
     }
 
     private async Task LaunchDownloadAsync(DownloadJob job)

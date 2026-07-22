@@ -336,6 +336,7 @@ class _DownloadEntry:
     terminal: bool = False
     completed: bool = False
     daily_schedule: bool = False
+    scheduled_day: date | None = None
 
     @property
     def camera_name(self) -> str:
@@ -362,6 +363,7 @@ class _DailySchedule:
     speed: str
     entry: _DownloadEntry
     last_run_day: date | None = None
+    active_day: date | None = None
 
 
 class _LogEmitter(QObject):
@@ -1805,24 +1807,51 @@ class _MainWindow(QMainWindow):
         schedule = self._daily_schedule
         if schedule is None:
             return
+        if schedule.active_day is not None:
+            active = any(
+                entry.scheduled_day == schedule.active_day and entry.worker in self._workers for entry in self._entries
+            )
+            if active:
+                return
+            active_config = config_for_local_day(schedule.entry.config, schedule.active_day)
+            if all(
+                self._valid_export(daily_output_path(active_config, camera, schedule.output_directory))
+                for camera in schedule.cameras
+            ):
+                schedule.last_run_day = schedule.active_day
+            schedule.active_day = None
+
         latest_day = latest_complete_local_day()
         day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day is not None else latest_day
-        if day > latest_day:
-            return
         while day <= latest_day:
-            schedule.last_run_day = day
             config = config_for_local_day(schedule.entry.config, day)
+            missing = [
+                camera
+                for camera in schedule.cameras
+                if not self._valid_export(daily_output_path(config, camera, schedule.output_directory))
+            ]
+            if not missing:
+                schedule.last_run_day = day
+                day += timedelta(days=1)
+                continue
             job_number = self._next_job_number
             self._next_job_number += 1
-            for camera in schedule.cameras:
+            started = 0
+            for camera in missing:
                 preferred = daily_output_path(config, camera, schedule.output_directory)
-                output = self._reserve_output_path(preferred)
+                if not self._reserve_daily_output_path(preferred):
+                    continue
+                output = preferred.resolve()
                 worker = _DownloadWorker(config, camera, output, self)
                 entry = self._add_download_row(job_number, camera, output, worker, config=config)
+                entry.scheduled_day = day
                 self._start_download_worker(entry, worker)
+                started += 1
                 _LOGGER.info("Started daily camera download: %s -> %s", camera.name, output)
-            self.statusBar().showMessage(f"Started daily job {job_number} for {day.isoformat()}")
-            day += timedelta(days=1)
+            schedule.active_day = day
+            if started:
+                self.statusBar().showMessage(f"Started daily job {job_number} for {day.isoformat()}")
+            return
         self._update_activity_indicator()
 
     @Slot()
@@ -1861,6 +1890,21 @@ class _MainWindow(QMainWindow):
             counter += 1
         self._reserved_paths.add(self._reservation_key(candidate))
         return candidate
+
+    def _reserve_daily_output_path(self, preferred: Path) -> bool:
+        candidate = preferred.resolve()
+        key = self._reservation_key(candidate)
+        if candidate.exists() or key in self._reserved_paths:
+            return False
+        self._reserved_paths.add(key)
+        return True
+
+    @staticmethod
+    def _valid_export(path: Path) -> bool:
+        try:
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
 
     @staticmethod
     def _reservation_key(path: Path) -> str:

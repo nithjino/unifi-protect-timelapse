@@ -189,6 +189,40 @@ def test_daily_schedule_adds_list_row_and_daily_downloads(
     assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Stopped"
 
 
+def test_daily_schedule_retries_only_missing_cameras_before_advancing(
+    main_window: gui_module._MainWindow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cameras = (
+        CameraInfo(id="camera-1", name="Same Name", state=None, model=None),
+        CameraInfo(id="camera-2", name="Same Name", state=None, model=None),
+    )
+    schedule_entry = main_window._add_daily_schedule_row(cameras, tmp_path)
+    schedule = gui_module._DailySchedule(cameras, tmp_path, "600x", schedule_entry)
+    main_window._daily_schedule = schedule
+    started: list[gui_module._DownloadEntry] = []
+    monkeypatch.setattr(gui_module, "latest_complete_local_day", lambda: date(2026, 7, 12))
+    monkeypatch.setattr(main_window, "_start_download_worker", lambda entry, _worker: started.append(entry))
+
+    main_window._run_daily_schedule_if_due()
+    assert len(started) == 2
+    assert started[0].output != started[1].output
+    assert schedule.last_run_day is None
+
+    started[0].output.write_bytes(b"video")
+    main_window._reserved_paths.clear()
+    main_window._run_daily_schedule_if_due()
+    assert len(started) == 3
+    assert started[2].camera.id == "camera-2"
+    assert schedule.last_run_day is None
+
+    started[2].output.write_bytes(b"video")
+    main_window._reserved_paths.clear()
+    main_window._run_daily_schedule_if_due()
+    assert schedule.last_run_day == date(2026, 7, 12)
+
+
 def test_logs_button_opens_separate_window_and_displays_logs(
     main_window: gui_module._MainWindow,
     qtbot: QtBot,

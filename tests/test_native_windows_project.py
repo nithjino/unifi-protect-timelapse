@@ -42,6 +42,8 @@ def test_windows_native_gui_includes_full_day_and_daily_controls() -> None:
     assert "Select cameras and a destination" in daily_dialog
     assert "NotifyDownloadFinished" in main_code
     assert "Download Jobs Are Still Running" in main_code
+    assert "ActiveJobIds" in main_code
+    assert "IsValidExport" in main_code
 
 
 def test_windows_build_packages_native_app_and_backend() -> None:
