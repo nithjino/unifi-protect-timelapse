@@ -8,7 +8,7 @@ import ipaddress
 import logging
 import os
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -36,6 +36,7 @@ from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebS
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from types import FrameType
 
     from starlette.datastructures import FormData
 
@@ -44,6 +45,7 @@ TEMPLATES_DIR = PACKAGE_DIR / "templates"
 STATIC_DIR = PACKAGE_DIR / "static"
 KIBIBYTE = 1024
 SSE_KEEPALIVE_TICKS = 30
+GRACEFUL_SHUTDOWN_SECONDS = 1
 SECONDS_PER_HOUR = 60 * 60
 SESSION_COOKIE = "timelapse_session"
 LOGIN_FAILURE_LIMIT = 5
@@ -55,6 +57,18 @@ NEXT_QUERY = Annotated[str | None, Query(alias="next")]
 _LOGGER = logging.getLogger(__name__)
 
 load_dotenv(override=False)
+
+
+class _ShutdownAwareServer(uvicorn.Server):
+    """Notify application streams before Uvicorn drains connections."""
+
+    def __init__(self, config: uvicorn.Config, shutdown_requested: asyncio.Event) -> None:
+        super().__init__(config)
+        self._shutdown_requested = shutdown_requested
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        self._shutdown_requested.set()
+        super().handle_exit(sig, frame)
 
 
 def _format_bytes(value: int | None) -> str:
@@ -319,6 +333,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     """Build an application, allowing isolated state injection in tests."""
     configured_settings = settings or WebSettings.from_environment()
     web_state = state or WebState(configured_settings)
+    shutdown_requested = asyncio.Event()
     session_seconds = configured_settings.web_session_hours * SECONDS_PER_HOUR
     sessions = _SessionStore(session_seconds)
     login_throttle = _LoginThrottle()
@@ -344,6 +359,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     )
     application.state.web = web_state
     application.state.sessions = sessions
+    application.state.shutdown_requested = shutdown_requested
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     templates = Jinja2Templates(directory=TEMPLATES_DIR)
@@ -665,7 +681,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         async def stream() -> AsyncIterator[str]:
             last_version = -1
             idle_ticks = 0
-            while not await request.is_disconnected():
+            while not shutdown_requested.is_set() and not await request.is_disconnected():
                 if web_state.version != last_version:
                     last_version = web_state.version
                     idle_ticks = 0
@@ -673,7 +689,8 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
                 elif idle_ticks >= SSE_KEEPALIVE_TICKS:
                     idle_ticks = 0
                     yield ": keep-alive\n\n"
-                await asyncio.sleep(0.5)
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(shutdown_requested.wait(), timeout=0.5)
                 idle_ticks += 1
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -698,12 +715,15 @@ def main() -> None:
     if not _is_loopback_host(host) and settings.web_password is None:
         message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
         raise SystemExit(message)
-    uvicorn.run(
+    config = uvicorn.Config(
         "timelapse.web:app",
         host=host,
         port=_environment_port(),
         proxy_headers=True,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
     )
+    with suppress(KeyboardInterrupt):
+        _ShutdownAwareServer(config, app.state.shutdown_requested).run()
 
 
 def _environment_port() -> int:

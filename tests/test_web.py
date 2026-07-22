@@ -20,6 +20,7 @@ from timelapse.web_state import DailySchedule, WebCapacityError, WebSettings, We
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import uvicorn
     from fastapi import FastAPI
 
     from timelapse.config import Config
@@ -444,6 +445,27 @@ def test_network_binding_requires_web_password(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(SystemExit, match="TIMELAPSE_WEB_PASSWORD is required"):
         main()
+
+
+def test_web_server_bounds_graceful_shutdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    launched: list[uvicorn.Server] = []
+
+    def run_server(server: uvicorn.Server) -> None:
+        launched.append(server)
+
+    monkeypatch.setenv("TIMELAPSE_WEB_HOST", "127.0.0.1")
+    monkeypatch.setenv("TIMELAPSE_WEB_PORT", "8765")
+    monkeypatch.delenv("TIMELAPSE_WEB_PASSWORD", raising=False)
+    monkeypatch.setattr("timelapse.web._ShutdownAwareServer.run", run_server)
+
+    main()
+
+    assert len(launched) == 1
+    config = launched[0].config
+    assert config.app == "timelapse.web:app"
+    assert config.host == "127.0.0.1"
+    assert config.port == 8765
+    assert config.timeout_graceful_shutdown == 1
 
 
 def test_passwordless_app_rejects_remote_clients_and_host_rebinding(tmp_path: Path) -> None:
