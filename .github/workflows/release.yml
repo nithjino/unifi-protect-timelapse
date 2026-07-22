@@ -37,7 +37,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent dist/macos/timelapse.app "${archive}"
 
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-macos
           path: dist/macos/TimeLapse-*.zip
@@ -76,7 +76,7 @@ jobs:
             -Destination "dist/windows/TimeLapse-$env:GITHUB_REF_NAME-windows-x64.exe"
 
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-windows
           path: dist/windows/TimeLapse-*.exe
@@ -122,7 +122,7 @@ jobs:
             "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
 
       - name: Upload Linux artifacts
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux
           path: |
@@ -144,7 +144,7 @@ jobs:
 
     steps:
       - name: Download release artifacts
-        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: release-assets
           merge-multiple: true
@@ -156,6 +156,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "${GITHUB_REF_NAME}" \
             release-assets/TimeLapse-* \
