@@ -12,3 +12,4 @@ dist/
 data/
 /native-windows/bin/
 /native-windows/obj/
+CODE_REVIEW*.md
