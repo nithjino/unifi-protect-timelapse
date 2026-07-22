@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import hashlib
+import json
 import logging
+import random
+import secrets
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 from timelapse import TimelapseError
@@ -21,6 +25,12 @@ from timelapse.schedule import (
     seconds_until_next_local_day,
 )
 from timelapse.service import export_timelapse, list_available_cameras
+
+DAILY_CHECKPOINT_VERSION = 1
+DAILY_RETRY_INITIAL_SECONDS = 30.0
+DAILY_RETRY_MAX_SECONDS = 15 * 60.0
+DAILY_RETRY_MAX_ATTEMPTS = 5
+DAILY_RETRY_JITTER_RATIO = 0.2
 
 
 def _choose_camera(cameras: list[CameraInfo]) -> CameraInfo:
@@ -121,7 +131,10 @@ async def _run_daily(config: Config, camera: CameraInfo) -> None:
         message = f"daily output must be a directory: {output_directory}"
         raise TimelapseError(message)
 
-    day = latest_complete_local_day()
+    checkpoint = _daily_checkpoint_path(output_directory, camera, config.speed)
+    day = _load_daily_checkpoint(checkpoint) or latest_complete_local_day()
+    _save_daily_checkpoint(checkpoint, day)
+    failures = 0
     while True:
         today = latest_complete_local_day() + timedelta(days=1)
         if day < today:
@@ -131,14 +144,75 @@ async def _run_daily(config: Config, camera: CameraInfo) -> None:
                 _write_stdout(f"Skipping {day.isoformat()}; output already exists: {output}\n")
             else:
                 _write_stdout(f"Creating daily timelapse for {day.isoformat()}.\n")
-                await _export(daily_config, camera, output)
+                try:
+                    await _export(daily_config, camera, output)
+                except Exception as exc:
+                    failures += 1
+                    if failures >= DAILY_RETRY_MAX_ATTEMPTS:
+                        message = (
+                            f"daily export for {day.isoformat()} failed after {failures} attempts: {exc}. "
+                            "Keep the checkpoint file and use a service manager to restart unattended daily exports."
+                        )
+                        raise TimelapseError(message) from exc
+                    base_delay = min(
+                        DAILY_RETRY_INITIAL_SECONDS * 2 ** (failures - 1),
+                        DAILY_RETRY_MAX_SECONDS,
+                    )
+                    delay = base_delay + random.uniform(  # noqa: S311 - retry jitter is not security-sensitive
+                        0,
+                        base_delay * DAILY_RETRY_JITTER_RATIO,
+                    )
+                    _write_stderr(
+                        f"Daily export for {day.isoformat()} failed (attempt {failures}/{DAILY_RETRY_MAX_ATTEMPTS}): "
+                        f"{exc}. Retrying in {delay:.0f} seconds.\n"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 _write_stdout(f"Saved daily timelapse to {output}\n")
+            failures = 0
             day += timedelta(days=1)
+            _save_daily_checkpoint(checkpoint, day)
             continue
 
         delay = seconds_until_next_local_day()
         _write_stdout(f"Waiting for the current local day to finish ({delay / 3600:.1f} hours).\n")
         await asyncio.sleep(delay)
+
+
+def _daily_checkpoint_path(output_directory: Path, camera: CameraInfo, speed: str) -> Path:
+    identity = f"{camera.id}\0{speed}".encode()
+    digest = hashlib.sha256(identity).hexdigest()[:12]
+    return output_directory / f".timelapse-daily-{digest}.json"
+
+
+def _load_daily_checkpoint(checkpoint: Path) -> date | None:
+    if not checkpoint.exists():
+        return None
+    try:
+        payload = json.loads(checkpoint.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("version") != DAILY_CHECKPOINT_VERSION:
+            raise ValueError  # noqa: TRY301 - malformed checkpoint follows the single recovery path below
+        next_day = payload.get("next_day")
+        if not isinstance(next_day, str):
+            raise TypeError  # noqa: TRY301 - malformed checkpoint follows the single recovery path below
+        return date.fromisoformat(next_day)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        message = f"could not load daily checkpoint {checkpoint}: {exc}"
+        raise TimelapseError(message) from exc
+
+
+def _save_daily_checkpoint(checkpoint: Path, day: date) -> None:
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    temporary = checkpoint.with_name(f".{checkpoint.name}.{secrets.token_hex(6)}.tmp")
+    payload = {"version": DAILY_CHECKPOINT_VERSION, "next_day": day.isoformat()}
+    try:
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        temporary.replace(checkpoint)
+    except OSError as exc:
+        message = f"could not persist daily checkpoint {checkpoint}: {exc}"
+        raise TimelapseError(message) from exc
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _print_progress(progress: DownloadProgress) -> None:

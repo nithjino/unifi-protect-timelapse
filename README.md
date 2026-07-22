@@ -178,7 +178,9 @@ uv run timelapse \
   --output ./daily-timelapses
 ```
 
-If a daily output already exists, it is skipped. Stop the scheduler with `Ctrl+C`.
+If a daily output already exists, it is skipped. The scheduler stores a small checkpoint in the output directory and
+retries a failed day up to five times with capped exponential backoff. For unattended use, run the command under a
+service manager so it restarts after the retry limit is reached. Stop the scheduler with `Ctrl+C`.
 
 ### Override connection settings
 
