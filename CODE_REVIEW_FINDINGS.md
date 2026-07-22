@@ -180,7 +180,7 @@ Several form/action routes catch broad exceptions and render an error fragment w
 
 **Recommendation:** Catch expected domain exceptions narrowly and map them to `4xx`/`5xx` responses. Let unexpected exceptions reach centralized logging/error middleware with a correlation ID.
 
-### LOW-4: The Windows export action does not handle destination-directory creation failures
+### ~~LOW-4: The Windows export action does not handle destination-directory creation failures~~ — Resolved
 
 **Affected code:** `native-windows/MainWindow.xaml.cs:644-670`
 

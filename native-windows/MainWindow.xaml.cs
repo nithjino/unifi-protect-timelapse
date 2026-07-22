@@ -455,8 +455,7 @@ public partial class MainWindow : Window
         if (_cameras.Count == 0) { SetDailyToggle(false); return; }
         var dialog = new DailyScheduleDialog(_cameras, _outputDirectory) { Owner = this };
         if (dialog.ShowDialog() != true) { SetDailyToggle(false); return; }
-        try { Directory.CreateDirectory(dialog.OutputDirectory); }
-        catch (Exception exception) { ShowError("Could Not Create Output Folder", exception.Message); SetDailyToggle(false); return; }
+        if (!TryEnsureOutputDirectory(dialog.OutputDirectory)) { SetDailyToggle(false); return; }
         ConfigureDailySchedule(dialog.SelectedCameras, dialog.OutputDirectory);
     }
 
@@ -679,8 +678,7 @@ public partial class MainWindow : Window
             return;
         }
         if (end <= start) { ShowMessage("Invalid Date Range", "The end date and time must be after the start."); return; }
-        if (File.Exists(_outputDirectory)) { ShowMessage("Invalid Output Folder", "The selected output location is not a folder."); return; }
-        Directory.CreateDirectory(_outputDirectory);
+        if (!TryEnsureOutputDirectory(_outputDirectory)) return;
         var speed = (SpeedCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "600x";
         var group = _nextGroupNumber++;
         var selected = _cameras.Where(camera => _selectedCameraIds.Contains(camera.Id)).ToList();
@@ -696,6 +694,27 @@ public partial class MainWindow : Window
                 requestSettings: _selectedProfile.Settings);
         StatusText.Text = $"Started job {group} with {selected.Count} downloads";
         AppendLog("INFO", StatusText.Text);
+    }
+
+    private bool TryEnsureOutputDirectory(string outputDirectory)
+    {
+        if (File.Exists(outputDirectory))
+        {
+            ShowMessage("Invalid Output Folder", "The selected output location is not a folder.");
+            return false;
+        }
+        try
+        {
+            Directory.CreateDirectory(outputDirectory);
+            return true;
+        }
+        catch (Exception exception)
+        {
+            ShowError(
+                "Could Not Create Output Folder",
+                $"Windows could not create or access the selected output folder. Choose a writable folder and try again.\n\n{exception.Message}");
+            return false;
+        }
     }
 
     private DownloadJob StartDownload(
