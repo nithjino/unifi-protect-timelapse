@@ -30,7 +30,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
 from timelapse.config import SPEED_TO_FPS
-from timelapse.web_state import DailySchedule, ExportJob, WebSettings, WebState
+from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -373,11 +373,18 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             return _add_security_headers(RedirectResponse(login_url, status_code=303))
         return _add_security_headers(await call_next(request))
 
-    def message_response(request: Request, message: str, *, kind: str = "success") -> HTMLResponse:
+    def message_response(
+        request: Request,
+        message: str,
+        *,
+        kind: str = "success",
+        status_code: int = 200,
+    ) -> HTMLResponse:
         response = templates.TemplateResponse(
             request=request,
             name="partials/message.html",
             context={"message": message, "kind": kind},
+            status_code=status_code,
         )
         response.headers["HX-Trigger"] = "stateChanged"
         return response
@@ -533,8 +540,10 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             start, end = _parse_export_range(form)
             speed = _parse_speed(form)
             created = await web_state.create_jobs(camera_ids, start, end, speed)
-        except Exception as exc:
-            return message_response(request, str(exc) or type(exc).__name__, kind="error")
+        except WebCapacityError as exc:
+            return message_response(request, str(exc), kind="error", status_code=429)
+        except ValueError as exc:
+            return message_response(request, str(exc), kind="error", status_code=400)
         noun = "export" if len(created) == 1 else "exports"
         return message_response(request, f"Started {len(created)} {noun}.")
 
@@ -564,8 +573,10 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     async def retry_job(request: Request, job_id: JOB_ID) -> Response:
         try:
             await web_state.retry_job(job_id)
+        except WebCapacityError as exc:
+            return message_response(request, str(exc), kind="error", status_code=429)
         except ValueError as exc:
-            return message_response(request, str(exc), kind="error")
+            return message_response(request, str(exc), kind="error", status_code=400)
         return message_response(request, "Export queued again.")
 
     @application.delete("/actions/schedules/{schedule_id}", response_class=HTMLResponse)

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
+import random
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -14,7 +16,7 @@ from pathlib import Path
 from typing import Literal, cast
 
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
-from timelapse.download import DownloadProgress, default_output_path
+from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
 from timelapse.schedule import daily_output_path, latest_complete_local_day
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
@@ -24,10 +26,23 @@ TERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset({"completed", "failed", 
 ALL_JOB_STATUSES: frozenset[JobStatus] = frozenset({"queued", "running", *TERMINAL_JOB_STATUSES})
 CAMERA_CACHE_SECONDS = 60.0
 MAX_VISIBLE_JOBS = 100
+SCHEDULE_STATE_VERSION = 1
+DEFAULT_MAX_ACTIVE_EXPORTS = 4
+DEFAULT_MAX_QUEUED_EXPORTS = 20
+DEFAULT_MAX_EXPORT_HOURS = 24 * 7
+DEFAULT_STORAGE_QUOTA_MIB = 100 * 1024
+SCHEDULE_RETRY_INITIAL_SECONDS = 60.0
+SCHEDULE_RETRY_MAX_SECONDS = 60.0 * 60
+SCHEDULE_RETRY_MAX_FAILURES = 5
+_LOGGER = logging.getLogger(__name__)
 
 CameraLoader = Callable[[Config], Awaitable[list[CameraInfo]]]
 ThumbnailLoader = Callable[[Config, CameraInfo, datetime], Awaitable[CameraThumbnail]]
 Exporter = Callable[[Config, CameraInfo, Path, Callable[[DownloadProgress], None] | None], Awaitable[None]]
+
+
+class WebCapacityError(ValueError):
+    """The bounded web export queue or storage budget is full."""
 
 
 def _environment_integer(name: str, default: int) -> int:
@@ -37,6 +52,10 @@ def _environment_integer(name: str, default: int) -> int:
     except ValueError:
         return default
     return max(value, 0)
+
+
+def _environment_positive_integer(name: str, default: int) -> int:
+    return max(_environment_integer(name, default), 1)
 
 
 def _environment_boolean(name: str, *, default: bool) -> bool:
@@ -96,6 +115,10 @@ class WebSettings:
     web_cookie_secure: bool = False
     web_host: str = "127.0.0.1"
     web_trusted_hosts: tuple[str, ...] = ()
+    web_max_active_exports: int = DEFAULT_MAX_ACTIVE_EXPORTS
+    web_max_queued_exports: int = DEFAULT_MAX_QUEUED_EXPORTS
+    web_max_export_hours: int = DEFAULT_MAX_EXPORT_HOURS
+    web_storage_quota_mib: int = DEFAULT_STORAGE_QUOTA_MIB
 
     @classmethod
     def from_environment(cls) -> WebSettings:
@@ -127,6 +150,16 @@ class WebSettings:
             web_cookie_secure=_environment_boolean("TIMELAPSE_WEB_COOKIE_SECURE", default=False),
             web_host=web_host,
             web_trusted_hosts=web_trusted_hosts,
+            web_max_active_exports=_environment_positive_integer(
+                "TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS", DEFAULT_MAX_ACTIVE_EXPORTS
+            ),
+            web_max_queued_exports=_environment_integer("TIMELAPSE_WEB_MAX_QUEUED_EXPORTS", DEFAULT_MAX_QUEUED_EXPORTS),
+            web_max_export_hours=_environment_positive_integer(
+                "TIMELAPSE_WEB_MAX_EXPORT_HOURS", DEFAULT_MAX_EXPORT_HOURS
+            ),
+            web_storage_quota_mib=_environment_positive_integer(
+                "TIMELAPSE_WEB_STORAGE_QUOTA_MIB", DEFAULT_STORAGE_QUOTA_MIB
+            ),
         )
 
     @property
@@ -212,6 +245,9 @@ class DailySchedule:
     created_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
     last_run_day: date | None = None
     last_error: str | None = None
+    failure_count: int = 0
+    next_retry_at: datetime | None = None
+    paused: bool = False
     task: asyncio.Task[None] | None = field(default=None, repr=False)
 
 
@@ -237,6 +273,9 @@ class WebState:
         self._cameras: list[CameraInfo] = []
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
+        self._export_semaphore = asyncio.Semaphore(settings.web_max_active_exports)
+        self._job_mutation_lock = asyncio.Lock()
+        self._schedule_mutation_lock = asyncio.Lock()
         self._reserved_output_paths: set[str] = set()
         self._schedule_persist_lock = asyncio.Lock()
         self._job_persist_lock = asyncio.Lock()
@@ -304,20 +343,65 @@ class WebState:
         *,
         daily: bool = False,
     ) -> list[ExportJob]:
-        """Create one concurrent export job per selected camera."""
+        """Durably queue one bounded export job per selected camera."""
         if end <= start:
             message = "End time must be after start time."
             raise ValueError(message)
+        maximum_duration = timedelta(hours=self.settings.web_max_export_hours)
+        if end - start > maximum_duration:
+            message = f"Exports are limited to {self.settings.web_max_export_hours} hours."
+            raise WebCapacityError(message)
         cameras = await self.cameras()
         by_id = {camera.id: camera for camera in cameras}
         selected = [by_id[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in by_id]
         if not selected:
             message = "Select at least one available camera."
             raise ValueError(message)
+        async with self._job_mutation_lock:
+            await self._ensure_export_capacity(len(selected))
+            jobs, planned_keys = self._plan_export_jobs(selected, start, end, speed, daily=daily)
+            previous_jobs = dict(self.jobs)
+            previous_reservations = set(self._reserved_output_paths)
+            self._reserved_output_paths.update(planned_keys)
+            self.jobs.update((job.id, job) for job in jobs)
+            self._trim_jobs()
+            try:
+                await self._persist_jobs()
+            except Exception:
+                self.jobs = previous_jobs
+                self._reserved_output_paths = previous_reservations
+                raise
+
+            started_tasks: list[asyncio.Task[None]] = []
+            try:
+                for job in jobs:
+                    job.task = asyncio.create_task(self._run_job(job), name=f"export-{job.id}")
+                    started_tasks.append(job.task)
+            except Exception:
+                for task in started_tasks:
+                    task.cancel()
+                if started_tasks:
+                    await asyncio.gather(*started_tasks, return_exceptions=True)
+                self.jobs = previous_jobs
+                self._reserved_output_paths = previous_reservations
+                await self._persist_jobs()
+                raise
+            self._changed()
+            return jobs
+
+    def _plan_export_jobs(
+        self,
+        cameras: list[CameraInfo],
+        start: datetime,
+        end: datetime,
+        speed: str,
+        *,
+        daily: bool,
+    ) -> tuple[list[ExportJob], set[str]]:
         base_config = self.settings.config(start, end, speed, daily=daily)
-        planned_outputs: list[tuple[CameraInfo, Path]] = []
+        jobs: list[ExportJob] = []
         planned_keys: set[str] = set()
-        for camera in selected:
+        for camera in cameras:
             output = self.settings.output_dir / default_output_path(base_config, camera).name
             if daily:
                 output = daily_output_path(base_config, camera, self.settings.output_dir)
@@ -329,27 +413,18 @@ class WebState:
                 message = f"An export is already writing {output.name}."
                 raise ValueError(message)
             planned_keys.add(key)
-            planned_outputs.append((camera, output))
-
-        self._reserved_output_paths.update(planned_keys)
-        jobs: list[ExportJob] = []
-        for camera, output in planned_outputs:
-            job = ExportJob(
-                id=secrets.token_urlsafe(9),
-                camera=camera,
-                start=start,
-                end=end,
-                speed=speed,
-                output=output,
-                daily=daily,
+            jobs.append(
+                ExportJob(
+                    id=secrets.token_urlsafe(9),
+                    camera=camera,
+                    start=start,
+                    end=end,
+                    speed=speed,
+                    output=output,
+                    daily=daily,
+                )
             )
-            self.jobs[job.id] = job
-            job.task = asyncio.create_task(self._run_job(job), name=f"export-{job.id}")
-            jobs.append(job)
-        self._trim_jobs()
-        self._changed()
-        await self._persist_jobs()
-        return jobs
+        return jobs, planned_keys
 
     async def cancel_or_remove_job(self, job_id: str) -> str:
         """Cancel an active job or remove a terminal job from the list."""
@@ -358,9 +433,14 @@ class WebState:
             message = "That export is no longer in the job list."
             raise ValueError(message)
         if job.terminal:
-            del self.jobs[job_id]
-            self._changed()
-            await self._persist_jobs()
+            async with self._job_mutation_lock:
+                del self.jobs[job_id]
+                try:
+                    await self._persist_jobs()
+                except Exception:
+                    self.jobs[job_id] = job
+                    raise
+                self._changed()
             return "removed"
         if job.task is not None:
             job.task.cancel()
@@ -391,47 +471,82 @@ class WebState:
 
     async def remove_schedule(self, schedule_id: str) -> None:
         """Stop and remove a persistent daily schedule."""
-        schedule = self.schedules.pop(schedule_id, None)
-        if schedule is None:
-            message = "That daily schedule no longer exists."
-            raise ValueError(message)
-        if schedule.task is not None:
-            schedule.task.cancel()
-        await self._persist_schedules()
-        self._changed()
+        async with self._schedule_mutation_lock:
+            schedule = self.schedules.pop(schedule_id, None)
+            if schedule is None:
+                message = "That daily schedule no longer exists."
+                raise ValueError(message)
+            try:
+                await self._persist_schedules()
+            except Exception:
+                self.schedules[schedule_id] = schedule
+                raise
+            if schedule.task is not None:
+                schedule.task.cancel()
+            self._changed()
+
+    async def retry_schedule(self, schedule_id: str) -> DailySchedule:
+        """Resume a paused daily schedule after operator intervention."""
+        async with self._schedule_mutation_lock:
+            schedule = self.schedules.get(schedule_id)
+            if schedule is None:
+                message = "That daily schedule no longer exists."
+                raise ValueError(message)
+            if not schedule.paused:
+                message = "That daily schedule is already active."
+                raise ValueError(message)
+            previous = (schedule.failure_count, schedule.next_retry_at, schedule.paused, schedule.last_error)
+            schedule.failure_count = 0
+            schedule.next_retry_at = None
+            schedule.paused = False
+            schedule.last_error = None
+            try:
+                await self._persist_schedules()
+                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
+            except Exception:
+                schedule.failure_count, schedule.next_retry_at, schedule.paused, schedule.last_error = previous
+                await self._persist_schedules()
+                raise
+            self._changed()
+            return schedule
 
     async def _run_job(self, job: ExportJob) -> None:
         try:
-            job.status = "running"
-            job.started_at = datetime.now().astimezone()
-            self._changed()
-            if job.output.exists():
-                valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
-                job.status = "skipped" if job.daily and valid_existing_export else "failed"
-                job.error = "A file already exists for this camera and time range."
-                job.finished_at = datetime.now().astimezone()
-                self._changed()
-                await self._persist_jobs()
-                return
-
-            config = self.settings.config(job.start, job.end, job.speed, daily=job.daily)
-
-            def report_progress(progress: DownloadProgress) -> None:
-                job.downloaded_bytes = progress.downloaded_bytes
-                job.total_bytes = progress.total_bytes
-                job.bytes_per_second = progress.bytes_per_second
-                job.elapsed_seconds = progress.elapsed_seconds
-                self._changed()
-
             try:
-                await self._exporter(config, job.camera, job.output, report_progress)
+                async with self._export_semaphore:
+                    job.status = "running"
+                    job.started_at = datetime.now().astimezone()
+                    self._changed()
+                    await self._persist_jobs()
+                    if job.output.exists():
+                        valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
+                        job.status = "skipped" if job.daily and valid_existing_export else "failed"
+                        job.error = "A file already exists for this camera and time range."
+                        return
+
+                    config = self.settings.config(job.start, job.end, job.speed, daily=job.daily)
+
+                    def report_progress(progress: DownloadProgress) -> None:
+                        job.downloaded_bytes = progress.downloaded_bytes
+                        job.total_bytes = progress.total_bytes
+                        job.bytes_per_second = progress.bytes_per_second
+                        job.elapsed_seconds = progress.elapsed_seconds
+                        self._changed()
+
+                    try:
+                        await self._exporter(config, job.camera, job.output, report_progress)
+                    except asyncio.CancelledError:
+                        job.status = "cancelled"
+                    except Exception as exc:
+                        job.status = "failed"
+                        job.error = str(exc) or type(exc).__name__
+                    else:
+                        job.status = "completed"
             except asyncio.CancelledError:
                 job.status = "cancelled"
             except Exception as exc:
                 job.status = "failed"
                 job.error = str(exc) or type(exc).__name__
-            else:
-                job.status = "completed"
             finally:
                 job.finished_at = datetime.now().astimezone()
                 self._changed()
@@ -479,6 +594,47 @@ class WebState:
                 await asyncio.sleep(max((next_midnight - now).total_seconds(), 1.0))
         except asyncio.CancelledError:
             return
+
+    async def _record_schedule_failure(self, schedule: DailySchedule, error: str) -> float | None:
+        schedule.failure_count += 1
+        if schedule.failure_count >= SCHEDULE_RETRY_MAX_FAILURES:
+            schedule.paused = True
+            schedule.next_retry_at = None
+            schedule.last_error = f"{error} Paused after {schedule.failure_count} failed attempts."
+            delay = None
+        else:
+            base_delay = min(
+                SCHEDULE_RETRY_INITIAL_SECONDS * 2 ** (schedule.failure_count - 1),
+                SCHEDULE_RETRY_MAX_SECONDS,
+            )
+            delay = base_delay + random.uniform(0, base_delay * 0.2)  # noqa: S311 - retry jitter is not security-sensitive
+            schedule.next_retry_at = datetime.now().astimezone() + timedelta(seconds=delay)
+            schedule.last_error = error
+        await self._persist_schedules()
+        self._changed()
+        return delay
+
+    async def _ensure_export_capacity(self, requested_jobs: int) -> None:
+        active_jobs = sum(not job.terminal for job in self.jobs.values())
+        maximum_jobs = self.settings.web_max_active_exports + self.settings.web_max_queued_exports
+        if active_jobs + requested_jobs > maximum_jobs:
+            message = "The export queue is full. Wait for an active export to finish and try again."
+            raise WebCapacityError(message)
+
+        quota_bytes = self.settings.web_storage_quota_mib * MEBIBYTE
+        usage_bytes = await asyncio.to_thread(self._output_storage_bytes)
+        per_job_bytes = self.settings.max_download_mib * MEBIBYTE or quota_bytes
+        reserved_bytes = len(self._reserved_output_paths) * per_job_bytes
+        if usage_bytes + reserved_bytes + requested_jobs * per_job_bytes > quota_bytes:
+            message = "The configured export storage quota cannot reserve space for this request."
+            raise WebCapacityError(message)
+
+    def _output_storage_bytes(self) -> int:
+        try:
+            return sum(path.stat().st_size for path in self.settings.output_dir.rglob("*") if path.is_file())
+        except OSError as exc:
+            message = f"Could not measure export storage usage: {exc}"
+            raise WebCapacityError(message) from exc
 
     def _trim_jobs(self) -> None:
         if len(self.jobs) <= MAX_VISIBLE_JOBS:
