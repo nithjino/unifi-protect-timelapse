@@ -89,7 +89,11 @@ def _job_status(job: ExportJob) -> str:
     return labels[job.status]
 
 
-def _schedule_next_run(_schedule: DailySchedule) -> str:
+def _schedule_next_run(schedule: DailySchedule) -> str:
+    if schedule.paused:
+        return "paused"
+    if schedule.next_retry_at is not None:
+        return _format_datetime(schedule.next_retry_at)
     now = datetime.now().astimezone()
     tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time()).astimezone()
     hour = tomorrow.strftime("%I").lstrip("0")
@@ -554,8 +558,8 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             camera_ids = _form_values(form, "camera_ids")
             speed = _parse_speed(form)
             schedule = await web_state.create_schedule(camera_ids, speed)
-        except Exception as exc:
-            return message_response(request, str(exc) or type(exc).__name__, kind="error")
+        except ValueError as exc:
+            return message_response(request, str(exc), kind="error", status_code=400)
         count = len(schedule.cameras)
         noun = "camera" if count == 1 else "cameras"
         return message_response(request, f"Daily exports enabled for {count} {noun}.")
@@ -578,6 +582,14 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=400)
         return message_response(request, "Export queued again.")
+
+    @application.post("/actions/schedules/{schedule_id}/retry", response_class=HTMLResponse)
+    async def retry_schedule(request: Request, schedule_id: SCHEDULE_ID) -> Response:
+        try:
+            await web_state.retry_schedule(schedule_id)
+        except ValueError as exc:
+            return message_response(request, str(exc), kind="error", status_code=400)
+        return message_response(request, "Daily schedule resumed.")
 
     @application.delete("/actions/schedules/{schedule_id}", response_class=HTMLResponse)
     async def remove_schedule(request: Request, schedule_id: SCHEDULE_ID) -> Response:

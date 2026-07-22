@@ -13,10 +13,23 @@
         <span class="schedule-mark" aria-hidden="true">↻</span>
         <div class="schedule-copy">
           <strong>{{ schedule.cameras | map(attribute='name') | join(', ') }}</strong>
-          <p>Next run {{ schedule | next_run }} · {{ schedule.speed }}</p>
+          {% if schedule.paused %}
+            <p>Needs attention · {{ schedule.speed }}</p>
+          {% else %}
+            <p>Next run {{ schedule | next_run }} · {{ schedule.speed }}</p>
+          {% endif %}
           <small>Last completed day: {{ schedule.last_run_day | date }}</small>
-          {% if schedule.last_error %}<small class="schedule-error">Retrying after: {{ schedule.last_error }}</small>{% endif %}
+          {% if schedule.last_error %}<small class="schedule-error">{{ schedule.last_error }}</small>{% endif %}
         </div>
+        {% if schedule.paused %}
+          <button
+            class="button button-secondary"
+            type="button"
+            hx-post="/actions/schedules/{{ schedule.id }}/retry"
+            hx-target="#message-region"
+            hx-swap="innerHTML"
+          >Retry</button>
+        {% endif %}
         <button
           class="small-button danger"
           hx-delete="/actions/schedules/{{ schedule.id }}"

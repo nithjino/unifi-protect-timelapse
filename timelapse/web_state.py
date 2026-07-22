@@ -289,7 +289,8 @@ class WebState:
         await self._load_jobs()
         await self._load_schedules()
         for schedule in self.schedules.values():
-            schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
+            if not schedule.paused:
+                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
 
     async def close(self) -> None:
         """Cancel background work during server shutdown."""
@@ -462,6 +463,9 @@ class WebState:
         if not selected:
             message = "Select at least one available camera."
             raise ValueError(message)
+        if speed not in SPEED_TO_FPS:
+            message = "Choose a supported timelapse speed."
+            raise ValueError(message)
         schedule = DailySchedule(id=secrets.token_urlsafe(9), cameras=selected, speed=speed)
         self.schedules[schedule.id] = schedule
         await self._persist_schedules()
@@ -556,7 +560,7 @@ class WebState:
 
     async def _run_schedule(self, schedule: DailySchedule) -> None:
         try:
-            while schedule.id in self.schedules:
+            while schedule.id in self.schedules and not schedule.paused:
                 latest_day = latest_complete_local_day()
                 day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day else latest_day
                 while day <= latest_day and schedule.id in self.schedules:
@@ -574,17 +578,22 @@ class WebState:
                         tasks = [job.task for job in jobs if job.task is not None]
                         await asyncio.gather(*tasks)
                     except Exception as exc:
-                        schedule.last_error = str(exc) or type(exc).__name__
-                        self._changed()
-                        await asyncio.sleep(60)
+                        delay = await self._record_schedule_failure(schedule, str(exc) or type(exc).__name__)
+                        if delay is None:
+                            return
+                        await asyncio.sleep(delay)
                         continue
                     failed_jobs = [job for job in jobs if job.status in {"failed", "cancelled"}]
                     if failed_jobs:
-                        schedule.last_error = f"{len(failed_jobs)} daily export(s) failed; retrying this day."
-                        self._changed()
-                        await asyncio.sleep(60)
+                        error = f"{len(failed_jobs)} daily export(s) failed."
+                        delay = await self._record_schedule_failure(schedule, error)
+                        if delay is None:
+                            return
+                        await asyncio.sleep(delay)
                         continue
                     schedule.last_error = None
+                    schedule.failure_count = 0
+                    schedule.next_retry_at = None
                     schedule.last_run_day = day
                     await self._persist_schedules()
                     self._changed()

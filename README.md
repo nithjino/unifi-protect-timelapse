@@ -269,6 +269,12 @@ failed, and cancelled entries return after a server restart. An export interrupt
 can be retried. Daily schedules are stored in `./data/web-schedules.json` and resume when the server restarts. Run one
 Uvicorn worker because export and schedule state is maintained by this process.
 
+Web exports default to 4 active jobs, 20 queued jobs, a 7-day requested range, and 100 GiB of aggregate export storage.
+Adjust `TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS`, `TIMELAPSE_WEB_MAX_QUEUED_EXPORTS`,
+`TIMELAPSE_WEB_MAX_EXPORT_HOURS`, and `TIMELAPSE_WEB_STORAGE_QUOTA_MIB` to fit the server. Daily schedules use capped
+exponential retry delays and pause after five consecutive failures; the dashboard shows the error and a manual Retry
+action.
+
 ### Run with Docker Compose
 
 Complete `.env`, including `TIMELAPSE_WEB_PASSWORD` and `TIMELAPSE_WEB_TRUSTED_HOSTS`, then run:
