@@ -67,6 +67,8 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
     camera: CameraInfo,
     output: Path,
     progress_callback: ProgressCallback | None = None,
+    *,
+    request_timeout_seconds: float | None = None,
 ) -> None:
     """Stream a Protect timelapse export to an atomic temporary file."""
     operation_started_at = perf_counter()
@@ -93,6 +95,9 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         _format_limit(config.max_download_mib),
     )
     request_started_at = perf_counter()
+    effective_request_timeout = (
+        config.request_timeout_seconds if request_timeout_seconds is None else request_timeout_seconds
+    )
     try:
         response = await client.request(
             "get",
@@ -100,7 +105,7 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
             require_auth=True,
             auto_close=False,
             params=params,
-            timeout=config.request_timeout_seconds or 0,
+            timeout=effective_request_timeout or 0,
         )
     except asyncio.CancelledError:
         _LOGGER.info("Protect video export request cancelled after %.2fs", perf_counter() - request_started_at)

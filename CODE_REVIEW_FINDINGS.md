@@ -150,7 +150,7 @@ Both native projects compiled successfully during this review, and the existing 
 
 ## Low
 
-### LOW-1: The configured request timeout is not an end-to-end operation deadline
+### ~~LOW-1: The configured request timeout is not an end-to-end operation deadline~~ — Resolved
 
 **Affected code:** `timelapse/download.py:91-99`, `timelapse/service.py:37-161`
 

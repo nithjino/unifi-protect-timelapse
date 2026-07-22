@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
 from uiprotect.exceptions import NotAuthorized
 
-from timelapse import TimelapseError, service
+from timelapse import OperationTimeoutError, TimelapseError, service
 from timelapse.config import Config
 from timelapse.protect import CameraInfo
 
@@ -110,4 +111,29 @@ def test_thumbnail_falls_back_to_api_token_live_snapshot(monkeypatch: pytest.Mon
     assert result.image == b"live-jpeg"
     assert result.source == "live"
     assert client.calls == 2
+    assert client.closed is True
+
+
+def test_camera_discovery_timeout_covers_the_complete_operation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _FakeClient()
+    config = replace(_config(tmp_path), request_timeout_seconds=1)
+
+    async def blocked_load(_client: object) -> list[CameraInfo]:
+        await asyncio.Event().wait()
+        return []
+
+    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    monkeypatch.setattr(service, "load_cameras", blocked_load)
+    monkeypatch.setattr(
+        service,
+        "_operation_deadline",
+        lambda _seconds: asyncio.get_running_loop().time() + 0.01,
+    )
+
+    with pytest.raises(OperationTimeoutError, match="configured 1-second operation timeout"):
+        asyncio.run(service.list_available_cameras(config))
+
     assert client.closed is True

@@ -226,7 +226,7 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--request-timeout-seconds",
         type=_parse_nonnegative_int,
         default=os.environ.get("TIMELAPSE_REQUEST_TIMEOUT_SECONDS", str(DEFAULT_REQUEST_TIMEOUT_SECONDS)),
-        help="request timeout; defaults to TIMELAPSE_REQUEST_TIMEOUT_SECONDS or 0 (disabled)",
+        help="whole-operation deadline; defaults to TIMELAPSE_REQUEST_TIMEOUT_SECONDS or 0 (disabled)",
     )
     parser.add_argument(
         "--max-download-mib",

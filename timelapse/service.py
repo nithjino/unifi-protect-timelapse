@@ -6,13 +6,14 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
-from timelapse import TimelapseError
+from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.download import download_timelapse
 from timelapse.protect import create_client, load_cameras, parse_connection
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable
     from datetime import datetime
     from pathlib import Path
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 
 CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 _LOGGER = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 @dataclass(frozen=True)
@@ -46,8 +48,14 @@ async def list_available_cameras(config: Config) -> list[CameraInfo]:
         _format_timeout(config.request_timeout_seconds),
     )
     client = create_client(config, connection)
+    deadline = _operation_deadline(config.request_timeout_seconds)
     try:
-        cameras = await load_cameras(client)
+        cameras = await _await_with_deadline(
+            load_cameras(client),
+            deadline=deadline,
+            timeout_seconds=config.request_timeout_seconds,
+            operation="Camera discovery",
+        )
     except asyncio.CancelledError:
         _LOGGER.info("Camera discovery cancelled after %.2fs", perf_counter() - started_at)
         raise
@@ -65,7 +73,7 @@ async def list_available_cameras(config: Config) -> list[CameraInfo]:
         await _close_client(client, operation="camera discovery")
 
 
-async def fetch_camera_thumbnail(
+async def fetch_camera_thumbnail(  # noqa: PLR0912 - exact/fallback requests share one deadline and cleanup path
     config: Config,
     camera: CameraInfo,
     timestamp: datetime,
@@ -87,21 +95,30 @@ async def fetch_camera_thumbnail(
         connection.port,
     )
     client = create_client(config, connection)
+    deadline = _operation_deadline(config.request_timeout_seconds)
     try:
         try:
             image = _require_thumbnail(
-                await client.api_request_raw(
-                    f"cameras/{camera.id}/recording-snapshot",
-                    params={
-                        "ts": int(timestamp.timestamp() * 1000),
-                        "w": width,
-                        "h": height,
-                    },
-                    raise_exception=True,
+                await _await_with_deadline(
+                    client.api_request_raw(
+                        f"cameras/{camera.id}/recording-snapshot",
+                        params={
+                            "ts": int(timestamp.timestamp() * 1000),
+                            "w": width,
+                            "h": height,
+                        },
+                        raise_exception=True,
+                        timeout=_remaining_timeout(deadline) or 0,
+                    ),
+                    deadline=deadline,
+                    timeout_seconds=config.request_timeout_seconds,
+                    operation=f"Thumbnail request for {camera.name}",
                 ),
                 camera,
             )
         except asyncio.CancelledError:
+            raise
+        except OperationTimeoutError:
             raise
         except Exception as exact_error:
             _LOGGER.warning(
@@ -111,15 +128,23 @@ async def fetch_camera_thumbnail(
             )
             try:
                 live_image = _require_thumbnail(
-                    await client.api_request_raw(
-                        public_api=True,
-                        raise_exception=True,
-                        url=f"/v1/cameras/{camera.id}/snapshot",
-                        params={"highQuality": "false"},
+                    await _await_with_deadline(
+                        client.api_request_raw(
+                            public_api=True,
+                            raise_exception=True,
+                            url=f"/v1/cameras/{camera.id}/snapshot",
+                            params={"highQuality": "false"},
+                            timeout=_remaining_timeout(deadline) or 0,
+                        ),
+                        deadline=deadline,
+                        timeout_seconds=config.request_timeout_seconds,
+                        operation=f"Thumbnail request for {camera.name}",
                     ),
                     camera,
                 )
             except asyncio.CancelledError:
+                raise
+            except OperationTimeoutError:
                 raise
             except Exception as live_error:
                 message = (
@@ -180,8 +205,22 @@ async def export_timelapse(
         output,
     )
     client = create_client(config, connection)
+    deadline = _operation_deadline(config.request_timeout_seconds)
     try:
-        await download_timelapse(config, connection, client, camera, output, progress_callback)
+        await _await_with_deadline(
+            download_timelapse(
+                config,
+                connection,
+                client,
+                camera,
+                output,
+                progress_callback,
+                request_timeout_seconds=_remaining_timeout(deadline),
+            ),
+            deadline=deadline,
+            timeout_seconds=config.request_timeout_seconds,
+            operation=f"Timelapse export for {camera.name}",
+        )
         _LOGGER.info(
             "Timelapse export completed: camera=%s, output=%s, elapsed=%.2fs",
             camera.name,
@@ -223,6 +262,35 @@ async def _close_client(client: ProtectApiClient, *, operation: str) -> None:
 
 def _format_timeout(seconds: int) -> str:
     return "disabled" if seconds == 0 else f"{seconds}s"
+
+
+def _operation_deadline(timeout_seconds: int) -> float | None:
+    if timeout_seconds == 0:
+        return None
+    return asyncio.get_running_loop().time() + timeout_seconds
+
+
+def _remaining_timeout(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(deadline - asyncio.get_running_loop().time(), 0.0)
+
+
+async def _await_with_deadline(
+    awaitable: Awaitable[_T],
+    *,
+    deadline: float | None,
+    timeout_seconds: int,
+    operation: str,
+) -> _T:
+    if deadline is None:
+        return await awaitable
+    try:
+        async with asyncio.timeout_at(deadline):
+            return await awaitable
+    except TimeoutError as exc:
+        message = f"{operation} exceeded the configured {timeout_seconds}-second operation timeout."
+        raise OperationTimeoutError(message) from exc
 
 
 def _require_thumbnail(image: bytes | None, camera: CameraInfo) -> bytes:

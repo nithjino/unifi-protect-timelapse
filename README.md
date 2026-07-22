@@ -21,7 +21,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 - Automatic start/end thumbnail previews with exact-time and live-snapshot fallback
 - Streaming downloads with progress, cancellation, and atomic finalization
 - Safe output filenames and protection against overwriting existing videos
-- Configurable request timeout and maximum download size
+- Configurable whole-operation timeout and maximum download size
 - Reusable CLI connection profiles stored in the operating system credential store
 - OS credential-store integration in the desktop interfaces
 
@@ -103,7 +103,7 @@ connection values explicitly.
 | `UNIFI_PROTECT_PASSWORD` | Yes | — | Password for the dedicated local Protect user |
 | `UNIFI_PROTECT_VERIFY_SSL` | No | `true` | Whether to verify the Protect console's TLS certificate |
 | `TIMELAPSE_OUTPUT` | No | Generated filename | Output MP4 path, or output directory in daily mode |
-| `TIMELAPSE_REQUEST_TIMEOUT_SECONDS` | No | `0` | Request timeout in seconds; `0` disables the timeout |
+| `TIMELAPSE_REQUEST_TIMEOUT_SECONDS` | No | `0` | Whole-operation deadline in seconds; `0` disables the deadline |
 | `TIMELAPSE_MAX_DOWNLOAD_MIB` | No | `10240` | Maximum download size in MiB; `0` disables the limit |
 
 Speed and date boundaries are intentionally CLI-only. They are not loaded from `.env`.
@@ -197,7 +197,8 @@ uv run timelapse \
 
 ### Adjust export safeguards
 
-The timeout is disabled by default so long-running exports can finish. The default maximum download size is 10 GiB:
+The whole-operation deadline covers authentication, retries, and response streaming. It is disabled by default so
+long-running exports can finish. The default maximum download size is 10 GiB:
 
 ```bash
 uv run timelapse \
@@ -428,7 +429,7 @@ Check the Protect URL, confirm that it uses HTTPS, and verify that the Integrati
 
 ### A long export stops early
 
-Leave `TIMELAPSE_REQUEST_TIMEOUT_SECONDS=0` for no request timeout, or pass a larger positive value. Also check `TIMELAPSE_MAX_DOWNLOAD_MIB` if the export is unusually large.
+Leave `TIMELAPSE_REQUEST_TIMEOUT_SECONDS=0` for no operation deadline, or pass a larger positive value. Also check `TIMELAPSE_MAX_DOWNLOAD_MIB` if the export is unusually large.
 
 ### Daily mode appears idle
 
