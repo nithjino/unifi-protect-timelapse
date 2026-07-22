@@ -64,8 +64,23 @@ if (-not (Test-Path -PathType Leaf $BuiltBackend)) {
 }
 
 $HealthRequest = '{"id":"build-health","command":"health"}'
-$HealthOutput = $HealthRequest | & $BuiltBackend
-if ($LASTEXITCODE -ne 0 -or $HealthOutput -notmatch '"event":"complete"') {
+$HealthOutput = @($HealthRequest | & $BuiltBackend)
+$HealthExitCode = $LASTEXITCODE
+$HealthEvents = @(
+    foreach ($Line in $HealthOutput) {
+        try {
+            $Line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            Write-Warning "Ignoring non-JSON backend health output: $Line"
+        }
+    }
+)
+$CompletedHealthEvents = @(
+    $HealthEvents | Where-Object { $_.id -eq "build-health" -and $_.event -eq "complete" }
+)
+if ($HealthExitCode -ne 0 -or $CompletedHealthEvents.Count -eq 0) {
+    Write-Error "Backend health output: $($HealthOutput -join [Environment]::NewLine)"
     throw "The packaged backend health check failed."
 }
 

@@ -57,6 +57,8 @@ def test_windows_build_packages_native_app_and_backend() -> None:
     assert "timelapse-backend.exe" in script
     assert "BackendExecutable" in script
     assert "PublishedFiles.Count -ne 1" in script
+    assert "ConvertFrom-Json" in script
+    assert '$_.id -eq "build-health" -and $_.event -eq "complete"' in script
     assert "timelapse\\gui.py" not in script
     assert "EmbeddedResource" in project
     assert "TimeLapseNative.timelapse-backend.exe" in project
