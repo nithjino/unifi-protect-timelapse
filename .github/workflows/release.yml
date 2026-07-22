@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Build native macOS application
+        run: ./build-macos.sh
+
+      - name: Package macOS application bundle
+        run: |
+          architecture="$(uname -m)"
+          archive="dist/macos/TimeLapse-${GITHUB_REF_NAME}-macos-${architecture}.zip"
+          ditto -c -k --sequesterRsrc --keepParent dist/macos/timelapse.app "${archive}"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-macos
+          path: dist/macos/TimeLapse-*.zip
+          compression-level: 0
+          if-no-files-found: error
+
+  build-windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      UV_PYTHON: "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1 # v5.4.0
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Build native Windows application
+        shell: pwsh
+        run: ./build-windows.ps1
+
+      - name: Name Windows release asset
+        shell: pwsh
+        run: |
+          Move-Item `
+            -Path dist/windows/timelapse.exe `
+            -Destination "dist/windows/TimeLapse-$env:GITHUB_REF_NAME-windows-x64.exe"
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-windows
+          path: dist/windows/TimeLapse-*.exe
+          compression-level: 0
+          if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Install Linux build libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes \
+            binutils \
+            libdbus-1-3 \
+            libegl1 \
+            libfontconfig1 \
+            libfreetype6 \
+            libgl1 \
+            libglib2.0-0 \
+            libx11-6 \
+            libxcb-cursor0 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0
+
+      - name: Build Linux executable and AppImage
+        run: ./build-linux.sh
+
+      - name: Name Linux release assets
+        run: |
+          mv dist/linux/timelapse "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64"
+          mv dist/linux/TimeLapse-x86_64.AppImage \
+            "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-linux
+          path: |
+            dist/linux/TimeLapse-*-linux-x86_64
+            dist/linux/TimeLapse-*-linux-x86_64.AppImage
+          compression-level: 0
+          if-no-files-found: error
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs:
+      - build-macos
+      - build-windows
+      - build-linux
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create checksums
+        working-directory: release-assets
+        run: sha256sum TimeLapse-* > SHA256SUMS
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            release-assets/TimeLapse-* \
+            release-assets/SHA256SUMS \
+            --generate-notes \
+            --title "TimeLapse ${GITHUB_REF_NAME}" \
+            --verify-tag

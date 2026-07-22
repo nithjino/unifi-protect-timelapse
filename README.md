@@ -345,7 +345,16 @@ Build the bundled Linux application on Linux:
 ./build-linux.sh
 ```
 
-The Linux build is written to `dist/linux/`. Build on the oldest Linux distribution you intend to support for the widest glibc compatibility.
+The Linux build writes both the standalone `dist/linux/timelapse` executable and a
+`dist/linux/TimeLapse-<architecture>.AppImage`. The AppImage packager is downloaded at a pinned
+version and verified by SHA-256; set `APPIMAGETOOL` to use an existing `appimagetool` executable
+instead. The bundled runtime uses Python 3.13 by default; set `TIMELAPSE_LINUX_PYTHON` to override
+it. Building requires `uv`, `curl`, `binutils`, `sha256sum`, and the system libraries needed to
+load Qt. On Ubuntu 22.04, install `libdbus-1-3`, `libegl1`, `libfontconfig1`, `libfreetype6`,
+`libgl1`, `libglib2.0-0`, `libx11-6`, `libxcb-cursor0`, `libxkbcommon0`, and
+`libxkbcommon-x11-0`. Build on the oldest Linux distribution you intend to support for the widest
+glibc compatibility. GitHub Actions release builds should use `ubuntu-22.04`, the oldest currently
+supported GitHub-hosted Ubuntu image.
 
 ## Native Windows GUI
 

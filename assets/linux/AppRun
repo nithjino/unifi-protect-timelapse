@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+if [ -n "${APPDIR:-}" ]; then
+    appdir="${APPDIR}"
+else
+    unset CDPATH
+    appdir="$(cd -- "$(dirname -- "$0")" && pwd)"
+fi
+exec "${appdir}/usr/bin/timelapse" "$@"
