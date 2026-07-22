@@ -109,15 +109,16 @@ def test_default_output_path_distinguishes_cameras_with_colliding_names() -> Non
     assert second_output.name.startswith("timelapse_Front_Door_")
 
 
-@pytest.mark.parametrize(("content_length", "expected_total"), [("6", 6), (None, None)])
+@pytest.mark.parametrize(("content_length", "expected_total"), [("16", 16), (None, None)])
 def test_download_emits_initial_throttled_and_final_progress(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     content_length: str | None,
     expected_total: int | None,
 ) -> None:
-    headers = {} if content_length is None else {"Content-Length": content_length}
-    response = _FakeResponse(_FakeContent([b"abc", b"def"]), headers)
+    video = b"\x00\x00\x00\x18ftypisomdata"
+    headers = {} if content_length is None else {"Content-Length": str(len(video))}
+    response = _FakeResponse(_FakeContent([video[:8], video[8:]]), headers)
     client = cast("ProtectApiClient", _FakeClient(response))
     camera = CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5")
     output = tmp_path / "output.mp4"
@@ -136,14 +137,14 @@ def test_download_emits_initial_throttled_and_final_progress(
         )
     )
 
-    assert output.read_bytes() == b"abcdef"
+    assert output.read_bytes() == video
     assert response.released is True
-    assert [event.downloaded_bytes for event in progress] == [0, 6, 6]
+    assert [event.downloaded_bytes for event in progress] == [0, len(video), len(video)]
     assert [event.total_bytes for event in progress] == [expected_total, expected_total, expected_total]
     assert progress[0].elapsed_seconds == 0
     assert progress[0].bytes_per_second == 0
-    assert progress[1].bytes_per_second == pytest.approx(30)
-    assert progress[-1].bytes_per_second == pytest.approx(20)
+    assert progress[1].bytes_per_second == pytest.approx(80)
+    assert progress[-1].bytes_per_second == pytest.approx(160 / 3)
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
 
 
@@ -179,7 +180,7 @@ def test_download_cancellation_releases_response_and_removes_partial_file(tmp_pa
 def test_download_does_not_overwrite_output_created_during_export(tmp_path: Path) -> None:
     output = tmp_path / "existing.mp4"
     output.write_bytes(b"keep me")
-    response = _FakeResponse(_FakeContent([b"new data"]), {})
+    response = _FakeResponse(_FakeContent([b"\x00\x00\x00\x18ftypisomnew data"]), {})
     client = cast("ProtectApiClient", _FakeClient(response))
 
     with pytest.raises(TimelapseError, match="refusing to overwrite"):
@@ -194,5 +195,39 @@ def test_download_does_not_overwrite_output_created_during_export(tmp_path: Path
         )
 
     assert output.read_bytes() == b"keep me"
+    assert response.released is True
+    assert all(path.suffix != ".part" for path in tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("chunks", "headers", "message"),
+    [
+        ([], {}, "empty response"),
+        ([b"not an mp4"], {}, "valid MP4 file signature"),
+        ([b"\x00\x00\x00\x18ftypisom"], {"Content-Type": "text/html"}, "unexpected content type"),
+    ],
+)
+def test_download_rejects_invalid_video_responses(
+    tmp_path: Path,
+    chunks: list[bytes],
+    headers: dict[str, str],
+    message: str,
+) -> None:
+    output = tmp_path / "invalid.mp4"
+    response = _FakeResponse(_FakeContent(chunks), headers)
+    client = cast("ProtectApiClient", _FakeClient(response))
+
+    with pytest.raises(TimelapseError, match=message):
+        asyncio.run(
+            download_timelapse(
+                _config(),
+                parse_connection(_config().instance_url),
+                client,
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                output,
+            )
+        )
+
+    assert not output.exists()
     assert response.released is True
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())

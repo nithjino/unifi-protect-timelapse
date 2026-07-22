@@ -27,6 +27,8 @@ MEBIBYTE = 1024 * 1024
 KIBIBYTE = 1024
 CHUNK_SIZE = MEBIBYTE
 MAX_ERROR_BODY_BYTES = 8 * 1024
+MP4_PROBE_BYTES = 4 * 1024
+MIN_MP4_FTYP_OFFSET = 4
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.1
 HTTP_OK = 200
 HTTP_MULTIPLE_CHOICES = 300
@@ -124,6 +126,11 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
             message = f"timelapse export failed with HTTP {response.status}: {detail or reason}"
             raise TimelapseError(message)
 
+        content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().casefold()
+        if content_type and content_type not in {"video/mp4", "application/mp4", "application/octet-stream"}:
+            message = f"timelapse export returned unexpected content type: {content_type}"
+            raise TimelapseError(message)
+
         max_bytes = config.max_download_mib * MEBIBYTE
         if max_bytes and total_bytes and total_bytes > max_bytes:
             message = (
@@ -174,6 +181,8 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
             _format_bytes(round(downloaded / stream_elapsed) if stream_elapsed else 0),
         )
 
+        _validate_mp4(temp_output, downloaded)
+
         if output.exists():  # noqa: ASYNC240 - local metadata check immediately before the atomic replace
             message = f"refusing to overwrite existing output file: {output}"
             raise TimelapseError(message)
@@ -200,6 +209,18 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
             if temp_output.exists():
                 _LOGGER.info("Removing temporary export file: %s", temp_output)
             temp_output.unlink(missing_ok=True)
+
+
+def _validate_mp4(path: Path, downloaded_bytes: int) -> None:
+    if downloaded_bytes == 0:
+        message = "timelapse export returned an empty response"
+        raise TimelapseError(message)
+    with path.open("rb") as file:
+        header = file.read(MP4_PROBE_BYTES)
+    marker = header.find(b"ftyp")
+    if marker < MIN_MP4_FTYP_OFFSET:
+        message = "timelapse export did not contain a valid MP4 file signature"
+        raise TimelapseError(message)
 
 
 def _js_time(value: datetime) -> int:
