@@ -93,3 +93,25 @@ jobs:
 
       - name: Check Dockerfile
         run: docker build --check .
+
+  native-macos:
+    runs-on: macos-15
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and test native macOS client
+        run: swift test --package-path native-macos
+
+  native-windows:
+    runs-on: windows-2025
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build native Windows client
+        run: dotnet build native-windows/TimeLapseNative.csproj --configuration Release
