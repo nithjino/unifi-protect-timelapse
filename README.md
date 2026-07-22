@@ -248,16 +248,19 @@ unique password:
 
 ```dotenv
 TIMELAPSE_WEB_HOST=0.0.0.0
-TIMELAPSE_WEB_TRUSTED_HOSTS=SERVER-IP
+TIMELAPSE_WEB_TRUSTED_HOSTS=timelapse-server,timelapse-server.local,192.168.2.17
 TIMELAPSE_WEB_USERNAME=timelapse
 TIMELAPSE_WEB_PASSWORD=replace-with-a-long-random-password
 ```
 
-Replace `SERVER-IP` with the exact IP address or hostname used in the browser. Multiple trusted hosts can be separated
-with commas. Restart the server, then browse to `http://SERVER-IP:8000`. TimeLapse refuses to start on a non-loopback
-address without an application password and rejects request hosts outside this allowlist. The browser shows a dedicated
-login page and creates an HTTP-only, same-site session after a successful sign-in. This password protects the web
-interface; it is separate from the Protect account password.
+`TIMELAPSE_WEB_TRUSTED_HOSTS` lists the server addresses that may appear in the browser URL; it does not list the IP
+addresses of computers, phones, or other clients connecting to the server. For example, browsing to
+`http://thinkpad:8000` requires `thinkpad`, while browsing to `http://192.168.2.17:8000` requires `192.168.2.17`.
+Include every hostname or IP address you actually use, separated by commas, and omit the port. Restart the server after
+changing the setting. TimeLapse refuses to start on a non-loopback address without an application password and rejects
+request hosts outside this allowlist with `Untrusted host`. The browser shows a dedicated login page and creates an
+HTTP-only, same-site session after a successful sign-in. This password protects the web interface; it is separate from
+the Protect account password.
 
 ![TimeLapse web login page with private local access and server-side credential notice](docs/screenshots/web-login.jpg)
 
@@ -287,6 +290,14 @@ docker compose up --build -d
 The Compose service publishes port `8000` for local-network access and mounts `./data` for exported videos, export
 history, and schedule state. Change `TIMELAPSE_WEB_BIND_ADDRESS` to `127.0.0.1` if the container should be reachable only
 from its host.
+
+After changing `.env`, recreate the container so Compose loads the new environment values:
+
+```bash
+docker compose up -d --force-recreate timelapse-web
+```
+
+`docker compose restart` restarts the existing container without reloading `.env`.
 
 Stop the service without deleting exports or schedules:
 
