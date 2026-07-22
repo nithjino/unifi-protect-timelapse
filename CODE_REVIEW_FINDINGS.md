@@ -190,7 +190,7 @@ The regular export path calls `Directory.CreateDirectory` outside an error bound
 
 **Recommendation:** Validate/create the directory inside the existing error path, preserve the UI state, and show a specific remediation message. Share this logic with the daily scheduler.
 
-### LOW-5: Container base images are tag-pinned but not digest-pinned
+### ~~LOW-5: Container base images are tag-pinned but not digest-pinned~~ — Resolved
 
 **Affected code:** `Dockerfile:1-3`
 
