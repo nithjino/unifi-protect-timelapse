@@ -789,7 +789,73 @@ class WebState:
                 ]
             }
             serialized = json.dumps(payload, indent=2, sort_keys=True)
-            await self._write_state_safely(self._job_state_file, serialized)
+            try:
+                await self._write_state_safely(self._job_state_file, serialized)
+            except Exception:
+                _LOGGER.exception("Failed to persist web export state to %s", self._job_state_file)
+                raise
+
+    def _stored_schedule(self, item: dict[object, object]) -> DailySchedule:
+        schedule_id = item.get("id")
+        speed = item.get("speed")
+        camera_payload = item.get("cameras")
+        if not isinstance(schedule_id, str) or not schedule_id:
+            message = "stored schedule requires a non-empty ID"
+            raise ValueError(message)
+        if not isinstance(speed, str) or speed not in SPEED_TO_FPS:
+            message = "stored schedule speed is invalid"
+            raise ValueError(message)
+        if not isinstance(camera_payload, list) or not camera_payload:
+            message = "stored schedule requires at least one camera"
+            raise ValueError(message)
+        cameras: list[CameraInfo] = []
+        for payload in camera_payload:
+            if not isinstance(payload, dict):
+                message = "stored schedule camera must be an object"
+                raise TypeError(message)
+            camera_id = payload.get("id")
+            camera_name = payload.get("name")
+            if not isinstance(camera_id, str) or not camera_id or not isinstance(camera_name, str) or not camera_name:
+                message = "stored schedule camera requires an ID and name"
+                raise ValueError(message)
+            state = payload.get("state")
+            model = payload.get("model")
+            if state is not None and not isinstance(state, str):
+                message = "stored schedule camera state must be text"
+                raise TypeError(message)
+            if model is not None and not isinstance(model, str):
+                message = "stored schedule camera model must be text"
+                raise TypeError(message)
+            cameras.append(CameraInfo(id=camera_id, name=camera_name, state=state, model=model))
+
+        created_at = _stored_datetime(item.get("created_at"), required=True)
+        if created_at is None:
+            message = "stored schedule creation time is invalid"
+            raise ValueError(message)
+        last_run_value = item.get("last_run_day")
+        if last_run_value is not None and not isinstance(last_run_value, str):
+            message = "stored schedule last-run day must be text"
+            raise TypeError(message)
+        last_run = date.fromisoformat(last_run_value) if last_run_value else None
+        last_error = item.get("last_error")
+        if last_error is not None and not isinstance(last_error, str):
+            message = "stored schedule error must be text"
+            raise TypeError(message)
+        paused = item.get("paused", False)
+        if not isinstance(paused, bool):
+            message = "stored schedule paused flag must be a boolean"
+            raise TypeError(message)
+        return DailySchedule(
+            id=schedule_id,
+            cameras=cameras,
+            speed=speed,
+            created_at=created_at,
+            last_run_day=last_run,
+            last_error=last_error,
+            failure_count=_stored_nonnegative_integer(item.get("failure_count")),
+            next_retry_at=_stored_datetime(item.get("next_retry_at")),
+            paused=paused,
+        )
 
     async def _load_schedules(self) -> None:
         if not self._schedule_state_file.exists():
@@ -797,33 +863,65 @@ class WebState:
         try:
             raw = await asyncio.to_thread(self._schedule_state_file.read_text, encoding="utf-8")
             payload = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
+        except OSError:
+            _LOGGER.exception("Failed to read web schedule state from %s", self._schedule_state_file)
             return
-        for item in payload.get("schedules", []):
-            try:
-                cameras = [
-                    CameraInfo(
-                        id=str(camera["id"]),
-                        name=str(camera["name"]),
-                        state=camera.get("state"),
-                        model=camera.get("model"),
-                    )
-                    for camera in item["cameras"]
-                ]
-                last_run = date.fromisoformat(item["last_run_day"]) if item.get("last_run_day") else None
-                schedule = DailySchedule(
-                    id=str(item["id"]),
-                    cameras=cameras,
-                    speed=str(item["speed"]),
-                    created_at=datetime.fromisoformat(item["created_at"]),
-                    last_run_day=last_run,
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-            self.schedules[schedule.id] = schedule
+        except json.JSONDecodeError as exc:
+            await self._quarantine_schedule_state(exc)
+            return
+        try:
+            version, restored = self._restore_schedules(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            await self._quarantine_schedule_state(exc)
+            return
+        self.schedules = restored
+        if version == 0:
+            await self._persist_schedules()
+
+    def _restore_schedules(self, payload: object) -> tuple[int, dict[str, DailySchedule]]:
+        if not isinstance(payload, dict):
+            message = "schedule state root must be an object"
+            raise TypeError(message)
+        version = payload.get("version", 0)
+        if isinstance(version, bool) or not isinstance(version, int) or version not in {0, SCHEDULE_STATE_VERSION}:
+            message = f"unsupported schedule state version: {version!r}"
+            raise ValueError(message)
+        items = payload.get("schedules")
+        if not isinstance(items, list):
+            message = "schedule state must contain a schedules list"
+            raise TypeError(message)
+        restored: dict[str, DailySchedule] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                message = "stored schedule must be an object"
+                raise TypeError(message)
+            schedule = self._stored_schedule(item)
+            if schedule.id in restored:
+                message = f"duplicate stored schedule ID: {schedule.id}"
+                raise ValueError(message)
+            restored[schedule.id] = schedule
+        return version, restored
+
+    async def _quarantine_schedule_state(self, error: Exception) -> None:
+        quarantined = self._schedule_state_file.with_name(
+            f"{self._schedule_state_file.stem}.invalid-{secrets.token_hex(4)}{self._schedule_state_file.suffix}"
+        )
+        try:
+            await asyncio.to_thread(self._schedule_state_file.replace, quarantined)
+        except OSError:
+            _LOGGER.exception(
+                "Invalid web schedule state in %s could not be quarantined: %s",
+                self._schedule_state_file,
+                error,
+            )
+            return
+        _LOGGER.warning(
+            "Moved invalid web schedule state from %s to %s: %s", self._schedule_state_file, quarantined, error
+        )
 
     async def _persist_schedules(self) -> None:
         payload = {
+            "version": SCHEDULE_STATE_VERSION,
             "schedules": [
                 {
                     "id": schedule.id,
@@ -839,13 +937,21 @@ class WebState:
                     "speed": schedule.speed,
                     "created_at": schedule.created_at.isoformat(),
                     "last_run_day": schedule.last_run_day.isoformat() if schedule.last_run_day else None,
+                    "last_error": schedule.last_error,
+                    "failure_count": schedule.failure_count,
+                    "next_retry_at": schedule.next_retry_at.isoformat() if schedule.next_retry_at else None,
+                    "paused": schedule.paused,
                 }
                 for schedule in self.schedules.values()
-            ]
+            ],
         }
         serialized = json.dumps(payload, indent=2, sort_keys=True)
         async with self._schedule_persist_lock:
-            await self._write_state_safely(self._schedule_state_file, serialized)
+            try:
+                await self._write_state_safely(self._schedule_state_file, serialized)
+            except Exception:
+                _LOGGER.exception("Failed to persist web schedule state to %s", self._schedule_state_file)
+                raise
 
     async def _write_state_safely(self, state_file: Path, serialized: str) -> None:
         write_task = asyncio.create_task(
