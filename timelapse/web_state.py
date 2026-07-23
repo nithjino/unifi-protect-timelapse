@@ -327,8 +327,16 @@ class WebState:
 
     async def start(self) -> None:
         """Prepare storage and resume persisted schedules."""
-        self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        self.settings.output_dir.mkdir(parents=True, exist_ok=True)
+        for directory in {self.settings.data_dir, self.settings.output_dir}:
+            try:
+                await asyncio.to_thread(self._prepare_storage_directory, directory)
+            except OSError as exc:
+                message = (
+                    f"Web storage directory {directory} is not writable by the server process. "
+                    "For Docker bind mounts, set TIMELAPSE_UID and TIMELAPSE_GID to the host directory owner's "
+                    "numeric IDs, rebuild the image, and recreate the container."
+                )
+                raise RuntimeError(message) from exc
         await self._load_jobs()
         await self._load_schedules()
         for schedule in self.schedules.values():
@@ -1066,3 +1074,13 @@ class WebState:
         finally:
             with suppress(FileNotFoundError):
                 temporary.unlink()
+
+    @staticmethod
+    def _prepare_storage_directory(directory: Path) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / f".timelapse-write-test-{secrets.token_hex(8)}.tmp"
+        try:
+            probe.touch(exist_ok=False)
+        finally:
+            with suppress(FileNotFoundError):
+                probe.unlink()

@@ -13,6 +13,9 @@ RUN uv sync --frozen --no-dev --no-editable
 
 FROM python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91
 
+ARG TIMELAPSE_UID=1000
+ARG TIMELAPSE_GID=1000
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     TIMELAPSE_WEB_DATA_DIR=/data \
@@ -23,9 +26,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --create-home --uid 10001 timelapse \
+    && if ! getent group "${TIMELAPSE_GID}" >/dev/null; then groupadd --gid "${TIMELAPSE_GID}" timelapse; fi \
+    && useradd --create-home --uid "${TIMELAPSE_UID}" --gid "${TIMELAPSE_GID}" timelapse \
     && mkdir -p /data/exports \
-    && chown -R timelapse:timelapse /data
+    && chown -R "${TIMELAPSE_UID}:${TIMELAPSE_GID}" /data
 
 COPY --from=builder /build/.venv /app/.venv
 

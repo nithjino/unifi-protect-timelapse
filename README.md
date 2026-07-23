@@ -290,12 +290,20 @@ action.
 Complete `.env`, including `TIMELAPSE_WEB_PASSWORD` and `TIMELAPSE_WEB_TRUSTED_HOSTS`, then run:
 
 ```bash
+mkdir -p data
 docker compose up --build -d
 ```
 
 The Compose service publishes port `8000` for local-network access and mounts `./data` for exported videos, export
 history, and schedule state. Change `TIMELAPSE_WEB_BIND_ADDRESS` to `127.0.0.1` if the container should be reachable only
 from its host.
+
+On Linux, the container user must have the same numeric UID and GID as the owner of the bind-mounted `./data`
+directory. The defaults are `1000:1000`. Check the host account with `id -u` and `id -g`, then set
+`TIMELAPSE_UID` and `TIMELAPSE_GID` in `.env` when they differ. If `./data` was created by an older image with a
+different owner, restore ownership with `sudo chown -R "$(id -u):$(id -g)" data`. Rebuild the image after changing
+either ID. The server checks both storage directories at startup and reports this configuration directly if they are
+not writable.
 
 After changing `.env`, recreate the container so Compose loads the new environment values:
 

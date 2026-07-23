@@ -2,6 +2,9 @@ services:
   timelapse-web:
     build:
       context: .
+      args:
+        TIMELAPSE_UID: ${TIMELAPSE_UID:-1000}
+        TIMELAPSE_GID: ${TIMELAPSE_GID:-1000}
     container_name: timelapse-web
     restart: unless-stopped
     env_file:

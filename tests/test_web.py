@@ -685,6 +685,21 @@ def test_job_persistence_failure_rolls_back_without_starting_export(
     assert not list(state.settings.output_dir.glob("*.mp4"))
 
 
+def test_web_state_fails_fast_when_storage_is_not_writable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = WebState(_settings(tmp_path), camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    def reject_storage(_directory: Path) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(state, "_prepare_storage_directory", reject_storage)
+
+    with pytest.raises(RuntimeError, match="TIMELAPSE_UID and TIMELAPSE_GID"):
+        asyncio.run(state.start())
+
+
 def test_schedule_persistence_failure_rolls_back_without_starting_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
