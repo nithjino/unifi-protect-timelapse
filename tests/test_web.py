@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -102,8 +103,46 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert 'id="full-day-end-date"' in response.text
     assert 'id="full-day-end-date" type="date"' in response.text
     assert response.text.count('type="time" value="00:00" disabled') == 2
+    assert "Times are interpreted in the server\u2019s UTC timezone." in response.text
     assert javascript.status_code == 200
     assert "htmx" in javascript.text
+
+
+def test_dashboard_reports_configured_server_timezone(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), timezone=ZoneInfo("America/New_York"))
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
+
+    with _client(app) as client:
+        response = client.get("/")
+
+    assert response.status_code == 200
+    assert "Times are interpreted in the server\u2019s America/New_York timezone." in response.text
+
+
+def test_web_settings_load_timezone_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "America/New_York")
+
+    settings = WebSettings.from_environment()
+
+    assert settings.timezone == ZoneInfo("America/New_York")
+    assert settings.timezone_name == "America/New_York"
+
+
+def test_web_settings_default_timezone_is_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TZ", raising=False)
+
+    settings = WebSettings.from_environment()
+
+    assert settings.timezone == ZoneInfo("UTC")
+    assert settings.timezone_name == "UTC"
+
+
+def test_web_settings_reject_invalid_timezone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "not/a-timezone")
+
+    with pytest.raises(ValueError, match="valid IANA timezone"):
+        WebSettings.from_environment()
 
 
 def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
@@ -246,7 +285,10 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
 
 
 def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
-    app, state = _app(tmp_path)
+    timezone = ZoneInfo("America/New_York")
+    settings = replace(_settings(tmp_path), timezone=timezone)
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
 
     with _client(app) as client:
         created = client.post(
@@ -263,7 +305,59 @@ def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
     job = next(iter(state.jobs.values()))
     assert created.status_code == 200
     assert job.full_day is True
+    assert job.start == datetime(2026, 7, 20, tzinfo=timezone)
+    assert job.end == datetime(2026, 7, 21, tzinfo=timezone)
+    assert job.start.astimezone(UTC) == datetime(2026, 7, 20, 4, tzinfo=UTC)
+    assert job.end.astimezone(UTC) == datetime(2026, 7, 21, 4, tzinfo=UTC)
     assert job.output.name == "timelapse_Front_Door_2026_07_20_2026_07_21_600x_6bf6f341d9a3.mp4"
+
+
+def test_exact_web_range_and_preview_use_configured_timezone(tmp_path: Path) -> None:
+    timezone = ZoneInfo("America/New_York")
+    settings = replace(_settings(tmp_path), timezone=timezone)
+    preview_times: list[datetime] = []
+
+    async def capture_thumbnail(
+        _config: Config,
+        _camera: CameraInfo,
+        timestamp: datetime,
+    ) -> CameraThumbnail:
+        preview_times.append(timestamp)
+        return CameraThumbnail(b"jpeg-data", "exact")
+
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=capture_thumbnail, exporter=_export)
+    app = create_app(settings, state=state)
+
+    with _client(app) as client:
+        created = client.post(
+            "/actions/export",
+            data={
+                "camera_ids": ["camera-1"],
+                "range_mode": "exact",
+                "start": "2026-07-20T00:00",
+                "end": "2026-07-20T01:00",
+                "speed": "600x",
+            },
+        )
+        preview = client.get("/api/thumbnails/camera-1", params={"timestamp": "2026-07-20T00:00:00"})
+
+    job = next(iter(state.jobs.values()))
+    assert created.status_code == 200
+    assert preview.status_code == 200
+    assert job.start == datetime(2026, 7, 20, tzinfo=timezone)
+    assert job.end == datetime(2026, 7, 20, 1, tzinfo=timezone)
+    assert preview_times == [datetime(2026, 7, 20, tzinfo=timezone)]
+
+
+def test_configured_timezone_preserves_dst_calendar_day_boundaries(tmp_path: Path) -> None:
+    timezone = ZoneInfo("America/New_York")
+    settings = replace(_settings(tmp_path), timezone=timezone)
+
+    start, end = settings.day_bounds(date(2026, 11, 1))
+
+    assert start.utcoffset() == timedelta(hours=-4)
+    assert end.utcoffset() == timedelta(hours=-5)
+    assert end.astimezone(UTC) - start.astimezone(UTC) == timedelta(hours=25)
 
 
 def test_invalid_export_returns_actionable_message(tmp_path: Path) -> None:

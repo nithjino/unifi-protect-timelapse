@@ -14,11 +14,12 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
-from timelapse.schedule import daily_output_path, latest_complete_local_day
+from timelapse.schedule import daily_output_path
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
 JobStatus = Literal["queued", "running", "completed", "failed", "cancelled", "skipped"]
@@ -63,6 +64,15 @@ def _environment_boolean(name: str, *, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _environment_timezone() -> ZoneInfo:
+    name = os.environ.get("TZ", "").strip() or "UTC"
+    try:
+        return ZoneInfo(name)
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        message = f"TZ must be a valid IANA timezone name, such as America/New_York; got {name!r}."
+        raise ValueError(message) from exc
 
 
 def _stored_datetime(value: object, *, required: bool = False) -> datetime | None:
@@ -119,6 +129,7 @@ class WebSettings:
     web_max_queued_exports: int = DEFAULT_MAX_QUEUED_EXPORTS
     web_max_export_hours: int = DEFAULT_MAX_EXPORT_HOURS
     web_storage_quota_mib: int = DEFAULT_STORAGE_QUOTA_MIB
+    timezone: ZoneInfo = field(default_factory=lambda: ZoneInfo("UTC"))
 
     @classmethod
     def from_environment(cls) -> WebSettings:
@@ -160,6 +171,7 @@ class WebSettings:
             web_storage_quota_mib=_environment_positive_integer(
                 "TIMELAPSE_WEB_STORAGE_QUOTA_MIB", DEFAULT_STORAGE_QUOTA_MIB
             ),
+            timezone=_environment_timezone(),
         )
 
     @property
@@ -177,6 +189,27 @@ class WebSettings:
     def connection_ready(self) -> bool:
         """Return whether all Protect credentials are configured."""
         return not self.missing_connection_values
+
+    @property
+    def timezone_name(self) -> str:
+        """Return the configured IANA timezone name."""
+        return self.timezone.key
+
+    def now(self) -> datetime:
+        """Return the current time in the server's configured local timezone."""
+        return datetime.now(self.timezone)
+
+    def localize(self, value: datetime) -> datetime:
+        """Interpret a wall time in, or convert an instant to, the server timezone."""
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=self.timezone)
+        return value.astimezone(self.timezone)
+
+    def day_bounds(self, day: date) -> tuple[datetime, datetime]:
+        """Return configured-local midnights surrounding one calendar day."""
+        start = self.localize(datetime.combine(day, datetime.min.time()))
+        end = self.localize(datetime.combine(day + timedelta(days=1), datetime.min.time()))
+        return start, end
 
     def config(
         self,
@@ -324,7 +357,7 @@ class WebState:
         async with self._camera_lock:
             if self._cameras and not refresh and loop.time() - self._cameras_loaded_at < CAMERA_CACHE_SECONDS:
                 return list(self._cameras)
-            now = datetime.now().astimezone()
+            now = self.settings.now()
             config = self.settings.config(now, now + timedelta(seconds=1), "600x")
             self._cameras = await self._camera_loader(config)
             self._cameras_loaded_at = loop.time()
@@ -443,6 +476,7 @@ class WebState:
                     output=output,
                     daily=daily,
                     full_day=full_day or daily,
+                    created_at=self.settings.now(),
                 )
             )
         return jobs, planned_keys
@@ -495,7 +529,12 @@ class WebState:
         if speed not in SPEED_TO_FPS:
             message = "Choose a supported timelapse speed."
             raise ValueError(message)
-        schedule = DailySchedule(id=secrets.token_urlsafe(9), cameras=selected, speed=speed)
+        schedule = DailySchedule(
+            id=secrets.token_urlsafe(9),
+            cameras=selected,
+            speed=speed,
+            created_at=self.settings.now(),
+        )
         async with self._schedule_mutation_lock:
             self.schedules[schedule.id] = schedule
             try:
@@ -554,7 +593,7 @@ class WebState:
             try:
                 async with self._export_semaphore:
                     job.status = "running"
-                    job.started_at = datetime.now().astimezone()
+                    job.started_at = self.settings.now()
                     self._changed()
                     await self._persist_jobs()
                     if job.output.exists():
@@ -593,7 +632,7 @@ class WebState:
                 job.status = "failed"
                 job.error = str(exc) or type(exc).__name__
             finally:
-                job.finished_at = datetime.now().astimezone()
+                job.finished_at = self.settings.now()
                 self._changed()
                 await self._persist_jobs()
         finally:
@@ -602,12 +641,10 @@ class WebState:
     async def _run_schedule(self, schedule: DailySchedule) -> None:
         try:
             while schedule.id in self.schedules and not schedule.paused:
-                latest_day = latest_complete_local_day()
+                latest_day = self.settings.now().date() - timedelta(days=1)
                 day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day else latest_day
                 while day <= latest_day and schedule.id in self.schedules:
-                    start = datetime.combine(day, datetime.min.time()).astimezone()
-                    end_day = day + timedelta(days=1)
-                    end = datetime.combine(end_day, datetime.min.time()).astimezone()
+                    start, end = self.settings.day_bounds(day)
                     try:
                         jobs = await self.create_jobs(
                             [camera.id for camera in schedule.cameras],
@@ -639,9 +676,9 @@ class WebState:
                     await self._persist_schedules()
                     self._changed()
                     day += timedelta(days=1)
-                now = datetime.now().astimezone()
-                next_midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time()).astimezone()
-                await asyncio.sleep(max((next_midnight - now).total_seconds(), 1.0))
+                now = self.settings.now()
+                next_midnight = self.settings.day_bounds(now.date())[1]
+                await asyncio.sleep(max(next_midnight.timestamp() - now.timestamp(), 1.0))
         except asyncio.CancelledError:
             return
 
@@ -658,7 +695,7 @@ class WebState:
                 SCHEDULE_RETRY_MAX_SECONDS,
             )
             delay = base_delay + random.uniform(0, base_delay * 0.2)  # noqa: S311 - retry jitter is not security-sensitive
-            schedule.next_retry_at = datetime.now().astimezone() + timedelta(seconds=delay)
+            schedule.next_retry_at = self.settings.now() + timedelta(seconds=delay)
             schedule.last_error = error
         await self._persist_schedules()
         self._changed()
@@ -800,7 +837,7 @@ class WebState:
             if job.status in {"queued", "running"}:
                 job.status = "cancelled"
                 job.error = "The server stopped before this export completed."
-                job.finished_at = datetime.now().astimezone()
+                job.finished_at = self.settings.now()
                 changed = True
             elif job.status == "completed" and not job.output.is_file():
                 job.status = "failed"

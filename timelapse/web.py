@@ -83,10 +83,10 @@ def _format_bytes(value: int | None) -> str:
     return f"{value} B"
 
 
-def _format_datetime(value: datetime | None) -> str:
+def _format_datetime(value: datetime | None, settings: WebSettings) -> str:
     if value is None:
         return "—"
-    local = value.astimezone()
+    local = settings.localize(value)
     return f"{local:%b} {local.day}, {local:%Y} · {local.strftime('%I').lstrip('0')}:{local:%M %p}"
 
 
@@ -106,13 +106,13 @@ def _job_status(job: ExportJob) -> str:
     return labels[job.status]
 
 
-def _schedule_next_run(schedule: DailySchedule) -> str:
+def _schedule_next_run(schedule: DailySchedule, settings: WebSettings) -> str:
     if schedule.paused:
         return "paused"
     if schedule.next_retry_at is not None:
-        return _format_datetime(schedule.next_retry_at)
-    now = datetime.now().astimezone()
-    tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time()).astimezone()
+        return _format_datetime(schedule.next_retry_at, settings)
+    now = settings.now()
+    tomorrow = settings.day_bounds(now.date())[1]
     hour = tomorrow.strftime("%I").lstrip("0")
     return f"{tomorrow:%b} {tomorrow.day} at {hour}:{tomorrow:%M %p %Z}"
 
@@ -285,16 +285,16 @@ def _required_form_value(form: FormData, name: str, label: str) -> str:
     return value
 
 
-def _parse_local_datetime(raw: str, label: str) -> datetime:
+def _parse_local_datetime(raw: str, label: str, settings: WebSettings) -> datetime:
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError as exc:
         message = f"{label} must be a valid date and time."
         raise ValueError(message) from exc
-    return parsed.astimezone()
+    return settings.localize(parsed)
 
 
-def _parse_export_range(form: FormData) -> tuple[datetime, datetime, bool]:
+def _parse_export_range(form: FormData, settings: WebSettings) -> tuple[datetime, datetime, bool]:
     mode = str(form.get("range_mode", "full-day"))
     if mode == "full-day":
         raw = _required_form_value(form, "day", "Export date")
@@ -303,14 +303,13 @@ def _parse_export_range(form: FormData) -> tuple[datetime, datetime, bool]:
         except ValueError as exc:
             message = "Export date must be a valid calendar date."
             raise ValueError(message) from exc
-        start = datetime.combine(selected_day, datetime.min.time()).astimezone()
-        end = datetime.combine(selected_day + timedelta(days=1), datetime.min.time()).astimezone()
+        start, end = settings.day_bounds(selected_day)
         return start, end, True
     if mode != "exact":
         message = "Choose a full day or an exact time range."
         raise ValueError(message)
-    start = _parse_local_datetime(_required_form_value(form, "start", "Start time"), "Start time")
-    end = _parse_local_datetime(_required_form_value(form, "end", "End time"), "End time")
+    start = _parse_local_datetime(_required_form_value(form, "start", "Start time"), "Start time", settings)
+    end = _parse_local_datetime(_required_form_value(form, "end", "End time"), "End time", settings)
     if end <= start:
         message = "End time must be after start time."
         raise ValueError(message)
@@ -364,10 +363,10 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
 
     templates = Jinja2Templates(directory=TEMPLATES_DIR)
     templates.env.filters["bytes"] = _format_bytes
-    templates.env.filters["datetime"] = _format_datetime
+    templates.env.filters["datetime"] = lambda value: _format_datetime(value, configured_settings)
     templates.env.filters["date"] = _format_date
     templates.env.filters["job_status"] = _job_status
-    templates.env.filters["next_run"] = _schedule_next_run
+    templates.env.filters["next_run"] = lambda schedule: _schedule_next_run(schedule, configured_settings)
 
     @application.middleware("http")
     async def identify_and_log_requests(
@@ -512,13 +511,13 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
 
     @application.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> Response:
-        now = datetime.now().astimezone()
+        now = configured_settings.now()
         return templates.TemplateResponse(
             request=request,
             name="index.html",
             context={
                 "speeds": SPEED_TO_FPS,
-                "timezone_name": now.tzname() or "local time",
+                "timezone_name": configured_settings.timezone_name,
                 "yesterday": (now.date() - timedelta(days=1)).isoformat(),
                 "today": now.date().isoformat(),
                 "now_local": now.strftime("%Y-%m-%dT%H:%M"),
@@ -594,7 +593,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         try:
             form = await request.form()
             camera_ids = _form_values(form, "camera_ids")
-            start, end, full_day = _parse_export_range(form)
+            start, end, full_day = _parse_export_range(form, configured_settings)
             speed = _parse_speed(form)
             created = await web_state.create_jobs(camera_ids, start, end, speed, full_day=full_day)
         except WebCapacityError as exc:
@@ -663,7 +662,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     @application.get("/api/thumbnails/{camera_id}")
     async def thumbnail(camera_id: str, timestamp: TIMESTAMP_QUERY) -> Response:
         try:
-            requested_time = _parse_local_datetime(timestamp, "Preview time")
+            requested_time = _parse_local_datetime(timestamp, "Preview time", configured_settings)
             result = await web_state.thumbnail(camera_id, requested_time)
         except OperationTimeoutError as exc:
             return PlainTextResponse(str(exc), status_code=504)

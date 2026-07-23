@@ -247,11 +247,17 @@ To use the interface from other devices on the same trusted network, add these v
 unique password:
 
 ```dotenv
+TZ=America/New_York
 TIMELAPSE_WEB_HOST=0.0.0.0
 TIMELAPSE_WEB_TRUSTED_HOSTS=timelapse-server,timelapse-server.local,192.168.2.17
 TIMELAPSE_WEB_USERNAME=timelapse
 TIMELAPSE_WEB_PASSWORD=replace-with-a-long-random-password
 ```
+
+Web dates and times default to UTC. Set `TZ` to an
+[IANA timezone name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones), such as `America/New_York`, when
+the server should use another timezone. Docker Compose passes `TZ` into the container and also defaults to UTC when the
+variable is unset.
 
 `TIMELAPSE_WEB_TRUSTED_HOSTS` lists the server addresses that may appear in the browser URL; it does not list the IP
 addresses of computers, phones, or other clients connecting to the server. For example, browsing to

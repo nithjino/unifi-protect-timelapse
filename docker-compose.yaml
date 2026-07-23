@@ -7,6 +7,7 @@ services:
     env_file:
       - .env
     environment:
+      TZ: ${TZ:-UTC}
       TIMELAPSE_WEB_DATA_DIR: /data
       TIMELAPSE_WEB_OUTPUT_DIR: /data/exports
       TIMELAPSE_WEB_HOST: 0.0.0.0

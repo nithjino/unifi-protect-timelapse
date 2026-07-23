@@ -20,7 +20,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     TIMELAPSE_WEB_HOST=0.0.0.0 \
     TIMELAPSE_WEB_PORT=8000
 
-RUN useradd --create-home --uid 10001 timelapse \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 10001 timelapse \
     && mkdir -p /data/exports \
     && chown -R timelapse:timelapse /data
 
