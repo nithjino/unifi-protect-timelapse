@@ -68,18 +68,18 @@ jobs:
         shell: pwsh
         run: ./build-windows.ps1
 
-      - name: Name Windows release asset
+      - name: Package Windows release asset
         shell: pwsh
         run: |
-          Move-Item `
+          Compress-Archive `
             -Path dist/windows/timelapse.exe `
-            -Destination "dist/windows/TimeLapse-$env:GITHUB_REF_NAME-windows-x64.exe"
+            -DestinationPath "dist/windows/TimeLapse-$env:GITHUB_REF_NAME-windows-x64.zip"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-windows
-          path: dist/windows/TimeLapse-*.exe
+          path: dist/windows/TimeLapse-*.zip
           compression-level: 0
           if-no-files-found: error
 
@@ -115,19 +115,21 @@ jobs:
       - name: Build Linux executable and AppImage
         run: ./build-linux.sh
 
-      - name: Name Linux release assets
+      - name: Package Linux release assets
         run: |
           mv dist/linux/timelapse "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64"
           mv dist/linux/TimeLapse-x86_64.AppImage \
+            "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
+          zip -j "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64.zip" \
+            "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64"
+          zip -j "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64-AppImage.zip" \
             "dist/linux/TimeLapse-${GITHUB_REF_NAME}-linux-x86_64.AppImage"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: release-linux
-          path: |
-            dist/linux/TimeLapse-*-linux-x86_64
-            dist/linux/TimeLapse-*-linux-x86_64.AppImage
+          path: dist/linux/TimeLapse-*.zip
           compression-level: 0
           if-no-files-found: error
 
