@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -77,10 +78,11 @@ def _client(app: FastAPI, *, host: str = "127.0.0.1") -> TestClient:
 
 
 def _wait_for_completed_jobs(client: TestClient, state: WebState) -> str:
-    for _attempt in range(10):
-        response = client.get("/partials/jobs")
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
         if state.jobs and all(job.status == "completed" for job in state.jobs.values()):
-            return response.text
+            return client.get("/partials/jobs").text
+        time.sleep(0.01)
     pytest.fail("exports did not complete after polling the jobs endpoint")
 
 
