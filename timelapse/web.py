@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import TYPE_CHECKING, Annotated
-from urllib.parse import quote, urlsplit
+from urllib.parse import urlsplit
 
 import uvicorn
 from dotenv import load_dotenv
@@ -408,10 +408,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         if public or configured_settings.web_password is None:
             return _add_security_headers(await call_next(request))
         if not sessions.valid(request.cookies.get(SESSION_COOKIE)):
-            next_path = request.url.path
-            if request.url.query:
-                next_path = f"{next_path}?{request.url.query}"
-            login_url = f"/login?next={quote(next_path, safe='')}"
+            login_url = "/login?next=%2F"
             if request.headers.get("HX-Request") == "true" or request.url.path.startswith("/api/"):
                 return _add_security_headers(
                     PlainTextResponse("Login required", status_code=401, headers={"HX-Redirect": login_url})

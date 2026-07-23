@@ -189,6 +189,29 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     assert denied_again.status_code == 303
 
 
+def test_reauthentication_from_partial_returns_to_dashboard(tmp_path: Path) -> None:
+    app, _state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
+
+    with _client(app) as client:
+        prompt = client.get(
+            "/partials/jobs",
+            headers={"HX-Request": "true"},
+            follow_redirects=False,
+        )
+        login_page = client.get(prompt.headers["hx-redirect"])
+        signed_in = client.post(
+            "/login",
+            data={"username": "viewer", "password": "web-secret", "next": "/"},
+            follow_redirects=False,
+        )
+
+    assert prompt.status_code == 401
+    assert prompt.headers["hx-redirect"] == "/login?next=%2F"
+    assert 'name="next" value="/"' in login_page.text
+    assert signed_in.status_code == 303
+    assert signed_in.headers["location"] == "/"
+
+
 def test_login_rejects_external_return_path_and_throttles_failures(tmp_path: Path) -> None:
     app, _state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
 
