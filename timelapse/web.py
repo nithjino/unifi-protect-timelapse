@@ -695,9 +695,16 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     @application.get("/exports/{job_id}")
     async def download_export(job_id: JOB_ID) -> Response:
         job = web_state.jobs.get(job_id)
-        if job is None or job.status != "completed" or not job.output.is_file():
+        if job is None or job.status not in {"completed", "skipped"} or not job.output.is_file():
             return PlainTextResponse("Export is not available.", status_code=404)
         return FileResponse(job.output, media_type="video/mp4", filename=job.output.name)
+
+    @application.get("/exports/{job_id}/play")
+    async def play_export(job_id: JOB_ID) -> Response:
+        job = web_state.jobs.get(job_id)
+        if job is None or job.status not in {"completed", "skipped"} or not job.output.is_file():
+            return PlainTextResponse("Export is not available.", status_code=404)
+        return FileResponse(job.output, media_type="video/mp4")
 
     return application
 

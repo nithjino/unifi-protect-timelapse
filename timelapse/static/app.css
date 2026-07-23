@@ -243,9 +243,47 @@ main {
   box-shadow: var(--shadow);
 }
 
-.server-info-dialog::backdrop {
+.server-info-dialog::backdrop,
+.video-player-dialog::backdrop {
   background: rgb(4 7 11 / 72%);
   backdrop-filter: blur(5px);
+}
+
+.video-player-dialog {
+  width: min(960px, calc(100vw - 36px));
+  max-height: calc(100vh - 36px);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 19px;
+  color: var(--ink);
+  background: #080c12;
+  box-shadow: var(--shadow);
+}
+
+.video-player-stage {
+  display: grid;
+  aspect-ratio: 16 / 9;
+  max-height: calc(100vh - 120px);
+  place-items: center;
+  overflow: hidden;
+  background: #000;
+}
+
+.video-player-stage video {
+  width: 100%;
+  height: 100%;
+  max-height: calc(100vh - 120px);
+  background: #000;
+}
+
+.video-player-dialog .dialog-heading > div {
+  min-width: 0;
+}
+
+.video-player-dialog .dialog-heading h2 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .dialog-heading {
@@ -408,6 +446,7 @@ main {
 
 .activity-column {
   display: grid;
+  min-width: 0;
   gap: 22px;
 }
 
@@ -951,6 +990,7 @@ button:disabled {
 .job-list,
 .schedule-list {
   display: grid;
+  min-width: 0;
   gap: 10px;
 }
 
@@ -962,6 +1002,7 @@ button:disabled {
 }
 
 .job-card {
+  min-width: 0;
   padding: 17px;
 }
 
@@ -1100,6 +1141,8 @@ progress::-moz-progress-bar {
 }
 
 .job-footer > span {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   color: var(--muted);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -1139,6 +1182,20 @@ progress::-moz-progress-bar {
   border-color: rgb(99 211 163 / 30%);
   color: var(--success);
   background: rgb(99 211 163 / 7%);
+}
+
+.small-button.play-button {
+  border-color: rgb(89 216 231 / 30%);
+  color: var(--cyan);
+  background: rgb(89 216 231 / 7%);
+}
+
+.small-button.play-button:disabled {
+  border-color: var(--line);
+  color: var(--muted);
+  background: transparent;
+  cursor: not-allowed;
+  opacity: 0.45;
 }
 
 .small-button.danger {
@@ -1440,7 +1497,7 @@ footer {
 
   .activity-column {
     order: 1;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
     align-items: start;
   }
 }

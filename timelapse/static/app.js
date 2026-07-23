@@ -19,6 +19,10 @@
   const liveLabel = document.querySelector("#live-label");
   const serverInfoButton = document.querySelector("#server-info-button");
   const serverInfoDialog = document.querySelector("#server-info-dialog");
+  const videoPlayerDialog = document.querySelector("#video-player-dialog");
+  const videoPlayerClose = document.querySelector("#video-player-close");
+  const videoPlayerTitle = document.querySelector("#video-player-title");
+  const exportVideoPlayer = document.querySelector("#export-video-player");
   const previewTimers = { start: null, end: null };
   const previewControllers = { start: null, end: null };
   const previewDirty = { start: false, end: false };
@@ -174,6 +178,34 @@
     }
   }
 
+  function resetVideoPlayer() {
+    if (!exportVideoPlayer) return;
+    exportVideoPlayer.pause();
+    exportVideoPlayer.removeAttribute("src");
+    exportVideoPlayer.load();
+  }
+
+  function closeVideoPlayer() {
+    if (videoPlayerDialog?.open) {
+      videoPlayerDialog.close();
+    } else {
+      resetVideoPlayer();
+    }
+  }
+
+  function openVideoPlayer(button) {
+    const videoUrl = button.dataset.videoUrl;
+    if (!videoUrl || !videoPlayerDialog || !exportVideoPlayer) return;
+    if (videoPlayerTitle) {
+      videoPlayerTitle.textContent = button.dataset.videoTitle || "Play export";
+    }
+    exportVideoPlayer.src = videoUrl;
+    videoPlayerDialog.showModal();
+    void exportVideoPlayer.play().catch(() => {
+      // Native controls remain available when autoplay is unavailable.
+    });
+  }
+
   document.addEventListener("change", (event) => {
     if (event.target.matches('input[name="camera_ids"]')) {
       updateSelectionCount();
@@ -211,6 +243,10 @@
     if (event.target.matches(".dismiss-toast")) {
       event.target.closest(".toast")?.remove();
     }
+    const playButton = event.target.closest(".play-button[data-video-url]");
+    if (playButton && !playButton.disabled) {
+      openVideoPlayer(playButton);
+    }
   });
 
   document.body.addEventListener("htmx:afterSwap", (event) => {
@@ -224,6 +260,11 @@
   serverInfoDialog?.addEventListener("click", (event) => {
     if (event.target === serverInfoDialog) serverInfoDialog.close();
   });
+  videoPlayerClose?.addEventListener("click", closeVideoPlayer);
+  videoPlayerDialog?.addEventListener("click", (event) => {
+    if (event.target === videoPlayerDialog) closeVideoPlayer();
+  });
+  videoPlayerDialog?.addEventListener("close", resetVideoPlayer);
   updateRangeMode();
   updateFullDayEnd();
   updateSelectionCount();

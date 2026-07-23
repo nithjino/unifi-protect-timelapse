@@ -38,8 +38,23 @@
         <div class="job-footer">
           <span>{{ job.speed }} · {{ job.output.name }}</span>
           <div class="job-actions">
-            {% if job.status == 'completed' %}
+            {% if job.status in ('completed', 'skipped') %}
               <a class="small-button primary" href="/exports/{{ job.id }}">Download</a>
+            {% endif %}
+            <button
+              class="small-button play-button"
+              type="button"
+              {% if job.status in ('completed', 'skipped') %}
+                data-video-url="/exports/{{ job.id }}/play"
+                data-video-title="{{ job.camera.name }} · {{ job.start | datetime }}"
+                aria-label="Play {{ job.camera.name }} export"
+              {% else %}
+                disabled
+                title="Available when the export is ready"
+                aria-label="Play {{ job.camera.name }} export (available when ready)"
+              {% endif %}
+            >Play</button>
+            {% if job.status == 'completed' %}
               <button
                 class="small-button"
                 hx-delete="/actions/jobs/{{ job.id }}"

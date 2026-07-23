@@ -16,7 +16,7 @@ from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
 from timelapse.web import create_app, main
-from timelapse.web_state import DailySchedule, WebCapacityError, WebSettings, WebState
+from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -90,6 +90,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     with _client(app) as client:
         response = client.get("/")
         javascript = client.get("/static/htmx.min.js")
+        application_javascript = client.get("/static/app.js")
 
     assert response.status_code == 200
     assert response.headers["x-request-id"]
@@ -97,6 +98,8 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "cdn.jsdelivr.net" not in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
+    assert 'id="video-player-dialog"' in response.text
+    assert 'id="export-video-player" controls playsinline preload="metadata"' in response.text
     assert ">Full Day<" in response.text
     assert ">Exact Range<" in response.text
     assert 'id="full-day-start-date"' in response.text
@@ -106,6 +109,8 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "Times are interpreted in the server\u2019s UTC timezone." in response.text
     assert javascript.status_code == 200
     assert "htmx" in javascript.text
+    assert application_javascript.status_code == 200
+    assert "showModal" in application_javascript.text
 
 
 def test_dashboard_reports_configured_server_timezone(tmp_path: Path) -> None:
@@ -291,6 +296,7 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
         job = next(iter(state.jobs.values()))
         preview = client.get(f"/api/thumbnails/{job.camera.id}", params={"timestamp": start.isoformat()})
         download = client.get(f"/exports/{job.id}")
+        playback = client.get(f"/exports/{job.id}/play", headers={"Range": "bytes=0-2"})
 
     assert camera_response.status_code == 200
     assert "Front Door" in camera_response.text
@@ -303,8 +309,71 @@ def test_camera_export_thumbnail_and_download_flow(tmp_path: Path) -> None:
     assert preview.headers["x-timelapse-thumbnail-source"] == "exact"
     assert download.status_code == 200
     assert download.content == b"video"
+    assert f'data-video-url="/exports/{job.id}/play"' in jobs_html
+    assert jobs_html.count('class="small-button play-button"') == 2
+    assert playback.status_code == 206
+    assert playback.content == b"vid"
+    assert playback.headers["content-type"] == "video/mp4"
+    assert playback.headers["accept-ranges"] == "bytes"
     assert job.full_day is False
     assert job.output.name.endswith("_120x__6bf6f341d9a3.mp4")
+
+
+def test_running_export_renders_disabled_play_button(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+    job = ExportJob(
+        id="running01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(hours=2),
+        speed="120x",
+        output=tmp_path / "data" / "exports" / "running.mp4",
+        status="running",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        jobs_response = client.get("/partials/jobs")
+        playback = client.get(f"/exports/{job.id}/play")
+
+    assert jobs_response.status_code == 200
+    assert 'class="small-button play-button"' in jobs_response.text
+    assert "disabled" in jobs_response.text
+    assert "Available when the export is ready" in jobs_response.text
+    assert "data-video-url" not in jobs_response.text
+    assert playback.status_code == 404
+
+
+def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, tzinfo=UTC)
+    output = tmp_path / "data" / "exports" / "existing.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"video")
+    job = ExportJob(
+        id="skipped01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(days=1),
+        speed="600x",
+        output=output,
+        daily=True,
+        full_day=True,
+        status="skipped",
+        error="A file already exists for this camera and time range.",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        jobs_response = client.get("/partials/jobs")
+        download = client.get(f"/exports/{job.id}")
+        playback = client.get(f"/exports/{job.id}/play")
+
+    assert f'href="/exports/{job.id}"' in jobs_response.text
+    assert f'data-video-url="/exports/{job.id}/play"' in jobs_response.text
+    assert download.content == b"video"
+    assert playback.content == b"video"
 
 
 def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
