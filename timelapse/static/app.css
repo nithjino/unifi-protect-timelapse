@@ -710,14 +710,19 @@ main {
 
 .range-fields.two-column {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
+}
+
+.field {
+  min-width: 0;
 }
 
 .field .date-time-inputs {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(120px, 0.65fr);
   gap: 8px;
+  min-width: 0;
   margin: 0;
 }
 
@@ -734,6 +739,7 @@ main {
 
 .field input {
   width: 100%;
+  min-width: 0;
   min-height: 43px;
   padding: 9px 11px;
   border: 1px solid var(--line);
@@ -1594,7 +1600,18 @@ footer {
   .range-fields.two-column,
   .preview-grid,
   .form-actions {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .field .date-time-inputs {
+    grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr);
+  }
+
+  .field input[type="date"],
+  .field input[type="time"],
+  .field input[type="datetime-local"] {
+    padding-inline: 8px;
+    text-align: center;
   }
 
   .job-topline,
@@ -1612,6 +1629,12 @@ footer {
 
   footer {
     flex-direction: column;
+  }
+}
+
+@media (max-width: 350px) {
+  .field .date-time-inputs {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
