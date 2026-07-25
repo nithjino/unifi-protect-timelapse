@@ -5,6 +5,7 @@ import json
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -539,6 +540,35 @@ def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:
     assert "UNIFI_PROTECT_URL" in status.text
     assert "Server configuration is incomplete" in cameras.text
     assert "sensitive-integration-token" not in status.text + cameras.text
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "expected_percent", "storage_low"),
+    [
+        (200, "20.0", "false"),
+        (199, "19.9", "true"),
+    ],
+)
+def test_server_status_reports_host_storage_and_low_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    free_bytes: int,
+    expected_percent: str,
+    storage_low: str,
+) -> None:
+    app, _state = _app(tmp_path)
+    monkeypatch.setattr(
+        "timelapse.web.shutil.disk_usage",
+        lambda _path: SimpleNamespace(total=1000, used=1000 - free_bytes, free=free_bytes),
+    )
+
+    with _client(app) as client:
+        status = client.get("/partials/status")
+
+    assert status.status_code == 200
+    assert "<strong>Host storage</strong>" in status.text
+    assert f'data-storage-low="{storage_low}"' in status.text
+    assert f"{free_bytes} B free of 1000 B ({expected_percent}% available)" in " ".join(status.text.split())
 
 
 def test_daily_schedule_is_persisted(tmp_path: Path) -> None:

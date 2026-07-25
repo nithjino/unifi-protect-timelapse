@@ -8,7 +8,9 @@ import ipaddress
 import logging
 import os
 import secrets
+import shutil
 from contextlib import asynccontextmanager, suppress
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import monotonic
@@ -51,6 +53,7 @@ SECONDS_PER_HOUR = 60 * 60
 SESSION_COOKIE = "timelapse_session"
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 60.0
+LOW_STORAGE_PERCENT = 20
 JOB_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
 SCHEDULE_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
 TIMESTAMP_QUERY = Annotated[str, Query(min_length=10, max_length=40)]
@@ -58,6 +61,20 @@ NEXT_QUERY = Annotated[str | None, Query(alias="next")]
 _LOGGER = logging.getLogger(__name__)
 
 load_dotenv(override=False)
+
+
+@dataclass(frozen=True)
+class _StorageInfo:
+    """Available capacity on the filesystem used for web exports."""
+
+    free_bytes: int | None
+    total_bytes: int | None
+    free_percent: float | None
+
+    @property
+    def low(self) -> bool:
+        """Return whether less than 20 percent of the filesystem is free."""
+        return self.free_percent is not None and self.free_percent < LOW_STORAGE_PERCENT
 
 
 class _ShutdownAwareServer(uvicorn.Server):
@@ -82,6 +99,16 @@ def _format_bytes(value: int | None) -> str:
             return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
         size /= KIBIBYTE
     return f"{value} B"
+
+
+def _storage_info(path: Path) -> _StorageInfo:
+    try:
+        usage = shutil.disk_usage(path)
+    except OSError:
+        _LOGGER.warning("Could not measure available storage for %s", path, exc_info=True)
+        return _StorageInfo(free_bytes=None, total_bytes=None, free_percent=None)
+    free_percent = usage.free / usage.total * 100 if usage.total else None
+    return _StorageInfo(free_bytes=usage.free, total_bytes=usage.total, free_percent=free_percent)
 
 
 def _format_datetime(value: datetime | None, settings: WebSettings) -> str:
@@ -539,10 +566,11 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     @application.get("/partials/status", response_class=HTMLResponse)
     async def connection_status(request: Request) -> Response:
         active_jobs = sum(not job.terminal for job in web_state.jobs.values())
+        storage = await asyncio.to_thread(_storage_info, configured_settings.output_dir)
         return templates.TemplateResponse(
             request=request,
             name="partials/status.html",
-            context={"settings": configured_settings, "active_jobs": active_jobs},
+            context={"settings": configured_settings, "active_jobs": active_jobs, "storage": storage},
         )
 
     @application.get("/partials/cameras", response_class=HTMLResponse)

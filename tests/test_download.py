@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -23,9 +24,11 @@ if TYPE_CHECKING:
 class _FakeContent:
     def __init__(self, chunks: list[bytes]) -> None:
         self.chunks = chunks
+        self.iterated = False
 
     async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
         del chunk_size
+        self.iterated = True
         for chunk in self.chunks:
             yield chunk
 
@@ -203,6 +206,119 @@ def test_download_cancellation_releases_response_and_removes_partial_file(tmp_pa
     assert response.released is True
     assert not output.exists()
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
+    assert not download_module._STORAGE_RESERVATIONS
+
+
+def test_download_rejects_known_size_before_streaming_when_storage_is_insufficient(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    content = _FakeContent([b"\x00\x00\x00\x18ftypisomdata"])
+    response = _FakeResponse(content, {"Content-Length": "60"})
+    client = cast("ProtectApiClient", _FakeClient(response))
+    monkeypatch.setattr(
+        download_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=1000, used=900, free=100),
+    )
+
+    with pytest.raises(TimelapseError, match=r"not enough free storage.*50 bytes is available.*50 bytes safety"):
+        asyncio.run(
+            download_timelapse(
+                _config(),
+                parse_connection(_config().instance_url),
+                client,
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                tmp_path / "insufficient.mp4",
+            )
+        )
+
+    assert content.iterated is False
+    assert response.released is True
+    assert list(tmp_path.iterdir()) == []
+    assert not download_module._STORAGE_RESERVATIONS
+
+
+def test_unknown_size_reserves_configured_maximum_across_concurrent_downloads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mebibyte = download_module.MEBIBYTE
+    monkeypatch.setattr(
+        download_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=10 * mebibyte, used=0, free=mebibyte + mebibyte // 2),
+    )
+    config = replace(_config(), max_download_mib=1)
+
+    async def exercise() -> tuple[_FakeResponse, _FakeResponse, _FakeContent]:
+        blocking_content = _BlockingContent()
+        first_response = _FakeResponse(blocking_content, {})
+        first_task = asyncio.create_task(
+            download_timelapse(
+                config,
+                parse_connection(config.instance_url),
+                cast("ProtectApiClient", _FakeClient(first_response)),
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                tmp_path / "first.mp4",
+            )
+        )
+        await blocking_content.blocked.wait()
+
+        second_content = _FakeContent([b"\x00\x00\x00\x18ftypisom"])
+        second_response = _FakeResponse(second_content, {"Content-Length": "16"})
+        with pytest.raises(TimelapseError, match="not enough free storage"):
+            await download_timelapse(
+                config,
+                parse_connection(config.instance_url),
+                cast("ProtectApiClient", _FakeClient(second_response)),
+                CameraInfo(id="camera-2", name="Back Yard", state=None, model=None),
+                tmp_path / "second.mp4",
+            )
+
+        first_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first_task
+        return first_response, second_response, second_content
+
+    first_response, second_response, second_content = asyncio.run(exercise())
+
+    assert first_response.released is True
+    assert second_response.released is True
+    assert second_content.iterated is False
+    assert not download_module._STORAGE_RESERVATIONS
+
+
+def test_download_stops_and_cleans_up_when_free_space_drops_mid_stream(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video = b"\x00\x00\x00\x18ftypisomdata"
+    content = _FakeContent([video[:8], video[8:]])
+    response = _FakeResponse(content, {"Content-Length": str(len(video))})
+    client = cast("ProtectApiClient", _FakeClient(response))
+    free_values = iter((100, 100, 55))
+    monkeypatch.setattr(
+        download_module.shutil,
+        "disk_usage",
+        lambda _path: SimpleNamespace(total=1000, used=0, free=next(free_values)),
+    )
+
+    with pytest.raises(TimelapseError, match="free storage fell below the download safety buffer"):
+        asyncio.run(
+            download_timelapse(
+                _config(),
+                parse_connection(_config().instance_url),
+                client,
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                tmp_path / "space-dropped.mp4",
+            )
+        )
+
+    assert content.iterated is True
+    assert response.released is True
+    assert list(tmp_path.iterdir()) == []
+    assert not download_module._STORAGE_RESERVATIONS
 
 
 def test_download_preserves_an_existing_output(tmp_path: Path) -> None:

@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import logging
 import re
+import shutil
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     from uiprotect import ProtectApiClient
 
 MEBIBYTE = 1024 * 1024
+GIBIBYTE = 1024 * MEBIBYTE
 KIBIBYTE = 1024
 CHUNK_SIZE = MEBIBYTE
 MAX_ERROR_BODY_BYTES = 8 * 1024
@@ -35,7 +38,11 @@ HTTP_MULTIPLE_CHOICES = 300
 HTTP_TOO_MANY_REQUESTS = 429
 MAX_CAMERA_FILENAME_CHARACTERS = 48
 CAMERA_ID_DIGEST_CHARACTERS = 12
+STORAGE_SAFETY_RESERVE_BYTES = GIBIBYTE
+STORAGE_SAFETY_RESERVE_PERCENT = 5
 _LOGGER = logging.getLogger(__name__)
+_STORAGE_RESERVATION_LOCK = threading.Lock()
+_STORAGE_RESERVATIONS: set[_StorageReservation] = set()
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,16 @@ class DownloadProgress:
 
 
 ProgressCallback = Callable[[DownloadProgress], None]
+
+
+@dataclass(eq=False)
+class _StorageReservation:
+    """Capacity promised to one active download on a destination filesystem."""
+
+    filesystem_key: tuple[int, str]
+    directory: Path
+    remaining_bytes: int
+    safety_bytes: int
 
 
 def default_output_path(config: Config, camera: CameraInfo) -> Path:
@@ -65,6 +82,89 @@ def default_output_path(config: Config, camera: CameraInfo) -> Path:
     return Path(
         f"timelapse_{safe_name}_{start_date}_{start_time}_{end_date}_{end_time}_{config.speed}__{camera_digest}.mp4"
     )
+
+
+def _storage_safety_bytes(total_bytes: int) -> int:
+    percentage_bytes = total_bytes * STORAGE_SAFETY_RESERVE_PERCENT // 100
+    return min(STORAGE_SAFETY_RESERVE_BYTES, percentage_bytes)
+
+
+def _filesystem_key(directory: Path) -> tuple[int, str]:
+    try:
+        return directory.stat().st_dev, directory.resolve().anchor.casefold()
+    except OSError as exc:
+        message = f"could not inspect export storage at {directory}: {exc}"
+        raise TimelapseError(message) from exc
+
+
+def _disk_usage(directory: Path) -> shutil._ntuple_diskusage:
+    try:
+        return shutil.disk_usage(directory)
+    except OSError as exc:
+        message = f"could not measure free export storage at {directory}: {exc}"
+        raise TimelapseError(message) from exc
+
+
+def _reserved_bytes(filesystem_key: tuple[int, str], *, excluding: _StorageReservation | None = None) -> int:
+    return sum(
+        reservation.remaining_bytes
+        for reservation in _STORAGE_RESERVATIONS
+        if reservation.filesystem_key == filesystem_key and reservation is not excluding
+    )
+
+
+def _reserve_storage(directory: Path, expected_bytes: int | None) -> _StorageReservation:
+    filesystem_key = _filesystem_key(directory)
+    with _STORAGE_RESERVATION_LOCK:
+        usage = _disk_usage(directory)
+        safety_bytes = _storage_safety_bytes(usage.total)
+        concurrently_reserved = _reserved_bytes(filesystem_key)
+        available_bytes = max(usage.free - concurrently_reserved - safety_bytes, 0)
+        reservation_bytes = available_bytes if expected_bytes is None else expected_bytes
+        if reservation_bytes > available_bytes or (expected_bytes is None and reservation_bytes == 0):
+            description = (
+                "an export of unknown size" if expected_bytes is None else f"the {_format_bytes(expected_bytes)} export"
+            )
+            message = (
+                f"not enough free storage for {description}: {_format_bytes(available_bytes)} is available after "
+                f"active download reservations and the {_format_bytes(safety_bytes)} safety buffer"
+            )
+            raise TimelapseError(message)
+        reservation = _StorageReservation(
+            filesystem_key=filesystem_key,
+            directory=directory,
+            remaining_bytes=reservation_bytes,
+            safety_bytes=safety_bytes,
+        )
+        _STORAGE_RESERVATIONS.add(reservation)
+        return reservation
+
+
+def _ensure_stream_storage(reservation: _StorageReservation, chunk_bytes: int) -> None:
+    with _STORAGE_RESERVATION_LOCK:
+        usage = _disk_usage(reservation.directory)
+        concurrently_reserved = _reserved_bytes(reservation.filesystem_key, excluding=reservation)
+        protected_bytes = max(reservation.remaining_bytes, chunk_bytes)
+        available_after_write = usage.free - concurrently_reserved - protected_bytes
+        if available_after_write < reservation.safety_bytes:
+            message = (
+                "free storage fell below the download safety buffer: "
+                f"{_format_bytes(usage.free)} remains, with {_format_bytes(concurrently_reserved)} reserved for "
+                f"other downloads and {_format_bytes(reservation.safety_bytes)} kept free"
+            )
+            raise TimelapseError(message)
+
+
+def _consume_storage_reservation(reservation: _StorageReservation, written_bytes: int) -> None:
+    with _STORAGE_RESERVATION_LOCK:
+        reservation.remaining_bytes = max(reservation.remaining_bytes - written_bytes, 0)
+
+
+def _release_storage_reservation(reservation: _StorageReservation | None) -> None:
+    if reservation is None:
+        return
+    with _STORAGE_RESERVATION_LOCK:
+        _STORAGE_RESERVATIONS.discard(reservation)
 
 
 async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-download lifecycle
@@ -130,6 +230,7 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         _format_bytes(total_bytes),
     )
     temp_output: Path | None = None
+    storage_reservation: _StorageReservation | None = None
     try:
         if not HTTP_OK <= response.status < HTTP_MULTIPLE_CHOICES:
             if response.status == HTTP_TOO_MANY_REQUESTS:
@@ -152,6 +253,8 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
             )
             raise TimelapseError(message)
 
+        expected_storage_bytes = total_bytes if total_bytes is not None else (max_bytes or None)
+        storage_reservation = _reserve_storage(output.parent, expected_storage_bytes)
         download_started_at = monotonic()
         stream_started_at = perf_counter()
         first_chunk_received = False
@@ -179,8 +282,10 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
                 if max_bytes and next_downloaded > max_bytes:
                     message = f"download exceeded the {config.max_download_mib} MiB limit"
                     raise TimelapseError(message)
+                _ensure_stream_storage(storage_reservation, len(chunk))
                 file.write(chunk)
                 downloaded = next_downloaded
+                _consume_storage_reservation(storage_reservation, len(chunk))
                 now = monotonic()
                 if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL_SECONDS:
                     _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, now)
@@ -220,6 +325,7 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         _release_response(response)
         if temp_output is not None:
             _remove_temporary_output(temp_output)
+        _release_storage_reservation(storage_reservation)
 
 
 def _release_response(response: ClientResponse) -> None:

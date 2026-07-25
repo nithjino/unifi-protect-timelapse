@@ -20,3 +20,23 @@
     </div>
   {% endif %}
 </div>
+<div
+  class="server-info-row"
+  id="host-storage-status"
+  data-storage-low="{{ 'true' if storage.low else 'false' }}"
+>
+  <div class="connection-icon {% if storage.low %}danger{% else %}ready{% endif %}" aria-hidden="true">
+    {% if storage.low %}!{% else %}✓{% endif %}
+  </div>
+  <div>
+    <strong>Host storage</strong>
+    {% if storage.free_percent is not none %}
+      <p>
+        {{ storage.free_bytes | bytes }} free of {{ storage.total_bytes | bytes }}
+        ({{ '%.1f' | format(storage.free_percent) }}% available)
+      </p>
+    {% else %}
+      <p>Available storage could not be measured.</p>
+    {% endif %}
+  </div>
+</div>

@@ -193,7 +193,8 @@ input:focus-visible {
   box-shadow: 0 0 0 4px rgb(99 211 163 / 12%);
 }
 
-.live-dot.offline {
+.live-dot.offline,
+.live-dot.storage-low {
   background: var(--danger);
   box-shadow: 0 0 0 4px rgb(255 122 138 / 12%);
 }
@@ -231,6 +232,11 @@ main {
 .connection-icon.warning {
   color: var(--accent);
   background: rgb(255 200 87 / 12%);
+}
+
+.connection-icon.danger {
+  color: var(--danger);
+  background: rgb(255 122 138 / 12%);
 }
 
 .server-info-dialog {

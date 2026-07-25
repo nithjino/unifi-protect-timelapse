@@ -28,6 +28,23 @@
   const previewDirty = { start: false, end: false };
   const previewDebounceMilliseconds = 350;
   let previewsActivated = false;
+  let serverConnected = false;
+  let storageLow = false;
+
+  function renderConnectedState() {
+    if (!serverConnected) return;
+    liveDot?.classList.toggle("online", !storageLow);
+    liveDot?.classList.toggle("storage-low", storageLow);
+    liveDot?.classList.remove("offline");
+    if (liveLabel) liveLabel.textContent = "Server connected";
+  }
+
+  function updateStorageState(container) {
+    const storageStatus = container?.querySelector?.("#host-storage-status");
+    if (!storageStatus) return;
+    storageLow = storageStatus.dataset.storageLow === "true";
+    renderConnectedState();
+  }
 
   function selectedCameras() {
     return Array.from(document.querySelectorAll('input[name="camera_ids"]:checked'));
@@ -253,6 +270,7 @@
     if (event.detail.target?.id === "camera-picker") {
       updateSelectionCount();
     }
+    updateStorageState(event.detail.target);
   });
 
   previewButton?.addEventListener("click", loadPreviews);
@@ -271,15 +289,16 @@
 
   const events = new EventSource("/api/events");
   events.addEventListener("open", () => {
-    liveDot?.classList.add("online");
-    liveDot?.classList.remove("offline");
-    if (liveLabel) liveLabel.textContent = "Server connected";
+    serverConnected = true;
+    renderConnectedState();
   });
   events.addEventListener("state", () => {
     if (window.htmx) window.htmx.trigger(document.body, "stateChanged");
   });
   events.addEventListener("error", () => {
+    serverConnected = false;
     liveDot?.classList.remove("online");
+    liveDot?.classList.remove("storage-low");
     liveDot?.classList.add("offline");
     if (liveLabel) liveLabel.textContent = "Reconnecting";
   });
