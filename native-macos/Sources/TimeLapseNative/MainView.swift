@@ -446,7 +446,7 @@ struct MainView: View {
             Button("Restart", systemImage: "arrow.clockwise") { model.restart(job) }
         case .completed:
             Button("Show in Finder", systemImage: "folder") { model.reveal(job) }
-        case .preparing, .downloading, .cancelling:
+        case .preparing, .queued, .downloading, .cancelling:
             Button("Cancel", systemImage: "xmark.circle") { model.cancel(job) }
                 .disabled(job.state == .cancelling)
         }
@@ -547,7 +547,7 @@ private struct DownloadActionCell: View {
         case .cancelled, .failed:
             Button("Restart") { model.restart(job) }
                 .help("Retry this download with its original settings.")
-        case .preparing, .downloading, .cancelling:
+        case .preparing, .queued, .downloading, .cancelling:
             Button("Cancel") { model.cancel(job) }
                 .disabled(job.state == .cancelling)
         }

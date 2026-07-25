@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import uuid
+from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -69,7 +70,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from timelapse import TimelapseError
+from timelapse import ProtectRateLimitError, TimelapseError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo, parse_connection
@@ -338,6 +339,7 @@ class _DownloadEntry:
     completed: bool = False
     daily_schedule: bool = False
     scheduled_day: date | None = None
+    queued_for_rate_limit: bool = False
 
     @property
     def camera_name(self) -> str:
@@ -926,6 +928,7 @@ class _DownloadWorker(QThread):
     progress_changed: ClassVar[Signal] = Signal(object)
     download_succeeded: ClassVar[Signal] = Signal(str)
     download_failed: ClassVar[Signal] = Signal(str)
+    download_rate_limited: ClassVar[Signal] = Signal(str)
     download_cancelled: ClassVar[Signal] = Signal()
 
     def __init__(self, config: Config, camera: CameraInfo, output: Path, parent: QWidget | None = None) -> None:
@@ -953,6 +956,8 @@ class _DownloadWorker(QThread):
             loop.run_until_complete(task)
         except asyncio.CancelledError:
             self.download_cancelled.emit()
+        except ProtectRateLimitError as exc:
+            self.download_rate_limited.emit(_exception_text(exc))
         except Exception as exc:
             self.download_failed.emit(_exception_text(exc))
         else:
@@ -1014,6 +1019,7 @@ class _MainWindow(QMainWindow):
         self._open_camera_dialog_after_load = False
         self._open_daily_dialog_after_load = False
         self._workers: dict[_DownloadWorker, _DownloadEntry] = {}
+        self._rate_limited_queue: deque[_DownloadEntry] = deque()
         self._entries: list[_DownloadEntry] = []
         self._reserved_paths: set[str] = set()
         self._next_job_number = 1
@@ -1810,7 +1816,9 @@ class _MainWindow(QMainWindow):
             return
         if schedule.active_day is not None:
             active = any(
-                entry.scheduled_day == schedule.active_day and entry.worker in self._workers for entry in self._entries
+                entry.scheduled_day == schedule.active_day
+                and (entry.worker in self._workers or entry.queued_for_rate_limit)
+                for entry in self._entries
             )
             if active:
                 return
@@ -1966,6 +1974,7 @@ class _MainWindow(QMainWindow):
         worker.progress_changed.connect(partial(self._download_progress, entry))
         worker.download_succeeded.connect(partial(self._download_succeeded, entry))
         worker.download_failed.connect(partial(self._download_failed, entry))
+        worker.download_rate_limited.connect(partial(self._download_rate_limited, entry))
         worker.download_cancelled.connect(partial(self._download_cancelled, entry))
         worker.finished.connect(partial(self._download_worker_finished, worker))
         worker.start()
@@ -1989,11 +1998,15 @@ class _MainWindow(QMainWindow):
             if self._daily_schedule is not None:
                 self._stop_daily_schedule()
             return
+        queued = list(self._rate_limited_queue)
+        for entry in queued:
+            self._cancel_queued_download(entry, advance_queue=False)
         cancellable = [worker for worker, entry in self._workers.items() if not entry.terminal and not entry.cancelling]
         for worker in cancellable:
             self._cancel_download(worker)
-        if cancellable:
-            self.statusBar().showMessage(f"Cancelling {len(cancellable)} downloads…")
+        cancelled_count = len(queued) + len(cancellable)
+        if cancelled_count:
+            self.statusBar().showMessage(f"Cancelling {cancelled_count} downloads…")
 
     @Slot()
     def _clear_finished_jobs(self) -> None:
@@ -2011,7 +2024,8 @@ class _MainWindow(QMainWindow):
         has_cancellable_jobs = (
             self._daily_schedule is not None
             if self._shows_daily_automations
-            else any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
+            else bool(self._rate_limited_queue)
+            or any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
         )
         self._cancel_all_button.setEnabled(has_cancellable_jobs)
 
@@ -2118,6 +2132,7 @@ class _MainWindow(QMainWindow):
             self._set_entry_text(entry, _COLUMN_SPEED, "0 bytes/s")
 
     def _download_succeeded(self, entry: _DownloadEntry, _output_text: str) -> None:
+        entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = True
         self._set_entry_text(entry, _COLUMN_STATUS, "Completed")
@@ -2135,8 +2150,29 @@ class _MainWindow(QMainWindow):
             f"{entry.camera_name}: {entry.output.name}",
             QSystemTrayIcon.MessageIcon.Information,
         )
+        self._retry_next_rate_limited_download()
+
+    def _download_rate_limited(self, entry: _DownloadEntry, message: str) -> None:
+        if entry.terminal or entry.queued_for_rate_limit:
+            return
+        entry.queued_for_rate_limit = True
+        entry.cancelling = False
+        entry.completed = False
+        self._rate_limited_queue.append(entry)
+        self._set_entry_text(entry, _COLUMN_STATUS, "Queued — Protect rate limited", tooltip=message)
+        self._set_entry_text(entry, _COLUMN_SPEED, "—")
+        entry.progress_bar.setRange(0, 0)
+        entry.progress_bar.setFormat("")
+        self._set_action_button(entry, "Cancel", partial(self._cancel_queued_download, entry))
+        self._update_bulk_buttons()
+        _LOGGER.warning("Queued rate-limited camera download: %s", entry.camera_name)
+        self.statusBar().showMessage(
+            f"Queued {entry.camera_name}; it will retry after another download completes or is cancelled.",
+            8000,
+        )
 
     def _download_failed(self, entry: _DownloadEntry, message: str) -> None:
+        entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
@@ -2152,6 +2188,7 @@ class _MainWindow(QMainWindow):
         )
 
     def _download_cancelled(self, entry: _DownloadEntry) -> None:
+        entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = False
         self._reserved_paths.discard(self._reservation_key(entry.output))
@@ -2165,6 +2202,49 @@ class _MainWindow(QMainWindow):
             f"The download for {entry.camera_name} was cancelled.",
             QSystemTrayIcon.MessageIcon.Warning,
         )
+        self._retry_next_rate_limited_download()
+
+    def _cancel_queued_download(self, entry: _DownloadEntry, *, advance_queue: bool = True) -> None:
+        if not entry.queued_for_rate_limit:
+            return
+        with suppress(ValueError):
+            self._rate_limited_queue.remove(entry)
+        entry.queued_for_rate_limit = False
+        entry.terminal = True
+        entry.completed = False
+        entry.cancelling = False
+        self._reserved_paths.discard(self._reservation_key(entry.output))
+        self._set_entry_text(entry, _COLUMN_STATUS, "Cancelled")
+        self._set_entry_text(entry, _COLUMN_SPEED, "—")
+        self._set_action_button(entry, "Restart", partial(self._restart_download, entry))
+        self._update_bulk_buttons()
+        _LOGGER.info("Cancelled queued camera download: %s", entry.camera_name)
+        if advance_queue:
+            self._retry_next_rate_limited_download()
+
+    def _retry_next_rate_limited_download(self) -> None:
+        if self._closing:
+            return
+        while self._rate_limited_queue:
+            entry = self._rate_limited_queue.popleft()
+            if entry.terminal or not entry.queued_for_rate_limit:
+                continue
+            entry.queued_for_rate_limit = False
+            entry.cancelling = False
+            entry.downloaded_bytes = 0
+            entry.last_progress_at = None
+            self._set_entry_text(entry, _COLUMN_STATUS, "Preparing queued retry…", tooltip="")
+            self._set_entry_text(entry, _COLUMN_DOWNLOADED, "0 bytes")
+            self._set_entry_text(entry, _COLUMN_EXPECTED, "Unknown")
+            self._set_entry_text(entry, _COLUMN_SPEED, "—")
+            entry.progress_bar.setRange(0, 0)
+            entry.progress_bar.setFormat("")
+            worker = _DownloadWorker(entry.config, entry.camera, entry.output, self)
+            self._set_action_button(entry, "Cancel", partial(self._cancel_download, worker))
+            self._start_download_worker(entry, worker)
+            _LOGGER.info("Retrying queued camera download: %s", entry.camera_name)
+            self.statusBar().showMessage(f"Retrying queued download for {entry.camera_name}", 5000)
+            return
 
     def _show_notification(
         self,
@@ -2241,6 +2321,7 @@ class _MainWindow(QMainWindow):
             )
             return
         self._reserved_paths.add(self._reservation_key(entry.output))
+        entry.queued_for_rate_limit = False
         entry.terminal = False
         entry.cancelling = False
         entry.completed = False
@@ -2265,6 +2346,8 @@ class _MainWindow(QMainWindow):
     def _download_worker_finished(self, worker: _DownloadWorker) -> None:
         entry = self._workers.pop(worker, None)
         worker.deleteLater()
+        if entry is not None and entry.queued_for_rate_limit:
+            entry.worker = None
         if entry is not None and entry.terminal and not entry.completed:
             entry.action_button.setEnabled(True)
         active_count = len(self._workers)

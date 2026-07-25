@@ -449,6 +449,8 @@ Protect is rate-limiting local-account authentication. TimeLapse automatically:
 - Makes no more than four total attempts for a transient request, using exponential backoff with jitter and honoring
   `Retry-After` when Protect supplies it.
 - Stops without retrying early when Protect requests a wait longer than five minutes.
+- Queues a GUI download after bounded retries still end in HTTP 429, then retries one queued download in FIFO order
+  whenever another download completes or is cancelled.
 - Uses the Integration API token for camera discovery and current live-snapshot fallback; local-account authentication
   remains necessary for exact historical frames and video export because the Integration API does not expose those
   operations.

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from timelapse import ProtectRateLimitError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
@@ -317,6 +318,8 @@ class WebState:
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
         self._export_semaphore = asyncio.Semaphore(settings.web_max_active_exports)
+        self._download_terminal_condition = asyncio.Condition()
+        self._download_terminal_generation = 0
         self._job_mutation_lock = asyncio.Lock()
         self._schedule_mutation_lock = asyncio.Lock()
         self._reserved_output_paths: set[str] = set()
@@ -598,53 +601,97 @@ class WebState:
 
     async def _run_job(self, job: ExportJob) -> None:
         try:
+            while True:
+                try:
+                    retry_generation = await self._run_job_attempt(job)
+                except asyncio.CancelledError:
+                    job.status = "cancelled"
+                    break
+                except Exception as exc:
+                    job.status = "failed"
+                    job.error = str(exc) or type(exc).__name__
+                    break
+
+                self._changed()
+                await self._persist_jobs()
+                if retry_generation is None:
+                    break
+                await self._wait_for_download_terminal(retry_generation)
+                job.downloaded_bytes = 0
+                job.total_bytes = None
+                job.bytes_per_second = 0
+                job.elapsed_seconds = 0
+
+            job.finished_at = self.settings.now()
+            self._changed()
+            await self._persist_jobs()
+            if job.status in {"completed", "cancelled"}:
+                await self._record_download_terminal()
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.finished_at = self.settings.now()
+            self._changed()
+            await self._persist_jobs()
+            await self._record_download_terminal()
+        finally:
+            self._reserved_output_paths.discard(self._output_key(job.output))
+
+    async def _run_job_attempt(self, job: ExportJob) -> int | None:
+        """Run one export attempt and return the terminal generation to wait after a 429."""
+        async with self._export_semaphore:
+            job.status = "running"
+            job.error = None
+            job.started_at = self.settings.now()
+            job.finished_at = None
+            self._changed()
+            await self._persist_jobs()
+            if job.output.exists():
+                valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
+                job.status = "skipped" if job.daily and valid_existing_export else "failed"
+                job.error = "A file already exists for this camera and time range."
+                return None
+
+            config = self.settings.config(
+                job.start,
+                job.end,
+                job.speed,
+                daily=job.daily,
+                full_day=job.full_day,
+            )
+
+            def report_progress(progress: DownloadProgress) -> None:
+                job.downloaded_bytes = progress.downloaded_bytes
+                job.total_bytes = progress.total_bytes
+                job.bytes_per_second = progress.bytes_per_second
+                job.elapsed_seconds = progress.elapsed_seconds
+                self._changed()
+
             try:
-                async with self._export_semaphore:
-                    job.status = "running"
-                    job.started_at = self.settings.now()
-                    self._changed()
-                    await self._persist_jobs()
-                    if job.output.exists():
-                        valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
-                        job.status = "skipped" if job.daily and valid_existing_export else "failed"
-                        job.error = "A file already exists for this camera and time range."
-                        return
-
-                    config = self.settings.config(
-                        job.start,
-                        job.end,
-                        job.speed,
-                        daily=job.daily,
-                        full_day=job.full_day,
-                    )
-
-                    def report_progress(progress: DownloadProgress) -> None:
-                        job.downloaded_bytes = progress.downloaded_bytes
-                        job.total_bytes = progress.total_bytes
-                        job.bytes_per_second = progress.bytes_per_second
-                        job.elapsed_seconds = progress.elapsed_seconds
-                        self._changed()
-
-                    try:
-                        await self._exporter(config, job.camera, job.output, report_progress)
-                    except asyncio.CancelledError:
-                        job.status = "cancelled"
-                    except Exception as exc:
-                        job.status = "failed"
-                        job.error = str(exc) or type(exc).__name__
-                    else:
-                        job.status = "completed"
+                await self._exporter(config, job.camera, job.output, report_progress)
+            except ProtectRateLimitError as exc:
+                job.status = "queued"
+                job.error = f"{exc} Queued until another download completes or is cancelled."
+                job.bytes_per_second = 0
+                return self._download_terminal_generation
             except asyncio.CancelledError:
-                job.status = "cancelled"
+                raise
             except Exception as exc:
                 job.status = "failed"
                 job.error = str(exc) or type(exc).__name__
-            finally:
-                job.finished_at = self.settings.now()
-                self._changed()
-                await self._persist_jobs()
-        finally:
-            self._reserved_output_paths.discard(self._output_key(job.output))
+            else:
+                job.status = "completed"
+            return None
+
+    async def _wait_for_download_terminal(self, generation: int) -> None:
+        """Wait until another download completes or is cancelled."""
+        async with self._download_terminal_condition:
+            await self._download_terminal_condition.wait_for(lambda: self._download_terminal_generation > generation)
+
+    async def _record_download_terminal(self) -> None:
+        """Wake one rate-limited job after a terminal download event."""
+        async with self._download_terminal_condition:
+            self._download_terminal_generation += 1
+            self._download_terminal_condition.notify(1)
 
     async def _run_schedule(self, schedule: DailySchedule) -> None:
         try:

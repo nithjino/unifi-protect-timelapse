@@ -121,6 +121,7 @@ final class BackendProcess: @unchecked Sendable {
                 let event = BackendEvent(
                     id: nil,
                     event: "log",
+                    code: nil,
                     level: "ERROR",
                     message: text,
                     cameras: nil,
@@ -192,6 +193,7 @@ final class BackendProcess: @unchecked Sendable {
             let event = BackendEvent(
                 id: nil,
                 event: "log",
+                code: nil,
                 level: "WARNING",
                 message: "Ignored malformed backend output: \(line)",
                 cameras: nil,

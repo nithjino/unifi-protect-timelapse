@@ -14,7 +14,7 @@ from pathlib import Path
 from time import perf_counter
 from typing import TYPE_CHECKING
 
-from timelapse import TimelapseError
+from timelapse import ProtectRateLimitError, TimelapseError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.protect import CameraInfo, protect_session_scope
 from timelapse.service import export_timelapse, fetch_camera_thumbnail, list_available_cameras
@@ -351,6 +351,15 @@ def main() -> int:
         return asyncio.run(_run_in_session(request))
     except _ProtocolError as exc:
         _write_event({"id": _request_id(request), "event": "error", "code": exc.code, "message": str(exc)})
+    except ProtectRateLimitError as exc:
+        _write_event(
+            {
+                "id": _request_id(request),
+                "event": "error",
+                "code": "protect_rate_limited",
+                "message": str(exc),
+            }
+        )
     except TimelapseError as exc:
         _write_event({"id": _request_id(request), "event": "error", "code": "timelapse_error", "message": str(exc)})
     except KeyboardInterrupt:

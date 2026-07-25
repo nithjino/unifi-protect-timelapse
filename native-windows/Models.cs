@@ -83,6 +83,9 @@ public sealed record BackendEvent
     [JsonPropertyName("event")]
     public string Event { get; init; } = "";
 
+    [JsonPropertyName("code")]
+    public string? Code { get; init; }
+
     [JsonPropertyName("level")]
     public string? Level { get; init; }
 
@@ -118,6 +121,7 @@ public enum DownloadState
 {
     Scheduled,
     Preparing,
+    Queued,
     Downloading,
     Cancelling,
     Completed,
@@ -198,6 +202,7 @@ public sealed class DownloadJob : INotifyPropertyChanged
     {
         DownloadState.Scheduled => "Scheduled daily",
         DownloadState.Preparing => "Preparing export…",
+        DownloadState.Queued => "Queued — Protect rate limited",
         DownloadState.Downloading => "Downloading",
         DownloadState.Cancelling => "Cancelling…",
         DownloadState.Completed => "Completed",

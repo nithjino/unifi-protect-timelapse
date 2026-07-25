@@ -175,6 +175,7 @@ struct ThumbnailPreview: Equatable, Sendable {
 struct BackendEvent: Decodable, Sendable {
     let id: String?
     let event: String
+    let code: String?
     let level: String?
     let message: String?
     let cameras: [CameraInfo]?
@@ -189,6 +190,7 @@ struct BackendEvent: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id
         case event
+        case code
         case level
         case message
         case cameras
@@ -205,6 +207,7 @@ struct BackendEvent: Decodable, Sendable {
 enum DownloadState: Equatable, Sendable {
     case scheduled
     case preparing
+    case queued
     case downloading
     case cancelling
     case completed
@@ -216,6 +219,7 @@ enum DownloadState: Equatable, Sendable {
         switch self {
         case .scheduled: "Scheduled daily"
         case .preparing: "Preparing export…"
+        case .queued: "Queued — Protect rate limited"
         case .downloading: "Downloading"
         case .cancelling: "Cancelling…"
         case .completed: "Completed"
@@ -228,7 +232,7 @@ enum DownloadState: Equatable, Sendable {
     var isTerminal: Bool {
         switch self {
         case .completed, .cancelled, .failed, .stopped: true
-        case .scheduled, .preparing, .downloading, .cancelling: false
+        case .scheduled, .preparing, .queued, .downloading, .cancelling: false
         }
     }
 

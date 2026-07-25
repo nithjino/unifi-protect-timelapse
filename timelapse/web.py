@@ -96,6 +96,8 @@ def _format_date(value: date | None) -> str:
 
 
 def _job_status(job: ExportJob) -> str:
+    if job.status == "queued" and job.error:
+        return "Queued — rate limited"
     labels = {
         "queued": "Queued",
         "running": "Exporting",

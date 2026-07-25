@@ -38,6 +38,8 @@ final class AppModel: ObservableObject {
     private var thumbnailProcesses: [ThumbnailBoundary: BackendProcess] = [:]
     private var thumbnailRequestIDs: [ThumbnailBoundary: String] = [:]
     private var downloadReceivedTerminal: Set<UUID> = []
+    private var rateLimitedDownloadQueue: [UUID] = []
+    private var handledQueuedCancellations: Set<UUID> = []
     private var reservedOutputPaths: Set<String> = []
     private var nextGroupNumber = 1
     private var didStart = false
@@ -51,7 +53,7 @@ final class AppModel: ObservableObject {
     private var didReportNotificationIssue = false
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
-    var hasActiveDownloadJobs: Bool { !downloadProcesses.isEmpty }
+    var hasActiveDownloadJobs: Bool { !downloadProcesses.isEmpty || !rateLimitedDownloadQueue.isEmpty }
     var hasActiveBackendProcesses: Bool {
         cameraProcess != nil || !downloadProcesses.isEmpty || !thumbnailProcesses.isEmpty
     }
@@ -437,7 +439,9 @@ final class AppModel: ObservableObject {
     private func runDailyScheduleIfDue() {
         guard var schedule = dailySchedule else { return }
         if !schedule.activeJobIDs.isEmpty {
-            if schedule.activeJobIDs.contains(where: { downloadProcesses[$0] != nil }) { return }
+            if schedule.activeJobIDs.contains(where: { id in
+                downloadProcesses[id] != nil || jobs.first(where: { $0.id == id })?.state == .queued
+            }) { return }
             let tracked = jobs.filter { schedule.activeJobIDs.contains($0.id) }
             let completed = tracked.count == schedule.activeJobIDs.count
                 && tracked.allSatisfy { $0.state == .completed && Self.isValidExport($0.outputURL) }
@@ -561,6 +565,10 @@ final class AppModel: ObservableObject {
             return
         }
         guard !job.state.isTerminal, job.state != .cancelling else { return }
+        if job.state == .queued {
+            cancelQueuedDownload(job)
+            return
+        }
         job.state = .cancelling
         downloadProcesses[job.id]?.cancel()
         appendLog(level: "INFO", message: "Cancellation requested for \(job.camera.name)")
@@ -571,7 +579,10 @@ final class AppModel: ObservableObject {
             $0.isDailySchedule == dailyAutomations && !$0.state.isTerminal && $0.state != .cancelling
         }
         guard !cancellableJobs.isEmpty else { return }
-        for job in cancellableJobs {
+        for job in cancellableJobs where job.state == .queued {
+            cancelQueuedDownload(job, advanceQueue: false)
+        }
+        for job in cancellableJobs where job.state != .queued {
             cancel(job)
         }
         statusMessage = dailyAutomations
@@ -660,6 +671,12 @@ final class AppModel: ObservableObject {
         dailyTimer?.invalidate()
         dailyTimer = nil
         dailySchedule = nil
+        for id in rateLimitedDownloadQueue {
+            guard let job = jobs.first(where: { $0.id == id }), job.state == .queued else { continue }
+            job.state = .cancelled
+            releaseOutputURL(job.outputURL)
+        }
+        rateLimitedDownloadQueue.removeAll()
         cameraProcess?.cancel()
         for process in downloadProcesses.values {
             process.cancel()
@@ -803,6 +820,8 @@ final class AppModel: ObservableObject {
     }
 
     private func launchDownload(_ job: DownloadJob) {
+        rateLimitedDownloadQueue.removeAll { $0 == job.id }
+        job.state = .preparing
         let process = BackendProcess()
         downloadProcesses[job.id] = process
         downloadReceivedTerminal.remove(job.id)
@@ -871,11 +890,23 @@ final class AppModel: ObservableObject {
             )
         case "error":
             let message = event.message ?? "An unknown backend error occurred."
-            job.state = .failed(message)
             job.bytesPerSecond = 0
             downloadReceivedTerminal.insert(job.id)
-            appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(message)")
-            sendDownloadNotification(title: "Download Failed", message: "\(job.camera.name): \(message)")
+            if event.code == "protect_rate_limited" {
+                job.state = .queued
+                if !rateLimitedDownloadQueue.contains(job.id) {
+                    rateLimitedDownloadQueue.append(job.id)
+                }
+                appendLog(
+                    level: "WARNING",
+                    message: "Queued rate-limited download for \(job.camera.name); waiting for a completion or cancellation."
+                )
+                statusMessage = "Queued \(job.camera.name) after Protect returned HTTP 429"
+            } else {
+                job.state = .failed(message)
+                appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(message)")
+                sendDownloadNotification(title: "Download Failed", message: "\(job.camera.name): \(message)")
+            }
         case "log":
             appendLog(level: event.level ?? "INFO", message: event.message ?? "")
         default:
@@ -904,9 +935,59 @@ final class AppModel: ObservableObject {
         job.bytesPerSecond = 0
         downloadProcesses.removeValue(forKey: job.id)
         downloadReceivedTerminal.remove(job.id)
-        releaseOutputURL(job.outputURL)
-        statusMessage = downloadProcesses.isEmpty ? "Ready" : "\(downloadProcesses.count) downloads active"
+        let queuedCancellationWasHandled = handledQueuedCancellations.remove(job.id) != nil
+        if job.state != .queued {
+            releaseOutputURL(job.outputURL)
+        }
+        let shouldAdvanceQueue = (job.state == .completed || job.state == .cancelled)
+            && !queuedCancellationWasHandled
+        if downloadProcesses.isEmpty {
+            statusMessage = rateLimitedDownloadQueue.isEmpty
+                ? "Ready"
+                : "\(rateLimitedDownloadQueue.count) downloads queued"
+        } else {
+            statusMessage = "\(downloadProcesses.count) downloads active"
+        }
+        if shouldAdvanceQueue {
+            retryNextRateLimitedDownload()
+        }
         finishShutdownIfReady()
+    }
+
+    private func cancelQueuedDownload(_ job: DownloadJob, advanceQueue: Bool = true) {
+        guard job.state == .queued else { return }
+        if downloadProcesses[job.id] != nil {
+            handledQueuedCancellations.insert(job.id)
+        }
+        rateLimitedDownloadQueue.removeAll { $0 == job.id }
+        job.state = .cancelled
+        job.bytesPerSecond = 0
+        releaseOutputURL(job.outputURL)
+        appendLog(level: "INFO", message: "Cancelled queued camera download: \(job.camera.name)")
+        sendDownloadNotification(
+            title: "Download Interrupted",
+            message: "The queued download for \(job.camera.name) was cancelled."
+        )
+        if advanceQueue {
+            retryNextRateLimitedDownload()
+        }
+    }
+
+    private func retryNextRateLimitedDownload() {
+        guard !isShuttingDown else { return }
+        while !rateLimitedDownloadQueue.isEmpty {
+            let id = rateLimitedDownloadQueue.removeFirst()
+            guard let job = jobs.first(where: { $0.id == id }), job.state == .queued else { continue }
+            job.downloadedBytes = 0
+            job.totalBytes = nil
+            job.bytesPerSecond = 0
+            job.elapsedSeconds = 0
+            job.lastProgressAt = nil
+            launchDownload(job)
+            statusMessage = "Retrying queued download for \(job.camera.name)"
+            appendLog(level: "INFO", message: statusMessage)
+            return
+        }
     }
 
     private func reserveOutputURL(

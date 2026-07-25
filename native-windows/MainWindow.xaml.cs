@@ -26,6 +26,8 @@ public partial class MainWindow : Window
     private readonly List<CameraInfo> _cameras = [];
     private readonly HashSet<string> _selectedCameraIds = [];
     private readonly Dictionary<Guid, BackendProcess> _downloadProcesses = [];
+    private readonly Queue<DownloadJob> _rateLimitedDownloadQueue = [];
+    private readonly HashSet<Guid> _handledQueuedCancellations = [];
     private readonly Forms.NotifyIcon _notificationIcon;
     private readonly HashSet<BackendProcess> _thumbnailProcesses = [];
     private readonly Dictionary<string, CameraThumbnail> _thumbnailCache = [];
@@ -506,7 +508,10 @@ public partial class MainWindow : Window
         if (schedule is null) return;
         if (schedule.ActiveJobIds.Count > 0)
         {
-            if (schedule.ActiveJobIds.Any(_downloadProcesses.ContainsKey)) return;
+            if (schedule.ActiveJobIds.Any(id =>
+                    _downloadProcesses.ContainsKey(id)
+                    || DownloadJobs.FirstOrDefault(job => job.Id == id)?.State == DownloadState.Queued))
+                return;
             var tracked = DownloadJobs.Where(job => schedule.ActiveJobIds.Contains(job.Id)).ToList();
             var completed = tracked.Count == schedule.ActiveJobIds.Count
                 && tracked.All(job => job.State == DownloadState.Completed && IsValidExport(job.OutputPath));
@@ -748,6 +753,8 @@ public partial class MainWindow : Window
 
     private async Task LaunchDownloadAsync(DownloadJob job)
     {
+        RemoveFromRateLimitedQueue(job);
+        job.State = DownloadState.Preparing;
         var process = new BackendProcess();
         _downloadProcesses[job.Id] = process;
         SetBusyState();
@@ -793,10 +800,22 @@ public partial class MainWindow : Window
                         break;
                     case "error":
                         job.Error = backendEvent.Message ?? "An unknown backend error occurred.";
-                        job.State = DownloadState.Failed;
                         receivedTerminal = true;
-                        AppendLog("ERROR", $"Download failed for {job.Camera.Name}: {job.Error}");
-                        NotifyDownloadFinished(job);
+                        if (backendEvent.Code == "protect_rate_limited")
+                        {
+                            job.State = DownloadState.Queued;
+                            if (!_rateLimitedDownloadQueue.Contains(job)) _rateLimitedDownloadQueue.Enqueue(job);
+                            AppendLog(
+                                "WARNING",
+                                $"Queued rate-limited download for {job.Camera.Name}; waiting for a completion or cancellation.");
+                            StatusText.Text = $"Queued {job.Camera.Name} after Protect returned HTTP 429";
+                        }
+                        else
+                        {
+                            job.State = DownloadState.Failed;
+                            AppendLog("ERROR", $"Download failed for {job.Camera.Name}: {job.Error}");
+                            NotifyDownloadFinished(job);
+                        }
                         break;
                     case "log": AppendLog(backendEvent.Level ?? "INFO", backendEvent.Message ?? ""); break;
                     default: AppendLog("WARNING", $"Unknown backend event: {backendEvent.Event}"); break;
@@ -820,12 +839,19 @@ public partial class MainWindow : Window
         {
             job.BytesPerSecond = 0;
             _downloadProcesses.Remove(job.Id);
-            _reservedOutputPaths.Remove(job.OutputPath);
+            var queuedCancellationWasHandled = _handledQueuedCancellations.Remove(job.Id);
+            if (job.State != DownloadState.Queued) _reservedOutputPaths.Remove(job.OutputPath);
             CleanupPartialFilesForOutput(job.OutputPath);
             process.Dispose();
-            StatusText.Text = _downloadProcesses.Count == 0 ? "Ready" : $"{_downloadProcesses.Count} downloads active";
+            StatusText.Text = _downloadProcesses.Count > 0
+                ? $"{_downloadProcesses.Count} downloads active"
+                : _rateLimitedDownloadQueue.Count > 0
+                    ? $"{_rateLimitedDownloadQueue.Count} downloads queued"
+                    : "Ready";
             UpdateDownloadsDisplay();
             SetBusyState();
+            if ((job.State is DownloadState.Completed or DownloadState.Cancelled) && !queuedCancellationWasHandled)
+                RetryNextRateLimitedDownload();
         }
     }
 
@@ -838,7 +864,7 @@ public partial class MainWindow : Window
             case DownloadState.Stopped: DailyAutomationJobs.Remove(job); UpdateDownloadsDisplay(); break;
             case DownloadState.Completed: Reveal(job); break;
             case DownloadState.Cancelled or DownloadState.Failed: Restart(job); break;
-            case DownloadState.Preparing or DownloadState.Downloading: Cancel(job); break;
+            case DownloadState.Preparing or DownloadState.Queued or DownloadState.Downloading: Cancel(job); break;
         }
     }
 
@@ -846,6 +872,11 @@ public partial class MainWindow : Window
     {
         if (job.IsDailySchedule) { StopDailySchedule(); return; }
         if (job.IsTerminal || job.State == DownloadState.Cancelling) return;
+        if (job.State == DownloadState.Queued)
+        {
+            CancelQueuedDownload(job);
+            return;
+        }
         job.State = DownloadState.Cancelling;
         if (_downloadProcesses.TryGetValue(job.Id, out var process)) process.Cancel();
         AppendLog("INFO", $"Cancellation requested for {job.Camera.Name}");
@@ -893,8 +924,53 @@ public partial class MainWindow : Window
             StopDailySchedule();
             return;
         }
-        foreach (var job in DownloadJobs.Where(job => !job.IsTerminal && job.State != DownloadState.Cancelling).ToList()) Cancel(job);
+        var cancellable = DownloadJobs.Where(job => !job.IsTerminal && job.State != DownloadState.Cancelling).ToList();
+        foreach (var job in cancellable.Where(job => job.State == DownloadState.Queued))
+            CancelQueuedDownload(job, advanceQueue: false);
+        foreach (var job in cancellable.Where(job => job.State != DownloadState.Queued))
+            Cancel(job);
         StatusText.Text = "Cancelling downloads…";
+    }
+
+    private void CancelQueuedDownload(DownloadJob job, bool advanceQueue = true)
+    {
+        if (job.State != DownloadState.Queued) return;
+        if (_downloadProcesses.ContainsKey(job.Id)) _handledQueuedCancellations.Add(job.Id);
+        RemoveFromRateLimitedQueue(job);
+        job.State = DownloadState.Cancelled;
+        job.BytesPerSecond = 0;
+        _reservedOutputPaths.Remove(job.OutputPath);
+        CleanupPartialFilesForOutput(job.OutputPath);
+        AppendLog("INFO", $"Cancelled queued camera download: {job.Camera.Name}");
+        NotifyDownloadFinished(job);
+        UpdateDownloadsDisplay();
+        if (advanceQueue) RetryNextRateLimitedDownload();
+    }
+
+    private void RetryNextRateLimitedDownload()
+    {
+        if (_allowClose) return;
+        while (_rateLimitedDownloadQueue.Count > 0)
+        {
+            var job = _rateLimitedDownloadQueue.Dequeue();
+            if (job.State != DownloadState.Queued) continue;
+            job.Error = "";
+            job.DownloadedBytes = 0;
+            job.TotalBytes = null;
+            job.BytesPerSecond = 0;
+            _ = LaunchDownloadAsync(job);
+            StatusText.Text = $"Retrying queued download for {job.Camera.Name}";
+            AppendLog("INFO", StatusText.Text);
+            return;
+        }
+    }
+
+    private void RemoveFromRateLimitedQueue(DownloadJob job)
+    {
+        if (_rateLimitedDownloadQueue.Count == 0) return;
+        var remaining = _rateLimitedDownloadQueue.Where(candidate => candidate.Id != job.Id).ToList();
+        _rateLimitedDownloadQueue.Clear();
+        foreach (var candidate in remaining) _rateLimitedDownloadQueue.Enqueue(candidate);
     }
 
     private bool ShowingDailyAutomations => JobsTabControl.SelectedIndex == 1;
