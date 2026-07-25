@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from timelapse import TimelapseError
 from timelapse.config import SPEED_TO_FPS, Config
-from timelapse.protect import CameraInfo, ProtectConnection, camera_id, camera_name
+from timelapse.protect import CameraInfo, ProtectConnection, camera_id, camera_name, rate_limit_error
 
 if TYPE_CHECKING:
     from datetime import datetime
@@ -32,6 +32,7 @@ MIN_MP4_FTYP_OFFSET = 4
 PROGRESS_UPDATE_INTERVAL_SECONDS = 0.1
 HTTP_OK = 200
 HTTP_MULTIPLE_CHOICES = 300
+HTTP_TOO_MANY_REQUESTS = 429
 MAX_CAMERA_FILENAME_CHARACTERS = 48
 CAMERA_ID_DIGEST_CHARACTERS = 12
 _LOGGER = logging.getLogger(__name__)
@@ -87,7 +88,6 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         "type": "timelapse",
         "fps": str(SPEED_TO_FPS[config.speed]),
     }
-    client.set_header("Accept", "video/mp4,application/octet-stream,*/*")
     output.parent.mkdir(parents=True, exist_ok=True)
 
     _LOGGER.info(
@@ -132,6 +132,8 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
     temp_output: Path | None = None
     try:
         if not HTTP_OK <= response.status < HTTP_MULTIPLE_CHOICES:
+            if response.status == HTTP_TOO_MANY_REQUESTS:
+                raise rate_limit_error(getattr(client, "rate_limit_retry_after", None))
             detail = await _read_error_detail(response)
             reason = _sanitize_terminal_text(response.reason or "unknown error")
             message = f"timelapse export failed with HTTP {response.status}: {detail or reason}"

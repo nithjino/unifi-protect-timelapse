@@ -32,6 +32,7 @@ from starlette.templating import Jinja2Templates
 
 from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.config import SPEED_TO_FPS
+from timelapse.protect import protect_session_scope
 from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
@@ -343,11 +344,12 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         if configured_settings.web_password is None and not _is_loopback_host(configured_settings.web_host):
             message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
             raise RuntimeError(message)
-        await web_state.start()
-        try:
-            yield
-        finally:
-            await web_state.close()
+        async with protect_session_scope():
+            await web_state.start()
+            try:
+                yield
+            finally:
+                await web_state.close()
 
     application = FastAPI(
         title="TimeLapse Web",

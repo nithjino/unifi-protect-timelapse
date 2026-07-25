@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 import timelapse.download as download_module
-from timelapse import TimelapseError
+from timelapse import ProtectRateLimitError, TimelapseError
 from timelapse.config import Config
 from timelapse.download import DownloadProgress, default_output_path, download_timelapse
 from timelapse.protect import CameraInfo, parse_connection
@@ -50,8 +50,14 @@ class _BlockingContent:
 
 
 class _FakeResponse:
-    def __init__(self, content: _FakeContent | _BlockingContent, headers: dict[str, str]) -> None:
-        self.status = 200
+    def __init__(
+        self,
+        content: _FakeContent | _BlockingContent,
+        headers: dict[str, str],
+        *,
+        status: int = 200,
+    ) -> None:
+        self.status = status
         self.reason = "OK"
         self.content = content
         self.headers = headers
@@ -219,6 +225,26 @@ def test_download_preserves_an_existing_output(tmp_path: Path) -> None:
     assert output.read_bytes() == b"keep me"
     assert response.released is True
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
+
+
+def test_download_surfaces_exhausted_http_429_with_actionable_message(tmp_path: Path) -> None:
+    output = tmp_path / "rate-limited.mp4"
+    response = _FakeResponse(_FakeContent([]), {}, status=429)
+    client = cast("ProtectApiClient", _FakeClient(response))
+
+    with pytest.raises(ProtectRateLimitError, match="bounded retries"):
+        asyncio.run(
+            download_timelapse(
+                _config(),
+                parse_connection(_config().instance_url),
+                client,
+                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+                output,
+            )
+        )
+
+    assert response.released is True
+    assert not output.exists()
 
 
 @pytest.mark.parametrize(

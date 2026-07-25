@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 
 from timelapse import TimelapseError
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
-from timelapse.protect import CameraInfo
+from timelapse.protect import CameraInfo, protect_session_scope
 from timelapse.service import export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
 if TYPE_CHECKING:
@@ -348,7 +348,7 @@ def main() -> int:
         log_handler = _NativeLogHandler(_request_id(request))
         package_logger.addHandler(log_handler)
         package_logger.setLevel(logging.INFO)
-        return asyncio.run(_run(request))
+        return asyncio.run(_run_in_session(request))
     except _ProtocolError as exc:
         _write_event({"id": _request_id(request), "event": "error", "code": exc.code, "message": str(exc)})
     except TimelapseError as exc:
@@ -363,6 +363,12 @@ def main() -> int:
             package_logger.removeHandler(log_handler)
         package_logger.setLevel(previous_log_level)
     return 1
+
+
+async def _run_in_session(request: Mapping[str, object]) -> int:
+    """Run one native command with session persistence and scoped cleanup."""
+    async with protect_session_scope():
+        return await _run(request)
 
 
 if __name__ == "__main__":

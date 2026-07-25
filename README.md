@@ -441,7 +441,25 @@ After correcting access, change the selected date or time to retry. A time with 
 
 ### Protect login returns `HTTP 429`
 
-Protect is rate-limiting local-account authentication. Wait for the console's rate-limit window to clear and avoid running multiple copies of TimeLapse with the same account. Thumbnail requests are started when a date/time is selected and cached for that camera and timestamp; merely hovering over the date/time does not start another request.
+Protect is rate-limiting local-account authentication. TimeLapse automatically:
+
+- Persists and reuses the authenticated Protect session per console and local username.
+- Collapses concurrent login attempts across threads and native backend processes.
+- Allows at most two simultaneous private thumbnail/export operations per console.
+- Makes no more than four total attempts for a transient request, using exponential backoff with jitter and honoring
+  `Retry-After` when Protect supplies it.
+- Stops without retrying early when Protect requests a wait longer than five minutes.
+- Uses the Integration API token for camera discovery and current live-snapshot fallback; local-account authentication
+  remains necessary for exact historical frames and video export because the Integration API does not expose those
+  operations.
+
+The persisted session is stored in the operating system's per-user application configuration directory with
+user-only permissions where the platform supports POSIX modes. If the bounded retries are exhausted, wait for the
+console's rate-limit window to clear. Do not rotate local accounts or repeatedly start additional TimeLapse copies;
+limits may be console- or client-wide, and extra login traffic can extend the problem.
+
+Thumbnail requests are started when a date/time is selected and cached for that camera and timestamp; merely hovering
+over the date/time does not start another request.
 
 ### TLS certificate verification fails
 

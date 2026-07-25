@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -13,6 +14,7 @@ from timelapse.config import Config
 from timelapse.protect import CameraInfo
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
     from pathlib import Path
 
 
@@ -75,6 +77,29 @@ def _config(tmp_path: Path) -> Config:
     )
 
 
+def _install_client(monkeypatch: pytest.MonkeyPatch, client: _FakeClient) -> None:
+    @asynccontextmanager
+    async def fake_client(_config: Config, _connection: object) -> AsyncIterator[_FakeClient]:
+        try:
+            yield client
+        finally:
+            with suppress(OSError):
+                await client.close_session()
+
+    @asynccontextmanager
+    async def fake_private_operation(
+        _connection: object,
+        _client: object,
+        *,
+        operation: str,
+    ) -> AsyncIterator[None]:
+        del operation
+        yield
+
+    monkeypatch.setattr(service, "protect_client", fake_client)
+    monkeypatch.setattr(service, "private_operation", fake_private_operation)
+
+
 def test_thumbnail_requests_historical_snapshot_with_timestamp(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -83,7 +108,7 @@ def test_thumbnail_requests_historical_snapshot_with_timestamp(
     config = _config(tmp_path)
     camera = CameraInfo(id="camera-1", name="Garage Door", state=None, model=None)
     timestamp = config.start
-    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    _install_client(monkeypatch, client)
 
     result = asyncio.run(service.fetch_camera_thumbnail(config, camera, timestamp))
 
@@ -98,7 +123,7 @@ def test_thumbnail_permission_error_is_actionable(monkeypatch: pytest.MonkeyPatc
     client = _FakeClient(error=NotAuthorized("Unauthorized request"))
     config = _config(tmp_path)
     camera = CameraInfo(id="camera-1", name="Garage Door", state=None, model=None)
-    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    _install_client(monkeypatch, client)
 
     with pytest.raises(TimelapseError, match="readmedia/livestream"):
         asyncio.run(service.fetch_camera_thumbnail(config, camera, config.start))
@@ -110,7 +135,7 @@ def test_thumbnail_falls_back_to_api_token_live_snapshot(monkeypatch: pytest.Mon
     client = _LiveFallbackClient()
     config = _config(tmp_path)
     camera = CameraInfo(id="camera-1", name="Garage Door", state=None, model=None)
-    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    _install_client(monkeypatch, client)
 
     result = asyncio.run(service.fetch_camera_thumbnail(config, camera, config.start))
 
@@ -131,7 +156,7 @@ def test_camera_discovery_timeout_covers_the_complete_operation(
         await asyncio.Event().wait()
         return []
 
-    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    _install_client(monkeypatch, client)
     monkeypatch.setattr(service, "load_cameras", blocked_load)
     monkeypatch.setattr(
         service,
@@ -149,7 +174,7 @@ def test_cleanup_failure_does_not_replace_thumbnail_error(monkeypatch: pytest.Mo
     client = _CleanupFailureClient(error=NotAuthorized("Unauthorized request"))
     config = _config(tmp_path)
     camera = CameraInfo(id="camera-1", name="Garage Door", state=None, model=None)
-    monkeypatch.setattr(service, "create_client", lambda _config, _connection: client)
+    _install_client(monkeypatch, client)
 
     with pytest.raises(TimelapseError, match="readmedia/livestream"):
         asyncio.run(service.fetch_camera_thumbnail(config, camera, config.start))

@@ -17,7 +17,7 @@ from timelapse import TimelapseError
 from timelapse.config import Config, CreateProfile, parse_args
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.profiles import ConnectionProfile, ProfileError, save_profile
-from timelapse.protect import CameraInfo, camera_name
+from timelapse.protect import CameraInfo, camera_name, protect_session_scope
 from timelapse.schedule import (
     config_for_local_day,
     daily_output_path,
@@ -56,6 +56,12 @@ def _choose_camera(cameras: list[CameraInfo]) -> CameraInfo:
 
 
 async def _run() -> int:
+    async with protect_session_scope():
+        return await _run_in_session()
+
+
+async def _run_in_session() -> int:
+    """Run one CLI lifecycle with reusable Protect connections."""
     try:
         command = parse_args()
         if isinstance(command, CreateProfile):

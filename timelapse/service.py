@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, TypeVar
 
 from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.download import download_timelapse
-from timelapse.protect import create_client, load_cameras, parse_connection
+from timelapse.protect import load_cameras, parse_connection, private_operation, protect_client
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable
@@ -21,9 +21,8 @@ if TYPE_CHECKING:
 
     from timelapse.config import Config
     from timelapse.download import ProgressCallback
-    from timelapse.protect import CameraInfo
+    from timelapse.protect import CameraInfo, ProtectConnection
 
-CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 _LOGGER = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
@@ -47,33 +46,31 @@ async def list_available_cameras(config: Config) -> list[CameraInfo]:
         config.verify_ssl,
         _format_timeout(config.request_timeout_seconds),
     )
-    client = create_client(config, connection)
     deadline = _operation_deadline(config.request_timeout_seconds)
-    try:
-        cameras = await _await_with_deadline(
-            load_cameras(client),
-            deadline=deadline,
-            timeout_seconds=config.request_timeout_seconds,
-            operation="Camera discovery",
-        )
-    except asyncio.CancelledError:
-        _LOGGER.info("Camera discovery cancelled after %.2fs", perf_counter() - started_at)
-        raise
-    except Exception:
-        _LOGGER.exception("Camera discovery failed after %.2fs", perf_counter() - started_at)
-        raise
-    else:
-        _LOGGER.info(
-            "Camera discovery completed: cameras=%d, elapsed=%.2fs",
-            len(cameras),
-            perf_counter() - started_at,
-        )
-        return cameras
-    finally:
-        await _close_client(client, operation="camera discovery")
+    async with protect_client(config, connection) as client:
+        try:
+            cameras = await _await_with_deadline(
+                load_cameras(client),
+                deadline=deadline,
+                timeout_seconds=config.request_timeout_seconds,
+                operation="Camera discovery",
+            )
+        except asyncio.CancelledError:
+            _LOGGER.info("Camera discovery cancelled after %.2fs", perf_counter() - started_at)
+            raise
+        except Exception:
+            _LOGGER.exception("Camera discovery failed after %.2fs", perf_counter() - started_at)
+            raise
+        else:
+            _LOGGER.info(
+                "Camera discovery completed: cameras=%d, elapsed=%.2fs",
+                len(cameras),
+                perf_counter() - started_at,
+            )
+            return cameras
 
 
-async def fetch_camera_thumbnail(  # noqa: PLR0912 - exact/fallback requests share one deadline and cleanup path
+async def fetch_camera_thumbnail(
     config: Config,
     camera: CameraInfo,
     timestamp: datetime,
@@ -94,47 +91,20 @@ async def fetch_camera_thumbnail(  # noqa: PLR0912 - exact/fallback requests sha
         connection.host,
         connection.port,
     )
-    client = create_client(config, connection)
     deadline = _operation_deadline(config.request_timeout_seconds)
-    try:
+    async with protect_client(config, connection) as client:
         try:
-            image = _require_thumbnail(
-                await _await_with_deadline(
-                    client.api_request_raw(
-                        f"cameras/{camera.id}/recording-snapshot",
-                        params={
-                            "ts": int(timestamp.timestamp() * 1000),
-                            "w": width,
-                            "h": height,
-                        },
-                        raise_exception=True,
-                        timeout=_remaining_timeout(deadline) or 0,
-                    ),
-                    deadline=deadline,
-                    timeout_seconds=config.request_timeout_seconds,
-                    operation=f"Thumbnail request for {camera.name}",
-                ),
-                camera,
-            )
-        except asyncio.CancelledError:
-            raise
-        except OperationTimeoutError:
-            raise
-        except Exception as exact_error:
-            _LOGGER.warning(
-                "Exact thumbnail request failed for %s (%s); trying API-token live snapshot",
-                camera.name,
-                _exception_summary(exact_error),
-            )
             try:
-                live_image = _require_thumbnail(
+                image = _require_thumbnail(
                     await _await_with_deadline(
-                        client.api_request_raw(
-                            public_api=True,
-                            raise_exception=True,
-                            url=f"/v1/cameras/{camera.id}/snapshot",
-                            params={"highQuality": "false"},
-                            timeout=_remaining_timeout(deadline) or 0,
+                        _fetch_exact_thumbnail(
+                            client,
+                            connection,
+                            camera,
+                            timestamp,
+                            width=width,
+                            height=height,
+                            request_timeout=_remaining_timeout(deadline),
                         ),
                         deadline=deadline,
                         timeout_seconds=config.request_timeout_seconds,
@@ -146,44 +116,92 @@ async def fetch_camera_thumbnail(  # noqa: PLR0912 - exact/fallback requests sha
                 raise
             except OperationTimeoutError:
                 raise
-            except Exception as live_error:
-                message = (
-                    f"Could not load a thumbnail for {camera.name}. Exact historical previews require the local "
-                    "Protect account's Livestream permission (readmedia/livestream); the live fallback requires "
-                    "the Integration API token to have access to this camera. Update the permissions or token, "
-                    "then change the date or time to retry."
-                )
-                _LOGGER.log(
-                    logging.ERROR,
-                    "Exact and live thumbnail requests failed for %s: exact=%s, live=%s",
+            except Exception as exact_error:
+                _LOGGER.warning(
+                    "Exact thumbnail request failed for %s (%s); trying API-token live snapshot",
                     camera.name,
                     _exception_summary(exact_error),
-                    _exception_summary(live_error),
                 )
-                raise TimelapseError(message) from live_error
+                try:
+                    live_image = _require_thumbnail(
+                        await _await_with_deadline(
+                            client.api_request_raw(
+                                public_api=True,
+                                raise_exception=True,
+                                url=f"/v1/cameras/{camera.id}/snapshot",
+                                params={"highQuality": "false"},
+                                timeout=_remaining_timeout(deadline) or 0,
+                            ),
+                            deadline=deadline,
+                            timeout_seconds=config.request_timeout_seconds,
+                            operation=f"Thumbnail request for {camera.name}",
+                        ),
+                        camera,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except OperationTimeoutError:
+                    raise
+                except Exception as live_error:
+                    message = (
+                        f"Could not load a thumbnail for {camera.name}. Exact historical previews require the local "
+                        "Protect account's Livestream permission (readmedia/livestream); the live fallback requires "
+                        "the Integration API token to have access to this camera. Update the permissions or token, "
+                        "then change the date or time to retry."
+                    )
+                    _LOGGER.log(
+                        logging.ERROR,
+                        "Exact and live thumbnail requests failed for %s: exact=%s, live=%s",
+                        camera.name,
+                        _exception_summary(exact_error),
+                        _exception_summary(live_error),
+                    )
+                    raise TimelapseError(message) from live_error
+                else:
+                    thumbnail = CameraThumbnail(live_image, "live")
             else:
-                thumbnail = CameraThumbnail(live_image, "live")
+                thumbnail = CameraThumbnail(image, "exact")
+        except asyncio.CancelledError:
+            _LOGGER.info("Thumbnail request cancelled for %s after %.2fs", camera.name, perf_counter() - started_at)
+            raise
+        except TimelapseError:
+            raise
+        except Exception:
+            _LOGGER.exception("Thumbnail request failed for %s after %.2fs", camera.name, perf_counter() - started_at)
+            raise
         else:
-            thumbnail = CameraThumbnail(image, "exact")
-    except asyncio.CancelledError:
-        _LOGGER.info("Thumbnail request cancelled for %s after %.2fs", camera.name, perf_counter() - started_at)
-        raise
-    except TimelapseError:
-        raise
-    except Exception:
-        _LOGGER.exception("Thumbnail request failed for %s after %.2fs", camera.name, perf_counter() - started_at)
-        raise
-    else:
-        _LOGGER.info(
-            "Thumbnail request completed: camera=%s, source=%s, bytes=%d, elapsed=%.2fs",
-            camera.name,
-            thumbnail.source,
-            len(thumbnail.image),
-            perf_counter() - started_at,
+            _LOGGER.info(
+                "Thumbnail request completed: camera=%s, source=%s, bytes=%d, elapsed=%.2fs",
+                camera.name,
+                thumbnail.source,
+                len(thumbnail.image),
+                perf_counter() - started_at,
+            )
+            return thumbnail
+
+
+async def _fetch_exact_thumbnail(
+    client: ProtectApiClient,
+    connection: ProtectConnection,
+    camera: CameraInfo,
+    timestamp: datetime,
+    *,
+    width: int,
+    height: int,
+    request_timeout: float | None,
+) -> bytes | None:
+    """Fetch a private historical frame inside a bounded console slot."""
+    async with private_operation(connection, client, operation=f"thumbnail request for {camera.name}"):
+        return await client.api_request_raw(
+            f"cameras/{camera.id}/recording-snapshot",
+            params={
+                "ts": int(timestamp.timestamp() * 1000),
+                "w": width,
+                "h": height,
+            },
+            raise_exception=True,
+            timeout=request_timeout or 0,
         )
-        return thumbnail
-    finally:
-        await _close_client(client, operation=f"thumbnail request for {camera.name}")
 
 
 async def export_timelapse(
@@ -204,68 +222,58 @@ async def export_timelapse(
         config.speed,
         output,
     )
-    client = create_client(config, connection)
     deadline = _operation_deadline(config.request_timeout_seconds)
-    try:
-        await _await_with_deadline(
-            download_timelapse(
-                config,
-                connection,
-                client,
-                camera,
+    async with protect_client(config, connection) as client:
+        try:
+            await _await_with_deadline(
+                _download_private_timelapse(
+                    config,
+                    connection,
+                    client,
+                    camera,
+                    output,
+                    progress_callback,
+                    request_timeout_seconds=_remaining_timeout(deadline),
+                ),
+                deadline=deadline,
+                timeout_seconds=config.request_timeout_seconds,
+                operation=f"Timelapse export for {camera.name}",
+            )
+            _LOGGER.info(
+                "Timelapse export completed: camera=%s, output=%s, elapsed=%.2fs",
+                camera.name,
                 output,
-                progress_callback,
-                request_timeout_seconds=_remaining_timeout(deadline),
-            ),
-            deadline=deadline,
-            timeout_seconds=config.request_timeout_seconds,
-            operation=f"Timelapse export for {camera.name}",
-        )
-        _LOGGER.info(
-            "Timelapse export completed: camera=%s, output=%s, elapsed=%.2fs",
-            camera.name,
+                perf_counter() - started_at,
+            )
+        except asyncio.CancelledError:
+            _LOGGER.info("Timelapse export cancelled for %s after %.2fs", camera.name, perf_counter() - started_at)
+            raise
+        except Exception:
+            _LOGGER.exception("Timelapse export failed for %s after %.2fs", camera.name, perf_counter() - started_at)
+            raise
+
+
+async def _download_private_timelapse(
+    config: Config,
+    connection: ProtectConnection,
+    client: ProtectApiClient,
+    camera: CameraInfo,
+    output: Path,
+    progress_callback: ProgressCallback | None,
+    *,
+    request_timeout_seconds: float | None,
+) -> None:
+    """Hold one private-operation slot for the complete streamed export."""
+    async with private_operation(connection, client, operation=f"timelapse export for {camera.name}"):
+        await download_timelapse(
+            config,
+            connection,
+            client,
+            camera,
             output,
-            perf_counter() - started_at,
+            progress_callback,
+            request_timeout_seconds=request_timeout_seconds,
         )
-    except asyncio.CancelledError:
-        _LOGGER.info("Timelapse export cancelled for %s after %.2fs", camera.name, perf_counter() - started_at)
-        raise
-    except Exception:
-        _LOGGER.exception("Timelapse export failed for %s after %.2fs", camera.name, perf_counter() - started_at)
-        raise
-    finally:
-        await _close_client(client, operation=f"timelapse export for {camera.name}")
-
-
-async def _close_client(client: ProtectApiClient, *, operation: str) -> None:
-    started_at = perf_counter()
-    _LOGGER.info(
-        "Protect client cleanup started after %s (timeout=%.1fs)",
-        operation,
-        CLIENT_CLOSE_TIMEOUT_SECONDS,
-    )
-    try:
-        await asyncio.wait_for(client.close_session(), timeout=CLIENT_CLOSE_TIMEOUT_SECONDS)
-    except TimeoutError:
-        _LOGGER.warning(
-            "Protect client cleanup timed out after %s (elapsed=%.2fs)",
-            operation,
-            perf_counter() - started_at,
-        )
-        return
-    except Exception:
-        _LOGGER.warning(
-            "Protect client cleanup failed after %s (elapsed=%.2fs)",
-            operation,
-            perf_counter() - started_at,
-            exc_info=True,
-        )
-        return
-    _LOGGER.info(
-        "Protect client cleanup completed after %s (elapsed=%.2fs)",
-        operation,
-        perf_counter() - started_at,
-    )
 
 
 def _format_timeout(seconds: int) -> str:
