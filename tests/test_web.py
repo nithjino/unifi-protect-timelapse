@@ -117,7 +117,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert application_javascript.status_code == 200
     assert "showModal" in application_javascript.text
     assert favicon.status_code == 200
-    assert favicon.headers["content-type"] == "image/x-icon"
+    assert favicon.headers["content-type"] in {"image/vnd.microsoft.icon", "image/x-icon"}
 
 
 def test_dashboard_reports_configured_server_timezone(tmp_path: Path) -> None:
