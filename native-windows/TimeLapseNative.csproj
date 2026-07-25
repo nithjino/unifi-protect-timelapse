@@ -9,7 +9,7 @@
     <ApplicationIcon>..\assets\icons\timelapse.ico</ApplicationIcon>
     <AssemblyName>timelapse</AssemblyName>
     <RootNamespace>TimeLapseNative</RootNamespace>
-    <Version>1.2.1</Version>
+    <Version>1.2.2</Version>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
   </PropertyGroup>
 

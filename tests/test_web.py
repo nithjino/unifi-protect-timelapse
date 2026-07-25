@@ -94,10 +94,12 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
         response = client.get("/")
         javascript = client.get("/static/htmx.min.js")
         application_javascript = client.get("/static/app.js")
+        favicon = client.get("/static/favicon.ico")
 
     assert response.status_code == 200
     assert response.headers["x-request-id"]
     assert "htmx.min.js" in response.text
+    assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
@@ -114,6 +116,8 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "htmx" in javascript.text
     assert application_javascript.status_code == 200
     assert "showModal" in application_javascript.text
+    assert favicon.status_code == 200
+    assert favicon.headers["content-type"] == "image/x-icon"
 
 
 def test_dashboard_reports_configured_server_timezone(tmp_path: Path) -> None:
@@ -180,6 +184,7 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     assert denied.status_code == 303
     assert denied.headers["location"] == "/login?next=%2F"
     assert login_page.status_code == 200
+    assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in login_page.text
     assert "Enter dashboard" in login_page.text
     assert "Your recordings stay" in login_page.text
     assert rejected.status_code == 401
