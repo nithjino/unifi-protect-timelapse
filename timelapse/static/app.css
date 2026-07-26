@@ -494,7 +494,6 @@ main {
   color: var(--cyan);
 }
 
-.timezone-chip,
 .selection-count,
 .mini-chip {
   padding: 6px 9px;
@@ -773,8 +772,20 @@ main {
   font-size: 10px;
 }
 
-.compact-section legend {
+.compact-heading {
   margin-bottom: 13px;
+}
+
+.compact-heading h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.compact-heading p {
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
 }
 
 .speed-row {
@@ -809,6 +820,33 @@ main {
   margin: 5px 0 0;
   color: var(--muted);
   font-size: 10px;
+}
+
+.preview-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+
+.preview-camera-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.preview-camera-field select {
+  min-width: 165px;
+  padding: 8px 30px 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  background: #0c111a;
+  font: inherit;
+}
+
+.preview-camera-field select:disabled {
+  color: var(--muted);
 }
 
 .preview-grid {
@@ -1607,6 +1645,19 @@ footer {
   .preview-grid,
   .form-actions {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .preview-section .field-heading,
+  .preview-actions {
+    align-items: stretch;
+  }
+
+  .preview-section .field-heading {
+    flex-direction: column;
+  }
+
+  .preview-camera-field select {
+    width: 100%;
   }
 
   .field .date-time-inputs {

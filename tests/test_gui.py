@@ -151,6 +151,24 @@ def test_failed_thumbnail_is_not_retried_on_hover(main_window: gui_module._MainW
     assert not main_window._thumbnail_loaders
 
 
+def test_preview_camera_dropdown_reuses_cached_thumbnails(main_window: gui_module._MainWindow) -> None:
+    front = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
+    back = CameraInfo(id="camera-2", name="Back Yard", state=None, model=None)
+    main_window._selected_cameras = [front, back]
+    main_window._update_camera_summary()
+    timestamps = [round(main_window._thumbnail_timestamp(boundary).timestamp()) for boundary in ("start", "end")]
+    for camera in (front, back):
+        for timestamp in timestamps:
+            main_window._thumbnail_cache[(camera.id, timestamp)] = CameraThumbnail(b"cached-image", "exact")
+
+    main_window._preview_camera_combo.setCurrentIndex(main_window._preview_camera_combo.findData(back.id))
+    main_window._preview_camera_combo.setCurrentIndex(main_window._preview_camera_combo.findData(front.id))
+
+    assert main_window._selected_preview_camera() == front
+    assert len(main_window._thumbnail_cache) == 4
+    assert not main_window._thumbnail_loaders
+
+
 def test_datetime_change_prefetches_without_hover(
     main_window: gui_module._MainWindow,
     monkeypatch: pytest.MonkeyPatch,

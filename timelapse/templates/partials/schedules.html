@@ -2,7 +2,7 @@
   <div class="empty-state compact">
     <span class="empty-glyph calendar" aria-hidden="true">31</span>
     <div>
-      <strong>No daily exports</strong>
+      <strong>No Daily Exports</strong>
       <p>Select cameras, then enable daily exports to archive each completed day.</p>
     </div>
   </div>
@@ -14,11 +14,11 @@
         <div class="schedule-copy">
           <strong>{{ schedule.cameras | map(attribute='name') | join(', ') }}</strong>
           {% if schedule.paused %}
-            <p>Needs attention · {{ schedule.speed }}</p>
+            <p>Needs Attention · {{ schedule.speed }}</p>
           {% else %}
-            <p>Next run {{ schedule | next_run }} · {{ schedule.speed }}</p>
+            <p>Next Run {{ schedule | next_run }} · {{ schedule.speed }}</p>
           {% endif %}
-          <small>Last completed day: {{ schedule.last_run_day | date }}</small>
+          <small>Last Completed Day: {{ schedule.last_run_day | date }}</small>
           {% if schedule.last_error %}<small class="schedule-error">{{ schedule.last_error }}</small>{% endif %}
         </div>
         {% if schedule.paused %}

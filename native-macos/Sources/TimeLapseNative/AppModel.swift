@@ -16,6 +16,7 @@ final class AppModel: ObservableObject {
     @Published var outputDirectory: URL
     @Published var cameras: [CameraInfo] = []
     @Published var selectedCameraIDs: Set<String> = []
+    @Published private(set) var previewCameraID: String?
     @Published var jobs: [DownloadJob] = []
     @Published var logs: [LogEntry] = []
     @Published var statusMessage = "Ready"
@@ -37,6 +38,7 @@ final class AppModel: ObservableObject {
     private var downloadProcesses: [UUID: BackendProcess] = [:]
     private var thumbnailProcesses: [ThumbnailBoundary: BackendProcess] = [:]
     private var thumbnailRequestIDs: [ThumbnailBoundary: String] = [:]
+    private var thumbnailCache: [ThumbnailCacheKey: CachedThumbnail] = [:]
     private var downloadReceivedTerminal: Set<UUID> = []
     private var rateLimitedDownloadQueue: [UUID] = []
     private var handledQueuedCancellations: Set<UUID> = []
@@ -78,6 +80,10 @@ final class AppModel: ObservableObject {
         cameras.filter { selectedCameraIDs.contains($0.id) }
     }
 
+    var previewCamera: CameraInfo? {
+        selectedCameras.first { $0.id == previewCameraID }
+    }
+
     var cameraSummary: String {
         switch selectedCameras.count {
         case 0: "No cameras selected"
@@ -95,6 +101,16 @@ final class AppModel: ObservableObject {
         var lastRunDay: Date?
         var activeDay: Date?
         var activeJobIDs: Set<UUID>
+    }
+
+    private struct ThumbnailCacheKey: Hashable {
+        let cameraID: String
+        let timestamp: Date
+    }
+
+    private struct CachedThumbnail {
+        let imageData: Data
+        let source: String?
     }
 
     init() {
@@ -186,6 +202,7 @@ final class AppModel: ObservableObject {
         settings = profile.settings
         cameras.removeAll()
         selectedCameraIDs.removeAll()
+        previewCameraID = nil
         clearThumbnailPreviews()
         statusMessage = "Selected \(profile.displayName)"
         appendLog(level: "INFO", message: "Selected connection profile: \(profile.displayName)")
@@ -215,6 +232,7 @@ final class AppModel: ObservableObject {
         settings = profile.settings
         cameras.removeAll()
         selectedCameraIDs.removeAll()
+        previewCameraID = nil
         clearThumbnailPreviews()
         editingProfileID = nil
         isFirstRun = false
@@ -259,6 +277,7 @@ final class AppModel: ObservableObject {
 
     func applyCameraSelection(_ ids: Set<String>) {
         selectedCameraIDs = ids
+        normalizePreviewCameraSelection()
         clearThumbnailPreviews()
         showingCameraSheet = false
         appendLog(level: "INFO", message: "Selected \(ids.count) cameras")
@@ -285,10 +304,20 @@ final class AppModel: ObservableObject {
         if enabled { setFullDayStart(startDate) }
     }
 
+    func selectPreviewCamera(_ cameraID: String?) {
+        guard cameraID != previewCameraID,
+              let cameraID,
+              selectedCameraIDs.contains(cameraID) else { return }
+        previewCameraID = cameraID
+        clearThumbnailPreviews(clearCache: false)
+        requestThumbnail(for: .start)
+        requestThumbnail(for: .end)
+    }
+
     func requestThumbnail(for boundary: ThumbnailBoundary) {
         let selectedDate = boundary == .start ? startDate : endDate
         let timestamp = fullDayMode ? Calendar.current.startOfDay(for: selectedDate) : selectedDate
-        guard let camera = selectedCameras.first else {
+        guard let camera = previewCamera else {
             thumbnailPreviews[boundary] = ThumbnailPreview(
                 timestamp: timestamp,
                 cameraID: nil,
@@ -303,6 +332,22 @@ final class AppModel: ObservableObject {
         if let preview = thumbnailPreviews[boundary],
            preview.timestamp == timestamp,
            preview.cameraID == camera.id {
+            return
+        }
+        let cacheKey = ThumbnailCacheKey(cameraID: camera.id, timestamp: timestamp)
+        if let cached = thumbnailCache[cacheKey] {
+            thumbnailProcesses[boundary]?.cancel()
+            thumbnailProcesses.removeValue(forKey: boundary)
+            thumbnailRequestIDs.removeValue(forKey: boundary)
+            thumbnailPreviews[boundary] = ThumbnailPreview(
+                timestamp: timestamp,
+                cameraID: camera.id,
+                cameraName: camera.name,
+                imageData: cached.imageData,
+                source: cached.source,
+                message: nil,
+                isLoading: false
+            )
             return
         }
 
@@ -687,13 +732,23 @@ final class AppModel: ObservableObject {
         finishShutdownIfReady()
     }
 
-    private func clearThumbnailPreviews() {
+    private func clearThumbnailPreviews(clearCache: Bool = true) {
         for process in thumbnailProcesses.values {
             process.cancel()
         }
         thumbnailProcesses.removeAll()
         thumbnailRequestIDs.removeAll()
         thumbnailPreviews.removeAll()
+        if clearCache {
+            thumbnailCache.removeAll()
+        }
+    }
+
+    private func normalizePreviewCameraSelection() {
+        if let previewCameraID, selectedCameraIDs.contains(previewCameraID) {
+            return
+        }
+        previewCameraID = selectedCameras.first?.id
     }
 
     private func handleThumbnailEvent(_ event: BackendEvent, boundary: ThumbnailBoundary, requestID: String) {
@@ -710,6 +765,10 @@ final class AppModel: ObservableObject {
             thumbnailPreviews[boundary]?.source = event.thumbnailSource
             thumbnailPreviews[boundary]?.message = nil
             thumbnailPreviews[boundary]?.isLoading = false
+            if let preview = thumbnailPreviews[boundary], let cameraID = preview.cameraID {
+                let key = ThumbnailCacheKey(cameraID: cameraID, timestamp: preview.timestamp)
+                thumbnailCache[key] = CachedThumbnail(imageData: data, source: event.thumbnailSource)
+            }
         case "error":
             thumbnailPreviews[boundary]?.isLoading = false
             thumbnailPreviews[boundary]?.message = event.message ?? "No thumbnail is available for this time."
@@ -747,6 +806,7 @@ final class AppModel: ObservableObject {
             cameras = event.cameras ?? []
             let validIDs = Set(cameras.map(\.id))
             selectedCameraIDs.formIntersection(validIDs)
+            normalizePreviewCameraSelection()
             statusMessage = "Loaded \(cameras.count) cameras"
             appendLog(level: "INFO", message: statusMessage)
             if cameras.isEmpty {

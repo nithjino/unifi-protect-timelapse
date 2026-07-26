@@ -97,6 +97,7 @@
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
               <RowDefinition Height="Auto" />
+              <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <TextBlock Grid.Row="0" Text="▰  Save to" Foreground="#666" VerticalAlignment="Center" />
             <TextBlock x:Name="OutputDirectoryText" Grid.Row="0" Grid.Column="1" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,8,8" />
@@ -105,9 +106,13 @@
             <TextBlock x:Name="CameraSummaryText" Grid.Row="1" Grid.Column="1" Text="No cameras selected" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,8,8" />
             <Button x:Name="SelectCamerasButton" Grid.Row="1" Grid.Column="2" Content="Select…" Click="SelectCameras_Click" Margin="0,0,8,8" />
             <Button x:Name="RefreshCamerasButton" Grid.Row="1" Grid.Column="3" Content="↻" ToolTip="Refresh cameras" Click="RefreshCameras_Click" Margin="0,0,0,8" />
-            <Button x:Name="StartDownloadsButton" Grid.Row="2" Grid.ColumnSpan="2" Content="↓  Start Downloads" Click="StartDownloads_Click"
+            <TextBlock Grid.Row="2" Text="▧  Preview" Foreground="#666" VerticalAlignment="Center" />
+            <ComboBox x:Name="PreviewCameraCombo" Grid.Row="2" Grid.Column="1" Grid.ColumnSpan="2"
+                      DisplayMemberPath="Name" SelectedValuePath="Id" SelectionChanged="PreviewCamera_SelectionChanged"
+                      MinWidth="180" HorizontalAlignment="Left" Margin="0,0,8,8" IsEnabled="False" />
+            <Button x:Name="StartDownloadsButton" Grid.Row="3" Grid.ColumnSpan="2" Content="↓  Start Downloads" Click="StartDownloads_Click"
                     HorizontalAlignment="Left" Background="#1769C2" Foreground="White" FontWeight="SemiBold" IsEnabled="False" />
-            <CheckBox x:Name="DailyAutomaticCheckBox" Grid.Row="3" Grid.ColumnSpan="3" Content="Daily automatic timelapses"
+            <CheckBox x:Name="DailyAutomaticCheckBox" Grid.Row="4" Grid.ColumnSpan="3" Content="Daily automatic timelapses"
                       Margin="0,9,0,0" Checked="DailyAutomatic_Checked" Unchecked="DailyAutomatic_Unchecked" />
           </Grid>
         </Grid>

@@ -27,6 +27,7 @@ from PySide6.QtCore import (
     QObject,
     QPoint,
     QSettings,
+    QSignalBlocker,
     QStandardPaths,
     Qt,
     QThread,
@@ -894,7 +895,7 @@ class _ThumbnailPopup(QFrame):
         layout.addWidget(self.source_label)
 
     def prepare(self, boundary: str, timestamp: datetime, camera_text: str) -> None:
-        self.title_label.setText(f"{boundary.title()} preview")
+        self.title_label.setText(f"Camera Preview · {boundary.title()}")
         self.time_label.setText(_format_job_datetime(timestamp))
         self.camera_label.setText(camera_text)
         self.source_label.clear()
@@ -1218,6 +1219,11 @@ class _MainWindow(QMainWindow):
         camera_layout.addStretch(1)
         details_form.addRow("Cameras:", camera_row)
 
+        self._preview_camera_combo = QComboBox()
+        self._preview_camera_combo.setMinimumWidth(220)
+        self._preview_camera_combo.currentIndexChanged.connect(self._preview_camera_changed)
+        details_form.addRow("Preview:", self._preview_camera_combo)
+
         self._daily_checkbox = QCheckBox("Daily automatic timelapses")
         self._daily_checkbox.setToolTip("Export each completed local day while this program remains open.")
         self._daily_checkbox.toggled.connect(self._daily_toggled)
@@ -1298,7 +1304,7 @@ class _MainWindow(QMainWindow):
         editor = self._start_edit if boundary == "start" else self._end_edit
         return datetime.fromtimestamp(editor.dateTime().toSecsSinceEpoch()).astimezone()
 
-    def _show_thumbnail_preview(  # noqa: PLR0912 - handles cached async preview states
+    def _show_thumbnail_preview(
         self,
         boundary: str,
         *,
@@ -1308,10 +1314,8 @@ class _MainWindow(QMainWindow):
             self._hovered_thumbnail_boundary = boundary
         editor = self._start_edit if boundary == "start" else self._end_edit
         timestamp = self._thumbnail_timestamp(boundary)
-        camera = self._selected_cameras[0] if self._selected_cameras else None
-        camera_text = ""
-        if camera is not None:
-            camera_text = camera.name if len(self._selected_cameras) == 1 else f"{camera.name} · first selected camera"
+        camera = self._selected_preview_camera()
+        camera_text = camera.name if camera is not None else ""
         if display:
             self._thumbnail_popup.prepare(boundary, timestamp, camera_text)
         if camera is None:
@@ -1388,11 +1392,12 @@ class _MainWindow(QMainWindow):
         loader.deleteLater()
         self._finish_close_if_ready()
 
-    def _clear_thumbnail_previews(self) -> None:
+    def _clear_thumbnail_previews(self, *, clear_cache: bool = True) -> None:
         self._hovered_thumbnail_boundary = None
         self._thumbnail_popup.hide()
-        self._thumbnail_cache.clear()
-        self._thumbnail_failures.clear()
+        if clear_cache:
+            self._thumbnail_cache.clear()
+            self._thumbnail_failures.clear()
         self._active_thumbnail_loaders.clear()
         for loader in tuple(self._thumbnail_loaders):
             loader.cancel()
@@ -1684,6 +1689,33 @@ class _MainWindow(QMainWindow):
                 self._show_thumbnail_preview("start", display=False)
                 self._show_thumbnail_preview("end", display=False)
 
+    def _selected_preview_camera(self) -> CameraInfo | None:
+        camera_id = self._preview_camera_combo.currentData()
+        return next(
+            (camera for camera in self._selected_cameras if camera.id == camera_id),
+            self._selected_cameras[0] if self._selected_cameras else None,
+        )
+
+    @Slot(int)
+    def _preview_camera_changed(self, _index: int) -> None:
+        self._clear_thumbnail_previews(clear_cache=False)
+        if self._selected_preview_camera() is not None:
+            self._show_thumbnail_preview("start", display=False)
+            self._show_thumbnail_preview("end", display=False)
+
+    def _update_preview_camera_options(self) -> None:
+        previous_id = self._preview_camera_combo.currentData()
+        with QSignalBlocker(self._preview_camera_combo):
+            self._preview_camera_combo.clear()
+            if not self._selected_cameras:
+                self._preview_camera_combo.addItem("Select cameras", None)
+            else:
+                for camera in self._selected_cameras:
+                    self._preview_camera_combo.addItem(camera.name, camera.id)
+                selected_index = self._preview_camera_combo.findData(previous_id)
+                self._preview_camera_combo.setCurrentIndex(max(selected_index, 0))
+        self._preview_camera_combo.setEnabled(bool(self._selected_cameras))
+
     def _update_camera_summary(self) -> None:
         count = len(self._selected_cameras)
         if count == 0:
@@ -1694,6 +1726,7 @@ class _MainWindow(QMainWindow):
             summary = f"{count} cameras selected"
         self._camera_summary.setText(summary)
         self._camera_summary.setToolTip(", ".join(camera.name for camera in self._selected_cameras))
+        self._update_preview_camera_options()
         self._start_button.setEnabled(count > 0 and not self._closing)
 
     @Slot(bool)

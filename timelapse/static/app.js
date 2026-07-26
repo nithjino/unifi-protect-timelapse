@@ -15,6 +15,7 @@
   const fullDayStartDate = document.querySelector("#full-day-start-date");
   const fullDayEndDate = document.querySelector("#full-day-end-date");
   const previewButton = document.querySelector("#load-previews");
+  const previewCamera = document.querySelector("#preview-camera");
   const liveDot = document.querySelector("#live-dot");
   const liveLabel = document.querySelector("#live-label");
   const serverInfoButton = document.querySelector("#server-info-button");
@@ -26,6 +27,7 @@
   const previewTimers = { start: null, end: null };
   const previewControllers = { start: null, end: null };
   const previewDirty = { start: false, end: false };
+  const previewCache = new Map();
   const previewDebounceMilliseconds = 350;
   let previewsActivated = false;
   let serverConnected = false;
@@ -36,7 +38,7 @@
     liveDot?.classList.toggle("online", !storageLow);
     liveDot?.classList.toggle("storage-low", storageLow);
     liveDot?.classList.remove("offline");
-    if (liveLabel) liveLabel.textContent = "Server connected";
+    if (liveLabel) liveLabel.textContent = "Server Connected";
   }
 
   function updateStorageState(container) {
@@ -53,7 +55,34 @@
   function updateSelectionCount() {
     const count = selectedCameras().length;
     if (selectionCount) {
-      selectionCount.textContent = `${count} selected`;
+      selectionCount.textContent = `${count} Selected`;
+    }
+  }
+
+  function updatePreviewCameraOptions() {
+    if (!previewCamera) return;
+    const cameras = selectedCameras();
+    const previousCameraId = previewCamera.value;
+    previewCamera.replaceChildren();
+    if (!cameras.length) {
+      previewCamera.append(new Option("Select A Camera", ""));
+      previewCamera.disabled = true;
+      if (previewsActivated && previousCameraId) {
+        schedulePreview("start");
+        schedulePreview("end");
+      }
+      return;
+    }
+    for (const camera of cameras) {
+      previewCamera.append(new Option(camera.dataset.cameraName || camera.value, camera.value));
+    }
+    previewCamera.disabled = false;
+    if (cameras.some((camera) => camera.value === previousCameraId)) {
+      previewCamera.value = previousCameraId;
+    }
+    if (previewsActivated && previewCamera.value !== previousCameraId) {
+      schedulePreview("start");
+      schedulePreview("end");
     }
   }
 
@@ -95,10 +124,34 @@
     return { start: localValue(start), end: localValue(end) };
   }
 
-  async function loadPreview(card, cameraId, timestamp, controller) {
+  function showPreviewImage(card, blob, source) {
     const frame = card.querySelector(".preview-frame");
     const caption = card.querySelector("figcaption");
     const boundary = card.dataset.boundary;
+    const oldImage = frame.querySelector("img");
+    if (oldImage?.src.startsWith("blob:")) {
+      URL.revokeObjectURL(oldImage.src);
+    }
+    const image = document.createElement("img");
+    image.alt = `${boundary} camera preview`;
+    image.src = URL.createObjectURL(blob);
+    frame.replaceChildren(image);
+    frame.classList.remove("loading");
+    caption.textContent = `${boundary === "start" ? "Start" : "End"} Frame${source === "live" ? " · Live Fallback" : ""}`;
+  }
+
+  async function loadPreview(card, cameraId, timestamp, controller) {
+    const frame = card.querySelector(".preview-frame");
+    const boundary = card.dataset.boundary;
+    const cacheKey = `${cameraId}|${timestamp}`;
+    const cached = previewCache.get(cacheKey);
+    if (cached) {
+      showPreviewImage(card, cached.blob, cached.source);
+      if (previewControllers[boundary] === controller) {
+        previewControllers[boundary] = null;
+      }
+      return;
+    }
     frame.classList.add("loading");
     try {
       const response = await fetch(
@@ -109,16 +162,9 @@
         throw new Error(await response.text());
       }
       const blob = await response.blob();
-      const oldImage = frame.querySelector("img");
-      if (oldImage?.src.startsWith("blob:")) {
-        URL.revokeObjectURL(oldImage.src);
-      }
-      const image = document.createElement("img");
-      image.alt = `${card.dataset.boundary} camera preview`;
-      image.src = URL.createObjectURL(blob);
-      frame.replaceChildren(image);
       const source = response.headers.get("X-TimeLapse-Thumbnail-Source");
-      caption.textContent = `${boundary === "start" ? "Start" : "End"} frame${source === "live" ? " · live fallback" : ""}`;
+      previewCache.set(cacheKey, { blob, source });
+      showPreviewImage(card, blob, source);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         return;
@@ -134,7 +180,7 @@
   }
 
   function loadPreviewBoundary(boundary) {
-    const camera = selectedCameras()[0];
+    const cameraId = previewCamera?.value;
     const timestamps = boundaryTimestamps();
     const card = document.querySelector(`.preview-card[data-boundary="${boundary}"]`);
     const frame = card?.querySelector(".preview-frame");
@@ -142,15 +188,15 @@
 
     previewControllers[boundary]?.abort();
     previewControllers[boundary] = null;
-    if (!camera || !timestamps[boundary]) {
+    if (!cameraId || !timestamps[boundary]) {
       frame.classList.remove("loading");
-      frame.replaceChildren(Object.assign(document.createElement("span"), { textContent: "Select a camera and range" }));
+      frame.replaceChildren(Object.assign(document.createElement("span"), { textContent: "Select A Camera And Range" }));
       return;
     }
 
     const controller = new AbortController();
     previewControllers[boundary] = controller;
-    void loadPreview(card, camera.value, timestamps[boundary], controller);
+    void loadPreview(card, cameraId, timestamps[boundary], controller);
   }
 
   function schedulePreview(boundary) {
@@ -186,7 +232,7 @@
 
   function loadPreviews() {
     previewsActivated = true;
-    if (previewButton) previewButton.textContent = "Refresh previews";
+    if (previewButton) previewButton.textContent = "Refresh Previews";
     for (const boundary of ["start", "end"]) {
       clearTimeout(previewTimers[boundary]);
       previewTimers[boundary] = null;
@@ -214,7 +260,7 @@
     const videoUrl = button.dataset.videoUrl;
     if (!videoUrl || !videoPlayerDialog || !exportVideoPlayer) return;
     if (videoPlayerTitle) {
-      videoPlayerTitle.textContent = button.dataset.videoTitle || "Play export";
+      videoPlayerTitle.textContent = button.dataset.videoTitle || "Play Export";
     }
     exportVideoPlayer.src = videoUrl;
     videoPlayerDialog.showModal();
@@ -226,6 +272,7 @@
   document.addEventListener("change", (event) => {
     if (event.target.matches('input[name="camera_ids"]')) {
       updateSelectionCount();
+      updatePreviewCameraOptions();
     }
     if (event.target.matches('input[name="range_mode"]')) {
       updateRangeMode();
@@ -269,11 +316,16 @@
   document.body.addEventListener("htmx:afterSwap", (event) => {
     if (event.detail.target?.id === "camera-picker") {
       updateSelectionCount();
+      updatePreviewCameraOptions();
     }
     updateStorageState(event.detail.target);
   });
 
   previewButton?.addEventListener("click", loadPreviews);
+  previewCamera?.addEventListener("change", () => {
+    schedulePreview("start");
+    schedulePreview("end");
+  });
   serverInfoButton?.addEventListener("click", () => serverInfoDialog?.showModal());
   serverInfoDialog?.addEventListener("click", (event) => {
     if (event.target === serverInfoDialog) serverInfoDialog.close();
@@ -286,6 +338,7 @@
   updateRangeMode();
   updateFullDayEnd();
   updateSelectionCount();
+  updatePreviewCameraOptions();
 
   const events = new EventSource("/api/events");
   events.addEventListener("open", () => {

@@ -111,6 +111,14 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert 'id="full-day-end-date"' in response.text
     assert 'id="full-day-end-date" type="date"' in response.text
     assert response.text.count('type="time" value="00:00" disabled') == 2
+    assert '<h2 id="new-export-title">New Export</h2>' in response.text
+    assert '<h3 id="timelapse-speed-title">Timelapse Speed</h3>' in response.text
+    assert '<h2 id="exports-title">Export Activity</h2>' in response.text
+    assert '<h2 id="schedules-title">Daily Automations</h2>' in response.text
+    assert "Set the pace" not in response.text
+    assert "timezone-chip" not in response.text
+    assert "<h3>Camera Preview</h3>" in response.text
+    assert 'id="preview-camera" disabled' in response.text
     assert "Times are interpreted in the server\u2019s UTC timezone." in response.text
     assert javascript.status_code == 200
     assert "htmx" in javascript.text
@@ -185,8 +193,8 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     assert denied.headers["location"] == "/login?next=%2F"
     assert login_page.status_code == 200
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in login_page.text
-    assert "Enter dashboard" in login_page.text
-    assert "Your recordings stay" in login_page.text
+    assert "Enter Dashboard" in login_page.text
+    assert "Your Recordings Stay" in login_page.text
     assert rejected.status_code == 401
     assert "username or password is incorrect" in rejected.text
     assert signed_in.status_code == 303
@@ -195,7 +203,7 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     assert "SameSite=strict" in signed_in.headers["set-cookie"]
     assert "web-secret" not in signed_in.headers["set-cookie"]
     assert allowed.status_code == 200
-    assert "Log out" in allowed.text
+    assert "Log Out" in allowed.text
     assert allowed.headers["x-frame-options"] == "DENY"
     assert "default-src 'self'" in allowed.headers["content-security-policy"]
     assert signed_out.status_code == 303
@@ -540,8 +548,8 @@ def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:
         cameras = client.get("/partials/cameras")
 
     assert status.status_code == 200
-    assert "Server healthy" in status.text
-    assert "Configuration needed" in status.text
+    assert "Server Healthy" in status.text
+    assert "Configuration Needed" in status.text
     assert "UNIFI_PROTECT_URL" in status.text
     assert "Server configuration is incomplete" in cameras.text
     assert "sensitive-integration-token" not in status.text + cameras.text
@@ -571,7 +579,7 @@ def test_server_status_reports_host_storage_and_low_capacity(
         status = client.get("/partials/status")
 
     assert status.status_code == 200
-    assert "<strong>Host storage</strong>" in status.text
+    assert "<strong>Host Storage</strong>" in status.text
     assert f'data-storage-low="{storage_low}"' in status.text
     assert f"{free_bytes} B free of 1000 B ({expected_percent}% available)" in " ".join(status.text.split())
 
@@ -948,6 +956,6 @@ def test_paused_schedule_is_visible_as_needing_attention(tmp_path: Path) -> None
         response = client.get("/partials/schedules")
 
     assert response.status_code == 200
-    assert "Needs attention" in response.text
+    assert "Needs Attention" in response.text
     assert ">Retry</button>" in response.text
     assert "Paused after 5 failed attempts" in response.text

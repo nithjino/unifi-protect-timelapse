@@ -14,17 +14,17 @@
   <body>
     <div class="page-shell">
       <header class="topbar">
-        <a class="brand" href="/" aria-label="TimeLapse dashboard">
+        <a class="brand" href="/" aria-label="TimeLapse Dashboard">
           <span class="brand-mark" aria-hidden="true">TL</span>
           <span>
             <strong>TimeLapse</strong>
-            <small>Protect exporter</small>
+            <small>Protect Exporter</small>
           </span>
         </a>
         <div class="topbar-actions">
           <div class="server-state" aria-live="polite">
             <span class="live-dot" id="live-dot"></span>
-            <span id="live-label">Connecting to server</span>
+            <span id="live-label">Connecting To Server</span>
           </div>
           <button
             class="info-button"
@@ -36,7 +36,7 @@
           {% if authentication_enabled %}
             <form method="post" action="/logout" class="logout-form">
               <span>{{ web_username }}</span>
-              <button type="submit">Log out</button>
+              <button type="submit">Log Out</button>
             </form>
           {% endif %}
         </div>
@@ -45,8 +45,8 @@
       <dialog class="server-info-dialog" id="server-info-dialog" aria-labelledby="server-info-title">
         <div class="dialog-heading">
           <div>
-            <p class="eyebrow">TimeLapse server</p>
-            <h2 id="server-info-title">Server information</h2>
+            <p class="eyebrow">TimeLapse Server</p>
+            <h2 id="server-info-title">Server Information</h2>
           </div>
           <form method="dialog">
             <button class="dialog-close" aria-label="Dismiss server information">×</button>
@@ -66,8 +66,8 @@
       <dialog class="video-player-dialog" id="video-player-dialog" aria-labelledby="video-player-title">
         <div class="dialog-heading">
           <div>
-            <p class="eyebrow">Export preview</p>
-            <h2 id="video-player-title">Play export</h2>
+            <p class="eyebrow">Export Preview</p>
+            <h2 id="video-player-title">Play Export</h2>
           </div>
           <button class="dialog-close" id="video-player-close" type="button" aria-label="Close video player">×</button>
         </div>
@@ -82,16 +82,13 @@
         <div class="workspace-grid">
           <section class="panel export-panel" aria-labelledby="new-export-title">
             <div class="panel-heading">
-              <div>
-                <h2 id="new-export-title">New export</h2>
-              </div>
-              <span class="timezone-chip">{{ timezone_name }}</span>
+              <h2 id="new-export-title">New Export</h2>
             </div>
 
             <form id="export-form">
               <fieldset class="form-section camera-section">
                 <div class="field-heading">
-                  <legend>Choose cameras</legend>
+                  <legend>Choose Cameras</legend>
                   <button
                     class="text-button"
                     type="button"
@@ -109,13 +106,13 @@
                 >
                   <div class="loading-block" id="camera-loader">
                     <span class="spinner" aria-hidden="true"></span>
-                    Discovering cameras…
+                    Discovering Cameras…
                   </div>
                 </div>
               </fieldset>
 
               <fieldset class="form-section range-section">
-                <legend>Choose a range</legend>
+                <legend>Choose A Range</legend>
                 <div class="segmented-control" role="radiogroup" aria-label="Export range type">
                   <label>
                     <input type="radio" name="range_mode" value="full-day" checked>
@@ -157,9 +154,12 @@
                 <p class="field-note">Times are interpreted in the server’s {{ timezone_name }} timezone.</p>
               </fieldset>
 
-              <fieldset class="form-section compact-section">
-                <legend>Set the pace</legend>
-                <div class="speed-row">
+              <section class="form-section compact-section" aria-labelledby="timelapse-speed-title">
+                <div class="compact-heading">
+                  <h3 id="timelapse-speed-title">Timelapse Speed</h3>
+                  <p>Choose how quickly the exported video should play.</p>
+                </div>
+                <div class="speed-row" role="radiogroup" aria-labelledby="timelapse-speed-title">
                   {% for speed in speeds %}
                     <label class="speed-option">
                       <input type="radio" name="speed" value="{{ speed }}" {% if speed == '600x' %}checked{% endif %}>
@@ -167,24 +167,32 @@
                     </label>
                   {% endfor %}
                 </div>
-              </fieldset>
+              </section>
 
               <div class="preview-section">
                 <div class="field-heading">
                   <div>
-                    <h3>Boundary preview</h3>
-                    <p>Check the first selected camera before exporting.</p>
+                    <h3>Camera Preview</h3>
+                    <p>Choose which selected camera to check at the start and end of the export.</p>
                   </div>
-                  <button class="text-button" type="button" id="load-previews">Load previews</button>
+                  <div class="preview-actions">
+                    <label class="preview-camera-field" for="preview-camera">
+                      <span>Preview Camera</span>
+                      <select id="preview-camera" disabled>
+                        <option value="">Select A Camera</option>
+                      </select>
+                    </label>
+                    <button class="text-button" type="button" id="load-previews">Load Previews</button>
+                  </div>
                 </div>
                 <div class="preview-grid">
                   <figure class="preview-card" data-boundary="start">
-                    <div class="preview-frame"><span>Select a camera</span></div>
-                    <figcaption>Start frame</figcaption>
+                    <div class="preview-frame"><span>Select A Camera</span></div>
+                    <figcaption>Start Frame</figcaption>
                   </figure>
                   <figure class="preview-card" data-boundary="end">
-                    <div class="preview-frame"><span>Select a camera</span></div>
-                    <figcaption>End frame</figcaption>
+                    <div class="preview-frame"><span>Select A Camera</span></div>
+                    <figcaption>End Frame</figcaption>
                   </figure>
                 </div>
               </div>
@@ -199,7 +207,7 @@
                   hx-swap="innerHTML"
                   hx-disabled-elt="this"
                 >
-                  <span>Start export</span>
+                  <span>Start Export</span>
                   <span aria-hidden="true">→</span>
                 </button>
                 <button
@@ -210,7 +218,7 @@
                   hx-target="#notifications"
                   hx-swap="innerHTML"
                   hx-disabled-elt="this"
-                >Enable daily exports</button>
+                >Enable Daily Exports</button>
               </div>
             </form>
           </section>
@@ -219,9 +227,9 @@
             <section class="panel" aria-labelledby="exports-title">
               <div class="panel-heading">
                 <div>
-                  <h2 id="exports-title">Export activity</h2>
+                  <h2 id="exports-title">Export Activity</h2>
                 </div>
-                <span class="selection-count" id="selection-count">0 selected</span>
+                <span class="selection-count" id="selection-count">0 Selected</span>
               </div>
               <div
                 id="jobs-list"
@@ -229,14 +237,14 @@
                 hx-trigger="load, stateChanged from:body, every 10s"
                 hx-swap="innerHTML"
               >
-                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading jobs…</div>
+                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Jobs…</div>
               </div>
             </section>
 
             <section class="panel" aria-labelledby="schedules-title">
               <div class="panel-heading">
                 <div>
-                  <h2 id="schedules-title">Daily automations</h2>
+                  <h2 id="schedules-title">Daily Automations</h2>
                 </div>
               </div>
               <div
@@ -245,7 +253,7 @@
                 hx-trigger="load, stateChanged from:body, every 30s"
                 hx-swap="innerHTML"
               >
-                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading schedules…</div>
+                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Schedules…</div>
               </div>
             </section>
           </div>

@@ -119,19 +119,19 @@ def _format_datetime(value: datetime | None, settings: WebSettings) -> str:
 
 
 def _format_date(value: date | None) -> str:
-    return "Not run yet" if value is None else f"{value:%b} {value.day}, {value:%Y}"
+    return "Not Run Yet" if value is None else f"{value:%b} {value.day}, {value:%Y}"
 
 
 def _job_status(job: ExportJob) -> str:
     if job.status == "queued" and job.error:
-        return "Queued — rate limited"
+        return "Queued — Rate Limited"
     labels = {
         "queued": "Queued",
         "running": "Exporting",
         "completed": "Ready",
         "failed": "Failed",
         "cancelled": "Cancelled",
-        "skipped": "Already exists",
+        "skipped": "Already Exists",
     }
     return labels[job.status]
 

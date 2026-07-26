@@ -182,6 +182,25 @@ struct MainView: View {
                             .disabled(model.isLoadingCameras)
                             .help("Refresh cameras")
                     }
+                    HStack(spacing: 8) {
+                        Label("Preview", systemImage: "photo")
+                            .foregroundStyle(.secondary)
+                            .frame(width: 86, alignment: .leading)
+                        Picker("Preview camera", selection: previewCameraSelection) {
+                            if model.selectedCameras.isEmpty {
+                                Text("Select cameras").tag(nil as String?)
+                            } else {
+                                ForEach(model.selectedCameras) { camera in
+                                    Text(camera.name).tag(camera.id as String?)
+                                }
+                            }
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(width: 150, alignment: .leading)
+                        .disabled(model.selectedCameras.isEmpty)
+                        Spacer()
+                    }
                     HStack {
                         Button("Start Downloads", systemImage: "arrow.down.circle.fill") { model.startDownloads() }
                             .buttonStyle(.borderedProminent)
@@ -240,7 +259,7 @@ struct MainView: View {
     private func thumbnailPopover(for boundary: ThumbnailBoundary) -> some View {
         let preview = model.thumbnailPreviews[boundary]
         VStack(alignment: .leading, spacing: 8) {
-            Text(boundary == .start ? "Start preview" : "End preview")
+            Text("Camera Preview · \(boundary == .start ? "Start" : "End")")
                 .font(.headline)
             if let preview {
                 Text(preview.timestamp.formatted(date: .abbreviated, time: .shortened))
@@ -268,7 +287,7 @@ struct MainView: View {
                     .frame(width: 320, height: 180)
                 }
                 if let cameraName = preview.cameraName {
-                    Text(model.selectedCameras.count > 1 ? "\(cameraName) · first selected camera" : cameraName)
+                    Text(cameraName)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -288,6 +307,10 @@ struct MainView: View {
 
     private var fullDayModeBinding: Binding<Bool> {
         Binding(get: { model.fullDayMode }, set: { enabled in model.setFullDayMode(enabled) })
+    }
+
+    private var previewCameraSelection: Binding<String?> {
+        Binding(get: { model.previewCameraID }, set: { model.selectPreviewCamera($0) })
     }
 
     private var dailyAutomaticBinding: Binding<Bool> {

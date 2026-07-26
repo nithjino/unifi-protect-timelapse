@@ -1,6 +1,6 @@
 {% if camera_error %}
   <div class="inline-error">
-    <strong>Could not load cameras</strong>
+    <strong>Could Not Load Cameras</strong>
     <span>{{ camera_error }}</span>
   </div>
 {% elif not cameras %}
@@ -9,7 +9,7 @@
   <div class="camera-grid">
     {% for camera in cameras %}
       <label class="camera-option">
-        <input type="checkbox" name="camera_ids" value="{{ camera.id }}">
+        <input type="checkbox" name="camera_ids" value="{{ camera.id }}" data-camera-name="{{ camera.name }}">
         <span class="camera-check" aria-hidden="true">✓</span>
         <span class="camera-glyph" aria-hidden="true"><i></i></span>
         <span class="camera-copy">

@@ -46,6 +46,8 @@ public partial class MainWindow : Window
     private bool _allowClose;
     private bool _adjustingFullDay;
     private bool _updatingDailyToggle;
+    private bool _updatingPreviewCamera;
+    private string? _previewCameraId;
     private string? _hoveredThumbnailBoundary;
     private string? _visibleThumbnailKey;
     private int _thumbnailGeneration;
@@ -275,8 +277,8 @@ public partial class MainWindow : Window
         }
 
         var selected = _cameras.Where(camera => _selectedCameraIds.Contains(camera.Id)).ToList();
-        var camera = selected.FirstOrDefault();
-        var cameraText = camera is null ? "" : selected.Count > 1 ? $"{camera.Name} · first selected camera" : camera.Name;
+        var camera = selected.FirstOrDefault(item => item.Id == _previewCameraId);
+        var cameraText = camera?.Name ?? "";
         if (display)
         {
             PrepareThumbnailPopup(boundary, timestamp, cameraText);
@@ -391,7 +393,7 @@ public partial class MainWindow : Window
 
     private void PrepareThumbnailPopup(string boundary, DateTime timestamp, string cameraText)
     {
-        ThumbnailTitle.Text = $"{char.ToUpperInvariant(boundary[0])}{boundary[1..]} preview";
+        ThumbnailTitle.Text = $"Camera Preview · {char.ToUpperInvariant(boundary[0])}{boundary[1..]}";
         ThumbnailTime.Text = timestamp == DateTime.MinValue ? "" : timestamp.ToString("g", CultureInfo.CurrentCulture);
         ThumbnailCamera.Text = cameraText;
         ThumbnailSource.Text = "";
@@ -435,7 +437,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private void ClearThumbnailPreviews()
+    private void ClearThumbnailPreviews(bool clearCache = true)
     {
         _startThumbnailTimer.Stop();
         _endThumbnailTimer.Stop();
@@ -443,8 +445,11 @@ public partial class MainWindow : Window
         _hoveredThumbnailBoundary = null;
         _visibleThumbnailKey = null;
         ThumbnailPopup.IsOpen = false;
-        _thumbnailCache.Clear();
-        _thumbnailFailures.Clear();
+        if (clearCache)
+        {
+            _thumbnailCache.Clear();
+            _thumbnailFailures.Clear();
+        }
         _thumbnailRequests.Clear();
         foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();
     }
@@ -665,6 +670,13 @@ public partial class MainWindow : Window
     private void UpdateCameraSummary()
     {
         var selected = _cameras.Where(camera => _selectedCameraIds.Contains(camera.Id)).ToList();
+        if (selected.All(camera => camera.Id != _previewCameraId))
+            _previewCameraId = selected.FirstOrDefault()?.Id;
+        _updatingPreviewCamera = true;
+        PreviewCameraCombo.ItemsSource = selected;
+        PreviewCameraCombo.SelectedValue = _previewCameraId;
+        PreviewCameraCombo.IsEnabled = selected.Count > 0;
+        _updatingPreviewCamera = false;
         CameraSummaryText.Text = selected.Count switch
         {
             0 => "No cameras selected",
@@ -673,6 +685,16 @@ public partial class MainWindow : Window
         };
         CameraSummaryText.ToolTip = string.Join(", ", selected.Select(camera => camera.Name));
         StartDownloadsButton.IsEnabled = selected.Count > 0;
+    }
+
+    private void PreviewCamera_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_updatingPreviewCamera) return;
+        _previewCameraId = (PreviewCameraCombo.SelectedItem as CameraInfo)?.Id;
+        ClearThumbnailPreviews(clearCache: false);
+        if (_previewCameraId is null) return;
+        RefreshThumbnail("start");
+        RefreshThumbnail("end");
     }
 
     private void StartDownloads_Click(object sender, RoutedEventArgs e)

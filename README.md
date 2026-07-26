@@ -226,7 +226,7 @@ uv run python -m timelapse --start-date 07-13-2026
 
 The web interface runs the existing exporter as a central FastAPI service, so phones, tablets, and other computers can
 use TimeLapse without installing the application. Protect credentials stay on the server and are never included in web
-pages or API responses. The browser interface supports camera discovery, exact or full-day ranges, boundary previews,
+pages or API responses. The browser interface supports camera discovery, exact or full-day ranges, camera previews,
 concurrent exports, live progress, cancellation, retry, downloads, and persistent daily schedules.
 
 ![TimeLapse web dashboard with camera selection, export controls, export activity, and daily automations](docs/screenshots/web-dashboard.jpg)
@@ -389,8 +389,8 @@ The build produces one self-contained `win-x64` distributable at `dist\windows\t
 The native macOS, native Windows, and Qt interfaces share the same preview behavior:
 
 - Selecting or changing a start or end date/time immediately starts a background thumbnail request. Hovering over that field only displays the current loading, image, or error state; it does not initiate another request.
-- A result or failure is cached for that camera and timestamp. Repeated hovers reuse it until the selected camera, connection profile, date, or time changes.
-- When multiple cameras are selected, the preview uses the first selected camera and identifies it in the popover.
+- A successfully loaded thumbnail is cached for that camera and timestamp. Repeated hovers and switching away from and back to that camera reuse the cached image.
+- A separate **Preview camera** dropdown chooses which selected camera supplies both the start and end previews. Export camera selection remains independent and can include multiple cameras.
 - A 24-hour timelapse previews `12:00 AM` on both the start date and end date.
 - TimeLapse first requests the exact historical frame through the private Protect API using the local account. If that fails, it requests the camera's current live snapshot through the Integration API token and labels the preview **Live snapshot — selected time unavailable**.
 - If both requests fail, the interface explains that the local account needs **Livestream** permission and the Integration API token needs access to the camera.
