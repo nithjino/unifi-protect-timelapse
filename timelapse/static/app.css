@@ -1069,8 +1069,10 @@ button:disabled {
 }
 
 .job-topline {
-  gap: 14px;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px 14px;
+  align-items: center;
 }
 
 .job-title-row {
@@ -1083,11 +1085,19 @@ button:disabled {
   font-size: 13px;
 }
 
-.job-topline p {
-  margin: 6px 0 0;
+.job-range,
+.job-file-size {
   color: var(--muted);
   font-size: 10px;
   line-height: 1.45;
+}
+
+.job-range {
+  margin: 0;
+}
+
+.job-file-size {
+  justify-self: end;
 }
 
 .mini-chip {
@@ -1097,6 +1107,7 @@ button:disabled {
 }
 
 .status-badge {
+  justify-self: end;
   padding: 5px 8px;
   border-radius: 999px;
   color: var(--muted-strong);
@@ -1105,20 +1116,6 @@ button:disabled {
   font-weight: 800;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-}
-
-.job-status {
-  display: flex;
-  flex: 0 0 auto;
-  flex-direction: column;
-  gap: 5px;
-  align-items: center;
-}
-
-.job-status small {
-  color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 9px;
 }
 
 .status-running .status-badge {

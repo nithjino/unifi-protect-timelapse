@@ -9,20 +9,16 @@
     {% for job in jobs %}
       <article class="job-card status-{{ job.status }}">
         <div class="job-topline">
-          <div>
-            <div class="job-title-row">
-              <strong>{{ job.camera.name }}</strong>
-              {% if job.daily %}<span class="mini-chip">Daily</span>{% endif %}
-            </div>
-            <p>{{ job.start | datetime }} — {{ job.end | datetime }}</p>
+          <div class="job-title-row">
+            <strong>{{ job.camera.name }}</strong>
+            {% if job.daily %}<span class="mini-chip">Daily</span>{% endif %}
           </div>
-          <div class="job-status">
-            <span class="status-badge">{{ job | job_status }}</span>
-            {% set file_size = job.display_file_size %}
-            {% if file_size is not none %}
-              <small>{{ file_size | bytes }}</small>
-            {% endif %}
-          </div>
+          <span class="status-badge">{{ job | job_status }}</span>
+          <p class="job-range">{{ job.start | datetime }} — {{ job.end | datetime }}</p>
+          {% set file_size = job.display_file_size %}
+          {% if file_size is not none %}
+            <small class="job-file-size">{{ file_size | bytes }}</small>
+          {% endif %}
         </div>
 
         {% if job.status == 'running' %}

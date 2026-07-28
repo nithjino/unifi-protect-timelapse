@@ -92,6 +92,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
 
     with _client(app) as client:
         response = client.get("/")
+        application_css = client.get("/static/app.css")
         javascript = client.get("/static/htmx.min.js")
         application_javascript = client.get("/static/app.js")
         favicon = client.get("/static/favicon.ico")
@@ -101,6 +102,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "htmx.min.js" in response.text
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
+    assert 'href="http://localhost/static/app.css?v=1.4.1"' in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
     assert 'id="video-player-dialog"' in response.text
@@ -125,6 +127,8 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "htmx" in javascript.text
     assert application_javascript.status_code == 200
     assert "showModal" in application_javascript.text
+    assert application_css.status_code == 200
+    assert "grid-template-columns: minmax(0, 1fr) auto" in application_css.text
     assert favicon.status_code == 200
     assert favicon.headers["content-type"] in {"image/vnd.microsoft.icon", "image/x-icon"}
 
@@ -360,7 +364,7 @@ def test_running_export_renders_disabled_play_button(tmp_path: Path) -> None:
     assert "disabled" in jobs_response.text
     assert "Available when the export is ready" in jobs_response.text
     assert "data-video-url" not in jobs_response.text
-    assert "<small>2.0 KiB</small>" in jobs_response.text
+    assert '<small class="job-file-size">2.0 KiB</small>' in jobs_response.text
     assert playback.status_code == 404
 
 
@@ -386,7 +390,7 @@ def test_ready_export_renders_actual_file_size_from_disk(tmp_path: Path) -> None
 
     assert jobs_response.status_code == 200
     assert "Ready" in jobs_response.text
-    assert "<small>1.5 KiB</small>" in jobs_response.text
+    assert '<small class="job-file-size">1.5 KiB</small>' in jobs_response.text
 
 
 def test_cancelled_export_does_not_render_file_size(tmp_path: Path) -> None:
@@ -410,7 +414,7 @@ def test_cancelled_export_does_not_render_file_size(tmp_path: Path) -> None:
 
     assert jobs_response.status_code == 200
     assert "Cancelled" in jobs_response.text
-    assert "<small>2.0 KiB</small>" not in jobs_response.text
+    assert "job-file-size" not in jobs_response.text
 
 
 def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path) -> None:
