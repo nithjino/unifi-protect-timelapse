@@ -347,6 +347,7 @@ def test_running_export_renders_disabled_play_button(tmp_path: Path) -> None:
         speed="120x",
         output=tmp_path / "data" / "exports" / "running.mp4",
         status="running",
+        total_bytes=2048,
     )
     state.jobs[job.id] = job
 
@@ -359,7 +360,57 @@ def test_running_export_renders_disabled_play_button(tmp_path: Path) -> None:
     assert "disabled" in jobs_response.text
     assert "Available when the export is ready" in jobs_response.text
     assert "data-video-url" not in jobs_response.text
+    assert "<small>2.0 KiB</small>" in jobs_response.text
     assert playback.status_code == 404
+
+
+def test_ready_export_renders_actual_file_size_from_disk(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+    output = tmp_path / "data" / "exports" / "legacy.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"x" * 1536)
+    job = ExportJob(
+        id="legacy01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(hours=2),
+        speed="120x",
+        output=output,
+        status="completed",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        jobs_response = client.get("/partials/jobs")
+
+    assert jobs_response.status_code == 200
+    assert "Ready" in jobs_response.text
+    assert "<small>1.5 KiB</small>" in jobs_response.text
+
+
+def test_cancelled_export_does_not_render_file_size(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+    job = ExportJob(
+        id="cancelled01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(hours=2),
+        speed="120x",
+        output=tmp_path / "data" / "exports" / "cancelled.mp4",
+        status="cancelled",
+        downloaded_bytes=1024,
+        total_bytes=2048,
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        jobs_response = client.get("/partials/jobs")
+
+    assert jobs_response.status_code == 200
+    assert "Cancelled" in jobs_response.text
+    assert "<small>2.0 KiB</small>" not in jobs_response.text
 
 
 def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path) -> None:
@@ -618,6 +669,9 @@ def test_export_list_is_restored_after_restart(tmp_path: Path) -> None:
         return job.id
 
     job_id = asyncio.run(create_export())
+    legacy_payload = json.loads((settings.data_dir / "web-jobs.json").read_text(encoding="utf-8"))
+    legacy_payload["jobs"][0].pop("total_bytes")
+    (settings.data_dir / "web-jobs.json").write_text(json.dumps(legacy_payload), encoding="utf-8")
     second_state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
 
     async def restore_export() -> None:
@@ -626,6 +680,8 @@ def test_export_list_is_restored_after_restart(tmp_path: Path) -> None:
         assert restored.status == "completed"
         assert restored.camera.name == "Front Door"
         assert restored.output.read_bytes() == b"video"
+        assert restored.total_bytes is None
+        assert restored.display_file_size == len(b"video")
         assert restored.task is None
         await second_state.close()
 

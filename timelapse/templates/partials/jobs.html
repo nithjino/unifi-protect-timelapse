@@ -16,7 +16,13 @@
             </div>
             <p>{{ job.start | datetime }} — {{ job.end | datetime }}</p>
           </div>
-          <span class="status-badge">{{ job | job_status }}</span>
+          <div class="job-status">
+            <span class="status-badge">{{ job | job_status }}</span>
+            {% set file_size = job.display_file_size %}
+            {% if file_size is not none %}
+              <small>{{ file_size | bytes }}</small>
+            {% endif %}
+          </div>
         </div>
 
         {% if job.status == 'running' %}

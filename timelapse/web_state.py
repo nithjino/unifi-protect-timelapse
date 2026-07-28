@@ -278,6 +278,18 @@ class ExportJob:
             return None
         return min(self.downloaded_bytes / self.total_bytes * 100, 100.0)
 
+    @property
+    def display_file_size(self) -> int | None:
+        """Return the size shown below active and ready status labels."""
+        if self.status == "running":
+            return self.total_bytes
+        if self.status != "completed":
+            return None
+        try:
+            return self.output.stat().st_size
+        except OSError:
+            return None
+
 
 @dataclass
 class DailySchedule:

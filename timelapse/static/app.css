@@ -1097,7 +1097,6 @@ button:disabled {
 }
 
 .status-badge {
-  flex: 0 0 auto;
   padding: 5px 8px;
   border-radius: 999px;
   color: var(--muted-strong);
@@ -1106,6 +1105,20 @@ button:disabled {
   font-weight: 800;
   letter-spacing: 0.05em;
   text-transform: uppercase;
+}
+
+.job-status {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 5px;
+  align-items: center;
+}
+
+.job-status small {
+  color: var(--muted);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
 }
 
 .status-running .status-badge {
