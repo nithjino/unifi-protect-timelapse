@@ -19,7 +19,7 @@ services:
       TIMELAPSE_WEB_USERNAME: ${TIMELAPSE_WEB_USERNAME:-timelapse}
       TIMELAPSE_WEB_PASSWORD: ${TIMELAPSE_WEB_PASSWORD:?Set TIMELAPSE_WEB_PASSWORD in .env before starting Docker}
     ports:
-      - "${TIMELAPSE_WEB_BIND_ADDRESS:-0.0.0.0}:${TIMELAPSE_WEB_PORT:-8000}:8000"
+      - "${TIMELAPSE_WEB_BIND_ADDRESS:-127.0.0.1}:${TIMELAPSE_WEB_PORT:-8000}:8000"
     volumes:
       - ./data:/data
     security_opt:
