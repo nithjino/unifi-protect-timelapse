@@ -102,7 +102,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "htmx.min.js" in response.text
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
-    assert 'href="http://localhost/static/app.css?v=1.4.1"' in response.text
+    assert 'href="http://localhost/static/app.css?v=1.4.2"' in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
     assert 'id="video-player-dialog"' in response.text
