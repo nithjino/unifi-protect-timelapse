@@ -100,6 +100,13 @@ def test_24_hour_toggle_uses_date_only_one_day_range(main_window: gui_module._Ma
     assert end == start.addDays(1)
 
 
+def test_speed_selector_lists_normal_speed_first(main_window: gui_module._MainWindow) -> None:
+    speeds = [main_window._speed_combo.itemText(index) for index in range(main_window._speed_combo.count())]
+
+    assert speeds == ["1x", "60x", "120x", "300x", "600x"]
+    assert main_window._speed_combo.currentText() == "600x"
+
+
 def test_24_hour_hover_preview_uses_midnight_and_prompts_for_camera(main_window: gui_module._MainWindow) -> None:
     main_window._full_day_checkbox.setChecked(True)
 

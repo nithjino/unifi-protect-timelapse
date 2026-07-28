@@ -176,6 +176,29 @@ def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_
     assert config.speed == "600x"
 
 
+def test_cli_accepts_normal_speed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
+    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "timelapse",
+            "--instance",
+            "https://protect.local",
+            "--token",
+            "test-token",
+            "--start-date",
+            "07-11-2026",
+            "--speed",
+            "1x",
+        ],
+    )
+
+    assert _parse_config().speed == "1x"
+
+
 def test_private_credentials_can_be_passed_on_command_line(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -28,7 +28,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var isLoadingCameras = false
     @Published private(set) var thumbnailPreviews: [ThumbnailBoundary: ThumbnailPreview] = [:]
 
-    let speeds = ["60x", "120x", "300x", "600x"]
+    let speeds = ["1x", "60x", "120x", "300x", "600x"]
 
     private var cameraProcess: BackendProcess?
     private var cameraRequestID: String?

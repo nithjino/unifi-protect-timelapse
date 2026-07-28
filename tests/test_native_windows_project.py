@@ -55,6 +55,16 @@ def test_windows_native_gui_declares_core_controls_and_bindings() -> None:
         "{Binding TimeRangeText}",
     ]
 
+    speed_combo = elements["SpeedCombo"]
+    assert [item.get("Content") for item in speed_combo] == ["1x", "60x", "120x", "300x", "600x"]
+    assert speed_combo.get("SelectedIndex") == "4"
+
+
+def test_macos_native_gui_lists_normal_speed_first() -> None:
+    app_model = (ROOT / "native-macos" / "Sources" / "TimeLapseNative" / "AppModel.swift").read_text(encoding="utf-8")
+
+    assert 'let speeds = ["1x", "60x", "120x", "300x", "600x"]' in app_model
+
 
 def test_windows_build_packages_native_app_and_backend() -> None:
     script = (ROOT / "build-windows.ps1").read_text(encoding="utf-8")

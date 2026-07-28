@@ -113,6 +113,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert response.text.count('type="time" value="00:00" disabled') == 2
     assert '<h2 id="new-export-title">New Export</h2>' in response.text
     assert '<h3 id="timelapse-speed-title">Timelapse Speed</h3>' in response.text
+    assert response.text.index('name="speed" value="1x"') < response.text.index('name="speed" value="60x"')
     assert '<h2 id="exports-title">Export Activity</h2>' in response.text
     assert '<h2 id="schedules-title">Daily Automations</h2>' in response.text
     assert "Set the pace" not in response.text

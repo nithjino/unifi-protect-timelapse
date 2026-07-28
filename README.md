@@ -12,7 +12,7 @@ The exporter lists the cameras available through the UniFi Protect Integration A
 - Native SwiftUI interface for macOS
 - Native WPF interface for Windows
 - Cross-platform Qt desktop interface built with PySide6
-- CLI speeds of `60x`, `120x`, `300x`, and `600x`
+- CLI speeds of `1x`, `60x`, `120x`, `300x`, and `600x`
 - Exact date/time ranges or daylight-saving-aware local calendar days
 - Daily automatic exports for the most recently completed day
 - Multiple concurrent per-camera jobs in the desktop interfaces

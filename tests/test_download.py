@@ -74,12 +74,14 @@ class _FakeClient:
     def __init__(self, response: _FakeResponse) -> None:
         self.response = response
         self.headers: dict[str, str] = {}
+        self.request_kwargs: dict[str, object] = {}
 
     def set_header(self, key: str, value: str) -> None:
         self.headers[key] = value
 
     async def request(self, method: str, url: str, **kwargs: object) -> _FakeResponse:
-        del method, url, kwargs
+        del method, url
+        self.request_kwargs = kwargs
         return self.response
 
 
@@ -139,6 +141,42 @@ def test_default_output_path_distinguishes_cameras_with_colliding_names() -> Non
     assert first_output != second_output
     assert first_output.name.startswith("timelapse_Front_Door_")
     assert second_output.name.startswith("timelapse_Front_Door_")
+
+
+@pytest.mark.parametrize(
+    ("speed", "expected_export_options"),
+    [
+        ("1x", {}),
+        ("60x", {"type": "timelapse", "fps": "4"}),
+    ],
+)
+def test_download_uses_the_protect_export_mode_for_the_selected_speed(
+    tmp_path: Path,
+    speed: str,
+    expected_export_options: dict[str, str],
+) -> None:
+    response = _FakeResponse(_FakeContent([b"\x00\x00\x00\x18ftypisomdata"]), {})
+    fake_client = _FakeClient(response)
+    config = replace(_config(), speed=speed)
+
+    asyncio.run(
+        download_timelapse(
+            config,
+            parse_connection(config.instance_url),
+            cast("ProtectApiClient", fake_client),
+            CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+            tmp_path / f"{speed}.mp4",
+        )
+    )
+
+    params = cast("dict[str, str]", fake_client.request_kwargs["params"])
+    assert {key: params[key] for key in ("camera", "start", "end", "channel")} == {
+        "camera": "camera-1",
+        "start": "1783756800000",
+        "end": "1783760400000",
+        "channel": "0",
+    }
+    assert {key: params[key] for key in ("type", "fps") if key in params} == expected_export_options
 
 
 @pytest.mark.parametrize("content_length", [16, None])

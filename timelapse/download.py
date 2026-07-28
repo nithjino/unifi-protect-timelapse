@@ -185,9 +185,10 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         "start": str(_js_time(config.start)),
         "end": str(_js_time(config.end)),
         "channel": "0",
-        "type": "timelapse",
-        "fps": str(SPEED_TO_FPS[config.speed]),
     }
+    timelapse_fps = SPEED_TO_FPS[config.speed]
+    if timelapse_fps is not None:
+        params.update(type="timelapse", fps=str(timelapse_fps))
     output.parent.mkdir(parents=True, exist_ok=True)
 
     _LOGGER.info(
@@ -196,7 +197,7 @@ async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-do
         connection.port,
         connection.export_path,
         params["camera"],
-        params["fps"],
+        params.get("fps", "source"),
         _format_timeout(config.request_timeout_seconds),
         _format_limit(config.max_download_mib),
     )

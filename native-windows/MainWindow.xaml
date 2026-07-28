@@ -75,7 +75,8 @@
               </Grid>
             </Border>
             <TextBlock Grid.Row="2" Text="Speed" Foreground="#666" VerticalAlignment="Center" />
-            <ComboBox x:Name="SpeedCombo" Grid.Row="2" Grid.Column="1" Width="105" HorizontalAlignment="Left" SelectedIndex="3">
+            <ComboBox x:Name="SpeedCombo" Grid.Row="2" Grid.Column="1" Width="105" HorizontalAlignment="Left" SelectedIndex="4">
+              <ComboBoxItem Content="1x" />
               <ComboBoxItem Content="60x" />
               <ComboBoxItem Content="120x" />
               <ComboBoxItem Content="300x" />
