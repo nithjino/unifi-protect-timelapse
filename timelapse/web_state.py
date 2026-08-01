@@ -505,13 +505,14 @@ class WebState:
         return jobs, planned_keys
 
     async def cancel_or_remove_job(self, job_id: str) -> str:
-        """Cancel an active job or remove a terminal job from the list."""
-        job = self.jobs.get(job_id)
-        if job is None:
-            message = "That export is no longer in the job list."
-            raise ValueError(message)
-        if job.terminal:
-            async with self._job_mutation_lock:
+        """Cancel an active job or delete a terminal job and its output file."""
+        async with self._job_mutation_lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                message = "That export is no longer in the job list."
+                raise ValueError(message)
+            if job.terminal:
+                await asyncio.to_thread(job.output.unlink, missing_ok=True)
                 del self.jobs[job_id]
                 try:
                     await self._persist_jobs()
@@ -519,7 +520,7 @@ class WebState:
                     self.jobs[job_id] = job
                     raise
                 self._changed()
-            return "removed"
+                return "removed"
         if job.task is not None:
             job.task.cancel()
         return "cancelled"

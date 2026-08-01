@@ -18,6 +18,9 @@ namespace TimeLapseNative;
 
 public partial class MainWindow : Window
 {
+    private static readonly string ApplicationVersion =
+        typeof(MainWindow).Assembly.GetName().Version?.ToString(3) ?? "Unknown";
+
     public ObservableCollection<DownloadJob> DownloadJobs { get; } = [];
     public ObservableCollection<DownloadJob> DailyAutomationJobs { get; } = [];
     public ObservableCollection<string> Logs { get; } = [];
@@ -68,6 +71,7 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
+        Title = $"UniFi Protect Timelapse - {ApplicationVersion}";
         _notificationIcon = new Forms.NotifyIcon
         {
             Icon = Drawing.Icon.ExtractAssociatedIcon(Environment.ProcessPath ?? "") ?? Drawing.SystemIcons.Application,
@@ -883,7 +887,7 @@ public partial class MainWindow : Window
         switch (job.State)
         {
             case DownloadState.Scheduled: StopDailySchedule(); break;
-            case DownloadState.Stopped: DailyAutomationJobs.Remove(job); UpdateDownloadsDisplay(); break;
+            case DownloadState.Stopped: DeleteJob(job); break;
             case DownloadState.Completed: Reveal(job); break;
             case DownloadState.Cancelled or DownloadState.Failed: Restart(job); break;
             case DownloadState.Preparing or DownloadState.Queued or DownloadState.Downloading: Cancel(job); break;
@@ -935,8 +939,43 @@ public partial class MainWindow : Window
     private void ClearAll_Click(object sender, RoutedEventArgs e)
     {
         var jobs = ShowingDailyAutomations ? DailyAutomationJobs : DownloadJobs;
-        foreach (var job in jobs.Where(job => job.IsTerminal).ToList()) jobs.Remove(job);
+        var deletedCount = 0;
+        foreach (var job in jobs.Where(job => job.IsTerminal).ToList())
+            if (DeleteJob(job, updateDisplay: false, showStatus: false)) deletedCount++;
+        if (deletedCount > 0)
+            StatusText.Text = ShowingDailyAutomations
+                ? $"Deleted {deletedCount} stopped daily automations"
+                : $"Deleted {deletedCount} finished downloads";
         UpdateDownloadsDisplay();
+    }
+
+    private bool DeleteJob(DownloadJob job, bool updateDisplay = true, bool showStatus = true)
+    {
+        if (!job.IsTerminal) return false;
+        if (!job.IsDailySchedule)
+        {
+            try
+            {
+                if (Directory.Exists(job.OutputPath))
+                {
+                    ShowError("Could Not Delete Export", "The output path is a directory and was left untouched.");
+                    return false;
+                }
+                File.Delete(job.OutputPath);
+            }
+            catch (Exception exception)
+            {
+                ShowError("Could Not Delete Export", $"The exported video could not be deleted: {exception.Message}");
+                return false;
+            }
+        }
+
+        var jobs = job.IsDailySchedule ? DailyAutomationJobs : DownloadJobs;
+        jobs.Remove(job);
+        if (showStatus) StatusText.Text = $"Deleted {job.Camera.Name} from the job list";
+        AppendLog("INFO", $"Deleted {job.Camera.Name} from the job list");
+        if (updateDisplay) UpdateDownloadsDisplay();
+        return true;
     }
 
     private void CancelAll_Click(object sender, RoutedEventArgs e)

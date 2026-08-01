@@ -32,7 +32,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from starlette.templating import Jinja2Templates
 
-from timelapse import OperationTimeoutError, TimelapseError
+from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.config import SPEED_TO_FPS
 from timelapse.protect import protect_session_scope
 from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
@@ -398,6 +398,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     templates.env.filters["date"] = _format_date
     templates.env.filters["job_status"] = _job_status
     templates.env.filters["next_run"] = lambda schedule: _schedule_next_run(schedule, configured_settings)
+    templates.env.globals["timelapse_version"] = __version__
 
     @application.middleware("http")
     async def identify_and_log_requests(
@@ -659,7 +660,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             action = await web_state.cancel_or_remove_job(job_id)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=404)
-        message = "Cancellation requested." if action == "cancelled" else "Export removed from the list."
+        message = "Cancellation requested." if action == "cancelled" else "Export deleted."
         return message_response(request, message)
 
     @application.post("/actions/jobs/{job_id}/retry", response_class=HTMLResponse)

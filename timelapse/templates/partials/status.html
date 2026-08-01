@@ -6,6 +6,13 @@
   </div>
 </div>
 <div class="server-info-row">
+  <div class="connection-icon ready" aria-hidden="true">v</div>
+  <div>
+    <strong>TimeLapse Version</strong>
+    <p><code>{{ timelapse_version }}</code></p>
+  </div>
+</div>
+<div class="server-info-row">
   {% if settings.connection_ready %}
     <div class="connection-icon ready" aria-hidden="true">✓</div>
     <div>

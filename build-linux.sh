@@ -67,6 +67,7 @@ pyinstaller_args=(
     --collect-submodules uiprotect.data
     --collect-submodules uiprotect.devices
     --collect-submodules uiprotect.events
+    --copy-metadata timelapse
     --hidden-import keyring.backends.SecretService
     --hidden-import PySide6.QtDBus
     --add-data "${DEFAULT_ICON}:timelapse_assets"

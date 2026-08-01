@@ -129,7 +129,8 @@
         <DockPanel Margin="0,0,0,9">
           <StackPanel Orientation="Horizontal">
             <TextBlock Text="⇩  Jobs" FontSize="15" FontWeight="SemiBold" VerticalAlignment="Center" Margin="0,0,12,0" />
-            <Button x:Name="ClearAllButton" Content="Clear All" Click="ClearAll_Click" Margin="0,0,8,0" IsEnabled="False" />
+            <Button x:Name="ClearAllButton" Content="Delete All" Click="ClearAll_Click" Margin="0,0,8,0"
+                    IsEnabled="False" Style="{StaticResource DangerButtonStyle}" />
             <Button x:Name="CancelAllButton" Content="Cancel All" Click="CancelAll_Click" IsEnabled="False" />
           </StackPanel>
         </DockPanel>
@@ -158,7 +159,8 @@
                   <DataGridTextColumn Header="Output" Binding="{Binding OutputName}" Width="*" />
                   <DataGridTemplateColumn Header="Action" Width="95">
                     <DataGridTemplateColumn.CellTemplate>
-                      <DataTemplate><Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2" /></DataTemplate>
+                      <DataTemplate><Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2"
+                                            Style="{StaticResource JobActionButtonStyle}" /></DataTemplate>
                     </DataGridTemplateColumn.CellTemplate>
                   </DataGridTemplateColumn>
                 </DataGrid.Columns>
@@ -189,7 +191,8 @@
                   <DataGridTextColumn Header="Output" Binding="{Binding OutputName}" Width="*" />
                   <DataGridTemplateColumn Header="Action" Width="95">
                     <DataGridTemplateColumn.CellTemplate>
-                      <DataTemplate><Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2" /></DataTemplate>
+                      <DataTemplate><Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2"
+                                            Style="{StaticResource JobActionButtonStyle}" /></DataTemplate>
                     </DataGridTemplateColumn.CellTemplate>
                   </DataGridTemplateColumn>
                 </DataGrid.Columns>

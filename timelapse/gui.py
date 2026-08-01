@@ -71,7 +71,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from timelapse import ProtectRateLimitError, TimelapseError
+from timelapse import ProtectRateLimitError, TimelapseError, __version__
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo, parse_connection
@@ -1032,7 +1032,7 @@ class _MainWindow(QMainWindow):
         application = cast("QApplication", QApplication.instance())
         self._notification_icon.setIcon(application.windowIcon())
         self._notification_icon.setToolTip("UniFi Protect Timelapse")
-        self.setWindowTitle("UniFi Protect Timelapse")
+        self.setWindowTitle(f"UniFi Protect Timelapse - {__version__}")
         self.resize(1400, 680)
         self.setMinimumSize(1250, 560)
         self._install_styles()
@@ -1101,6 +1101,10 @@ class _MainWindow(QMainWindow):
             "QPushButton[primary='true'] { background: palette(highlight); color: palette(highlighted-text); "
             "border: 1px solid palette(highlight); border-radius: 5px; padding: 5px 12px; }"
             "QPushButton[primary='true']:disabled { background: palette(midlight); color: palette(disabled, text); "
+            "border-color: palette(mid); }"
+            "QPushButton[danger='true'] { background: #b42318; color: white; border: 1px solid #b42318; "
+            "border-radius: 5px; padding: 5px 12px; }"
+            "QPushButton[danger='true']:disabled { background: palette(midlight); color: palette(disabled, text); "
             "border-color: palette(mid); }"
             "QGroupBox { border: 1px solid palette(mid); border-radius: 10px; margin-top: 9px; "
             "padding: 12px 10px 10px; }"
@@ -1406,8 +1410,8 @@ class _MainWindow(QMainWindow):
         group = QGroupBox("Jobs")
         layout = QVBoxLayout(group)
         controls = QHBoxLayout()
-        self._clear_all_button = QPushButton("Clear All")
-        self._clear_all_button.setProperty("primary", "true")
+        self._clear_all_button = QPushButton("Delete All")
+        self._clear_all_button.setProperty("danger", "true")
         self._clear_all_button.clicked.connect(self._clear_finished_jobs)
         controls.addWidget(self._clear_all_button)
         self._cancel_all_button = QPushButton("Cancel All")
@@ -1831,7 +1835,12 @@ class _MainWindow(QMainWindow):
         self._daily_schedule = None
         schedule.entry.terminal = True
         self._set_entry_text(schedule.entry, _COLUMN_STATUS, "Stopped")
-        self._set_action_button(schedule.entry, "Remove", partial(self._remove_entry, schedule.entry))
+        self._set_action_button(
+            schedule.entry,
+            "Delete",
+            partial(self._remove_entry, schedule.entry),
+            danger=True,
+        )
         self._set_daily_checkbox(checked=False)
         self._update_bulk_buttons()
         self.statusBar().showMessage("Stopped daily automatic timelapses", 5000)
@@ -2044,12 +2053,13 @@ class _MainWindow(QMainWindow):
     @Slot()
     def _clear_finished_jobs(self) -> None:
         removable = [entry for entry in self._visible_entries() if self._is_removable(entry)]
+        deleted_count = 0
         for entry in sorted(removable, key=lambda item: item.row, reverse=True):
-            self._remove_entry(entry)
-        if removable:
+            deleted_count += self._remove_entry(entry, show_status=False)
+        if deleted_count:
             description = "stopped daily automations" if self._shows_daily_automations else "finished downloads"
-            self.statusBar().showMessage(f"Cleared {len(removable)} {description}", 5000)
-            _LOGGER.info("Cleared %d %s", len(removable), description)
+            self.statusBar().showMessage(f"Deleted {deleted_count} {description}", 5000)
+            _LOGGER.info("Deleted %d %s", deleted_count, description)
 
     def _update_bulk_buttons(self) -> None:
         self._clear_all_button.setEnabled(any(self._is_removable(entry) for entry in self._visible_entries()))
@@ -2092,9 +2102,9 @@ class _MainWindow(QMainWindow):
             if worker is not None:
                 cancel_action.triggered.connect(partial(self._cancel_download, worker))
         menu.addSeparator()
-        remove_action = menu.addAction("Remove from List")
-        remove_action.setEnabled(self._is_removable(entry))
-        remove_action.triggered.connect(partial(self._remove_entry, entry))
+        delete_action = menu.addAction("Delete")
+        delete_action.setEnabled(self._is_removable(entry))
+        delete_action.triggered.connect(partial(self._remove_entry, entry))
         menu.exec(table.viewport().mapToGlobal(position))
 
     def _open_completed_video(self, table: QTableWidget, row: int, _column: int) -> None:
@@ -2117,9 +2127,20 @@ class _MainWindow(QMainWindow):
     def _table_for_entry(self, entry: _DownloadEntry) -> QTableWidget:
         return self._daily_automations if entry.daily_schedule else self._downloads
 
-    def _remove_entry(self, entry: _DownloadEntry) -> None:
+    def _remove_entry(self, entry: _DownloadEntry, *, show_status: bool = True) -> bool:
         if not self._is_removable(entry):
-            return
+            return False
+        if not entry.daily_schedule:
+            try:
+                entry.output.unlink(missing_ok=True)
+            except OSError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Could Not Delete Export",
+                    f"The exported video could not be deleted from {entry.output}: {_exception_text(exc)}",
+                )
+                _LOGGER.exception("Could not delete export %s", entry.output)
+                return False
         table = self._table_for_entry(entry)
         removed_row = entry.row
         table.removeRow(removed_row)
@@ -2129,7 +2150,9 @@ class _MainWindow(QMainWindow):
                 remaining.row -= 1
         self._sync_download_view()
         self._update_bulk_buttons()
-        self.statusBar().showMessage(f"Removed {entry.camera_name} from the job list", 5000)
+        if show_status:
+            self.statusBar().showMessage(f"Deleted {entry.camera_name} from the job list", 5000)
+        return True
 
     def _download_progress(self, entry: _DownloadEntry, payload: object) -> None:
         if entry.terminal or not isinstance(payload, DownloadProgress):
@@ -2329,15 +2352,18 @@ class _MainWindow(QMainWindow):
         self,
         entry: _DownloadEntry,
         text: str,
-        callback: Callable[[], None],
+        callback: Callable[[], object],
         *,
         enabled: bool = True,
+        danger: bool = False,
     ) -> None:
         table = self._table_for_entry(entry)
         old_widget = table.cellWidget(entry.row, _COLUMN_ACTION)
         if old_widget is not None:
             old_widget.deleteLater()
         button = QPushButton(text)
+        if danger:
+            button.setProperty("danger", "true")
         button.clicked.connect(callback)
         button.setEnabled(enabled)
         table.setCellWidget(entry.row, _COLUMN_ACTION, button)

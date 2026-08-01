@@ -58,11 +58,11 @@
             >Play</button>
             {% if job.status == 'completed' %}
               <button
-                class="small-button"
+                class="small-button danger"
                 hx-delete="/actions/jobs/{{ job.id }}"
                 hx-target="#notifications"
                 hx-swap="innerHTML"
-              >Remove</button>
+              >Delete</button>
             {% elif job.status in ('queued', 'running') %}
               <button
                 class="small-button danger"
@@ -78,18 +78,18 @@
                 hx-swap="innerHTML"
               >Retry</button>
               <button
-                class="small-button"
+                class="small-button danger"
                 hx-delete="/actions/jobs/{{ job.id }}"
                 hx-target="#notifications"
                 hx-swap="innerHTML"
-              >Remove</button>
+              >Delete</button>
             {% else %}
               <button
-                class="small-button"
+                class="small-button danger"
                 hx-delete="/actions/jobs/{{ job.id }}"
                 hx-target="#notifications"
                 hx-swap="innerHTML"
-              >Remove</button>
+              >Delete</button>
             {% endif %}
           </div>
         </div>

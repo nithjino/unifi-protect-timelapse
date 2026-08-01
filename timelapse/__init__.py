@@ -1,5 +1,12 @@
 """UniFi Protect timelapse exporter."""
 
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("timelapse")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+
 
 class TimelapseError(RuntimeError):
     """Raised when a timelapse export cannot be completed."""

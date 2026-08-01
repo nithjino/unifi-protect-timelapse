@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timelapse"
-version = "1.4.2"
+version = "1.5.0"
 description = "CLI and desktop UniFi Protect timelapse exporter"
 requires-python = ">=3.11"
 dependencies = [

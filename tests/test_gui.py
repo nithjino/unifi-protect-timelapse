@@ -7,6 +7,7 @@ import pytest
 from PySide6.QtCore import Qt
 
 import timelapse.gui as gui_module
+from timelapse import __version__
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
@@ -87,6 +88,11 @@ def _entry_text(window: gui_module._MainWindow, entry: gui_module._DownloadEntry
     item = table.item(entry.row, column)
     assert item is not None
     return item.text()
+
+
+def test_window_title_includes_application_version(main_window: gui_module._MainWindow) -> None:
+    assert __version__ != "0+unknown"
+    assert main_window.windowTitle() == f"UniFi Protect Timelapse - {__version__}"
 
 
 def test_24_hour_toggle_uses_date_only_one_day_range(main_window: gui_module._MainWindow) -> None:
@@ -572,6 +578,11 @@ def test_bulk_controls_only_affect_the_active_job_tab(
     main_window._cancel_all_jobs()
     assert main_window._daily_schedule is None
     assert schedule_entry.terminal is True
+    assert schedule_entry.action_button.text() == "Delete"
+    assert schedule_entry.action_button.property("danger") == "true"
+    schedule_entry.action_button.click()
+    assert tmp_path.exists()
+    assert schedule_entry not in main_window._entries
     main_window._workers.clear()
 
 
@@ -585,15 +596,19 @@ def test_bulk_download_controls_preserve_active_rows(
     active_worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
     finished = main_window._add_download_row(1, camera, tmp_path / "finished.mp4", finished_worker)
     active = main_window._add_download_row(2, camera, tmp_path / "active.mp4", active_worker)
+    finished.output.write_bytes(b"video")
     finished.terminal = True
     finished.completed = True
     main_window._workers[active_worker] = active
     main_window._update_bulk_buttons()
 
     assert main_window._clear_all_button.isEnabled() is True
+    assert main_window._clear_all_button.text() == "Delete All"
+    assert main_window._clear_all_button.property("danger") == "true"
     assert main_window._cancel_all_button.isEnabled() is True
 
     main_window._clear_finished_jobs()
+    assert not finished.output.exists()
     assert main_window._downloads.rowCount() == 1
     assert main_window._entries == [active]
 

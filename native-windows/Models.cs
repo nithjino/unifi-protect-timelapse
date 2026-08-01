@@ -222,7 +222,7 @@ public sealed class DownloadJob : INotifyPropertyChanged
         DownloadState.Completed => "Show",
         DownloadState.Cancelled or DownloadState.Failed => "Restart",
         DownloadState.Cancelling => "Cancelling…",
-        DownloadState.Stopped => "Remove",
+        DownloadState.Stopped => "Delete",
         _ => "Cancel",
     };
 

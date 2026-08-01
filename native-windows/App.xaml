@@ -16,5 +16,19 @@
       <Setter Property="Padding" Value="12,5" />
       <Setter Property="MinHeight" Value="28" />
     </Style>
+    <Style x:Key="DangerButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Setter Property="Background" Value="#B42318" />
+      <Setter Property="BorderBrush" Value="#B42318" />
+      <Setter Property="Foreground" Value="White" />
+    </Style>
+    <Style x:Key="JobActionButtonStyle" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding ActionText}" Value="Delete">
+          <Setter Property="Background" Value="#B42318" />
+          <Setter Property="BorderBrush" Value="#B42318" />
+          <Setter Property="Foreground" Value="White" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
   </Application.Resources>
 </Application>

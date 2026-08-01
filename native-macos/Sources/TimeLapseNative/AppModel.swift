@@ -635,23 +635,55 @@ final class AppModel: ObservableObject {
             : "Cancelling \(cancellableJobs.count) downloads…"
     }
 
-    func remove(_ job: DownloadJob) {
-        guard job.state.isTerminal else { return }
+    @discardableResult
+    func remove(_ job: DownloadJob) -> Bool {
+        guard job.state.isTerminal else { return false }
+        guard deleteOutput(for: job) else { return false }
         jobs.removeAll { $0.id == job.id }
-        statusMessage = "Removed \(job.camera.name) from the job list"
+        statusMessage = "Deleted \(job.camera.name) from the job list"
         appendLog(level: "INFO", message: statusMessage)
+        return true
     }
 
     func clearFinishedJobs(dailyAutomations: Bool) {
-        let removedCount = jobs.count(where: {
+        let clearableJobs = jobs.filter {
             $0.isDailySchedule == dailyAutomations && $0.state.isTerminal
-        })
-        guard removedCount > 0 else { return }
-        jobs.removeAll { $0.isDailySchedule == dailyAutomations && $0.state.isTerminal }
+        }
+        var deletedCount = 0
+        for job in clearableJobs where remove(job) {
+            deletedCount += 1
+        }
+        guard deletedCount > 0 else { return }
         statusMessage = dailyAutomations
-            ? "Cleared \(removedCount) stopped daily automations"
-            : "Cleared \(removedCount) finished downloads"
+            ? "Deleted \(deletedCount) stopped daily automations"
+            : "Deleted \(deletedCount) finished downloads"
         appendLog(level: "INFO", message: statusMessage)
+    }
+
+    private func deleteOutput(for job: DownloadJob) -> Bool {
+        guard !job.isDailySchedule else { return true }
+        var isDirectory = ObjCBool(false)
+        guard FileManager.default.fileExists(atPath: job.outputURL.path, isDirectory: &isDirectory) else {
+            return true
+        }
+        guard !isDirectory.boolValue else {
+            reportDeleteFailure(job, detail: "The output path is a directory and was left untouched.")
+            return false
+        }
+        do {
+            try FileManager.default.removeItem(at: job.outputURL)
+            return true
+        } catch {
+            reportDeleteFailure(job, detail: error.localizedDescription)
+            return false
+        }
+    }
+
+    private func reportDeleteFailure(_ job: DownloadJob, detail: String) {
+        let message = "The exported video could not be deleted from \(job.outputURL.path): \(detail)"
+        alert = AppAlert(title: "Could Not Delete Export", message: message)
+        statusMessage = "Could not delete \(job.camera.name)"
+        appendLog(level: "ERROR", message: message)
     }
 
     func restart(_ job: DownloadJob) {

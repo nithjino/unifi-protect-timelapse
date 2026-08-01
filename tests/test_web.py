@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 
-from timelapse import OperationTimeoutError, TimelapseError
+from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
@@ -96,15 +96,19 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
         javascript = client.get("/static/htmx.min.js")
         application_javascript = client.get("/static/app.js")
         favicon = client.get("/static/favicon.ico")
+        server_status = client.get("/partials/status")
 
     assert response.status_code == 200
     assert response.headers["x-request-id"]
     assert "htmx.min.js" in response.text
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
-    assert 'href="http://localhost/static/app.css?v=1.4.2"' in response.text
+    assert f'href="http://localhost/static/app.css?v={__version__}"' in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
+    assert server_status.status_code == 200
+    assert "<strong>TimeLapse Version</strong>" in server_status.text
+    assert f"<code>{__version__}</code>" in server_status.text
     assert 'id="video-player-dialog"' in response.text
     assert 'id="export-video-player" controls playsinline preload="metadata"' in response.text
     assert ">Full Day<" in response.text
@@ -589,6 +593,58 @@ def test_missing_job_action_returns_not_found(tmp_path: Path) -> None:
         response = client.delete("/actions/jobs/missing01")
 
     assert response.status_code == 404
+
+
+def test_delete_job_removes_export_file_and_activity(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+    output = state.settings.output_dir / "completed.mp4"
+    output.parent.mkdir(parents=True)
+    output.write_bytes(b"video")
+    job = ExportJob(
+        id="completed01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(hours=2),
+        speed="120x",
+        output=output,
+        status="completed",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        jobs_response = client.get("/partials/jobs")
+        response = client.delete(f"/actions/jobs/{job.id}")
+
+    assert jobs_response.status_code == 200
+    assert 'class="small-button danger"' in jobs_response.text
+    assert ">Delete</button>" in jobs_response.text
+    assert ">Remove</button>" not in jobs_response.text
+    assert response.status_code == 200
+    assert "Export deleted." in response.text
+    assert not output.exists()
+    assert job.id not in state.jobs
+
+
+def test_delete_job_succeeds_when_export_file_is_already_missing(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+    job = ExportJob(
+        id="failed01",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(hours=2),
+        speed="120x",
+        output=state.settings.output_dir / "missing.mp4",
+        status="failed",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        response = client.delete(f"/actions/jobs/{job.id}")
+
+    assert response.status_code == 200
+    assert job.id not in state.jobs
 
 
 def test_incomplete_connection_does_not_render_secrets(tmp_path: Path) -> None:

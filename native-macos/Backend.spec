@@ -66,7 +66,7 @@ app = BUNDLE(
     bundle_identifier="io.timelapse.desktop.backend",
     info_plist={
         "CFBundleDisplayName": "TimeLapse Backend",
-        "CFBundleShortVersionString": "1.4.2",
+        "CFBundleShortVersionString": "1.5.0",
         "CFBundleVersion": "4",
         "LSBackgroundOnly": True,
     },

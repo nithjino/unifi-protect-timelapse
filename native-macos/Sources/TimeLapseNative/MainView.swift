@@ -342,8 +342,9 @@ struct MainView: View {
             HStack(spacing: 8) {
                 Label("Jobs", systemImage: "arrow.down.circle")
                     .font(.headline)
-                Button("Clear All") { clearFinishedJobs() }
+                Button("Delete All", role: .destructive) { clearFinishedJobs() }
                     .buttonStyle(.borderedProminent)
+                    .tint(.red)
                     .disabled(!model.hasClearableJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations))
                 Button(selectedJobListTab.showsDailyAutomations ? "Stop All" : "Cancel All") {
                     model.cancelAllJobs(dailyAutomations: selectedJobListTab.showsDailyAutomations)
@@ -474,15 +475,16 @@ struct MainView: View {
                 .disabled(job.state == .cancelling)
         }
         Divider()
-        Button("Remove from List", systemImage: "trash", role: .destructive) {
+        Button("Delete", systemImage: "trash", role: .destructive) {
             removeFromList(job)
         }
         .disabled(!job.state.isTerminal)
     }
 
     private func removeFromList(_ job: DownloadJob) {
-        model.remove(job)
-        selectedJobIDs.remove(job.id)
+        if model.remove(job) {
+            selectedJobIDs.remove(job.id)
+        }
     }
 
     private func clearFinishedJobs() {
@@ -563,7 +565,8 @@ private struct DownloadActionCell: View {
         case .scheduled:
             Button("Stop") { model.stopDailySchedule() }
         case .stopped:
-            Button("Remove") { model.remove(job) }
+            Button("Delete", role: .destructive) { model.remove(job) }
+                .tint(.red)
         case .completed:
             Button("Show") { model.reveal(job) }
                 .help("Show the output location in Finder.")
