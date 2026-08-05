@@ -46,6 +46,7 @@ if TYPE_CHECKING:
 PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
 STATIC_DIR = PACKAGE_DIR / "static"
+APP_CSS_VERSION = hashlib.sha256((STATIC_DIR / "app.css").read_bytes()).hexdigest()[:12]
 KIBIBYTE = 1024
 SSE_KEEPALIVE_TICKS = 30
 GRACEFUL_SHUTDOWN_SECONDS = 1
@@ -399,6 +400,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     templates.env.filters["job_status"] = _job_status
     templates.env.filters["next_run"] = lambda schedule: _schedule_next_run(schedule, configured_settings)
     templates.env.globals["timelapse_version"] = __version__
+    templates.env.globals["app_css_version"] = APP_CSS_VERSION
 
     @application.middleware("http")
     async def identify_and_log_requests(

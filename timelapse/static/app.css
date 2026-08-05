@@ -1044,6 +1044,13 @@ button:disabled {
   gap: 10px;
 }
 
+#jobs-list {
+  max-height: 700px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
 .job-card,
 .schedule-card {
   border: 1px solid var(--line);

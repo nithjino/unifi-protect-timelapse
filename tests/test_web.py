@@ -17,7 +17,7 @@ from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
-from timelapse.web import create_app, main
+from timelapse.web import APP_CSS_VERSION, create_app, main
 from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
@@ -103,7 +103,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "htmx.min.js" in response.text
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
-    assert f'href="http://localhost/static/app.css?v={__version__}"' in response.text
+    assert f'href="http://localhost/static/app.css?v={APP_CSS_VERSION}"' in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
     assert server_status.status_code == 200
