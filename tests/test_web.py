@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from dataclasses import replace
@@ -98,11 +99,14 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
         favicon = client.get("/static/favicon.ico")
         server_status = client.get("/partials/status")
 
+    expected_css_version = hashlib.sha256(application_css.content).hexdigest()[:12]
+
     assert response.status_code == 200
     assert response.headers["x-request-id"]
     assert "htmx.min.js" in response.text
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in response.text
     assert "cdn.jsdelivr.net" not in response.text
+    assert expected_css_version == APP_CSS_VERSION
     assert f'href="http://localhost/static/app.css?v={APP_CSS_VERSION}"' in response.text
     assert 'id="server-info-button"' in response.text
     assert 'id="server-info-dialog"' in response.text
@@ -133,6 +137,15 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert "showModal" in application_javascript.text
     assert application_css.status_code == 200
     assert "grid-template-columns: minmax(0, 1fr) auto" in application_css.text
+    assert (
+        """#jobs-list {
+  max-height: 700px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}"""
+        in application_css.text
+    )
     assert favicon.status_code == 200
     assert favicon.headers["content-type"] in {"image/vnd.microsoft.icon", "image/x-icon"}
 
@@ -202,6 +215,7 @@ def test_login_session_protects_ui_but_not_health(tmp_path: Path) -> None:
     assert denied.headers["location"] == "/login?next=%2F"
     assert login_page.status_code == 200
     assert 'rel="icon" href="http://localhost/static/favicon.ico" sizes="any"' in login_page.text
+    assert f'href="http://localhost/static/app.css?v={APP_CSS_VERSION}"' in login_page.text
     assert "Enter Dashboard" in login_page.text
     assert "Your Recordings Stay" in login_page.text
     assert rejected.status_code == 401
