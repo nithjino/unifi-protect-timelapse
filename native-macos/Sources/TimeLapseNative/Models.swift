@@ -162,6 +162,89 @@ struct ThumbnailRequest: Encodable, Sendable {
     let timestamp: String
 }
 
+struct HydrateCredentialsRequest: Encodable, Sendable {
+    let id: String
+    let command = "hydrate_credentials"
+    let profileID: String
+    let settings: BackendSettings
+
+    enum CodingKeys: String, CodingKey {
+        case id, command, settings
+        case profileID = "profile_id"
+    }
+}
+
+struct AutomationAddRequest: Encodable, Sendable {
+    let id: String
+    let command = "automation_add"
+    let automationID: String
+    let name: String
+    let profileID: String
+    let cameras: [CameraInfo]
+    let speed: String
+    let outputDirectory: String
+    let timezone: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, command, name, cameras, speed, timezone
+        case automationID = "automation_id"
+        case profileID = "profile_id"
+        case outputDirectory = "output_directory"
+    }
+}
+
+struct AutomationActionRequest: Encodable, Sendable {
+    let id: String
+    let command: String
+    let automationID: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, command
+        case automationID = "automation_id"
+    }
+}
+
+struct StateSnapshotRequest: Encodable, Sendable {
+    let id: String
+    let command = "state_snapshot"
+}
+
+struct AutomationEditRequest: Encodable, Sendable {
+    let id: String
+    let command = "automation_edit"
+    let automationID: String
+    let name: String
+    let profileID: String
+    let cameras: [CameraInfo]
+
+    enum CodingKeys: String, CodingKey {
+        case id, command, name, cameras
+        case automationID = "automation_id"
+        case profileID = "profile_id"
+    }
+}
+
+struct NativeAutomation: Codable, Sendable {
+    let id: String
+    let name: String
+    let status: String
+    let profileID: String
+    let cameras: [CameraInfo]
+    let speed: String
+    let outputDirectory: String
+    let timezone: String
+    let nextDay: String
+    let lastError: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, status, cameras, speed, timezone
+        case profileID = "profile_id"
+        case outputDirectory = "output_directory"
+        case nextDay = "next_day"
+        case lastError = "last_error"
+    }
+}
+
 struct ThumbnailPreview: Equatable, Sendable {
     let timestamp: Date
     let cameraID: String?
@@ -186,6 +269,8 @@ struct BackendEvent: Decodable, Sendable {
     let output: String?
     let thumbnailBase64: String?
     let thumbnailSource: String?
+    let automation: NativeAutomation?
+    let automations: [NativeAutomation]?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -201,6 +286,8 @@ struct BackendEvent: Decodable, Sendable {
         case output
         case thumbnailBase64 = "thumbnail_base64"
         case thumbnailSource = "thumbnail_source"
+        case automation
+        case automations
     }
 }
 
@@ -246,13 +333,16 @@ enum DownloadState: Equatable, Sendable {
 final class DownloadJob: ObservableObject, Identifiable {
     let id: UUID
     let groupNumber: Int
-    let camera: CameraInfo
+    var camera: CameraInfo
     let outputURL: URL
     let requestSettings: BackendSettings
     let requestStart: String
     let requestEnd: String
     let requestSpeed: String
     let isDailySchedule: Bool
+    let automationID: String?
+    let automationProfileID: String?
+    var automationCameras: [CameraInfo]
     @Published var state: DownloadState
     @Published var downloadedBytes: Int64 = 0
     @Published var totalBytes: Int64?
@@ -270,6 +360,9 @@ final class DownloadJob: ObservableObject, Identifiable {
         requestEnd: String,
         requestSpeed: String,
         isDailySchedule: Bool = false,
+        automationID: String? = nil,
+        automationProfileID: String? = nil,
+        automationCameras: [CameraInfo] = [],
         initialState: DownloadState = .preparing
     ) {
         self.id = id
@@ -281,6 +374,9 @@ final class DownloadJob: ObservableObject, Identifiable {
         self.requestEnd = requestEnd
         self.requestSpeed = requestSpeed
         self.isDailySchedule = isDailySchedule
+        self.automationID = automationID
+        self.automationProfileID = automationProfileID
+        self.automationCameras = automationCameras
         state = initialState
     }
 

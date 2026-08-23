@@ -113,8 +113,9 @@
                       MinWidth="180" HorizontalAlignment="Left" Margin="0,0,8,8" IsEnabled="False" />
             <Button x:Name="StartDownloadsButton" Grid.Row="3" Grid.ColumnSpan="2" Content="↓  Start Downloads" Click="StartDownloads_Click"
                     HorizontalAlignment="Left" Background="#1769C2" Foreground="White" FontWeight="SemiBold" IsEnabled="False" />
-            <CheckBox x:Name="DailyAutomaticCheckBox" Grid.Row="4" Grid.ColumnSpan="3" Content="Daily automatic timelapses"
-                      Margin="0,9,0,0" Checked="DailyAutomatic_Checked" Unchecked="DailyAutomatic_Unchecked" />
+            <Button x:Name="AddDailyAutomationButton" Grid.Row="4" Grid.ColumnSpan="3"
+                    Content="Add Daily Automation…" Margin="0,9,0,0" HorizontalAlignment="Left"
+                    Click="AddDailyAutomation_Click" />
           </Grid>
         </Grid>
       </StackPanel>
@@ -189,10 +190,16 @@
                   <DataGridTextColumn Header="Expected" Binding="{Binding ExpectedText}" Width="90" />
                   <DataGridTextColumn Header="Speed" Binding="{Binding SpeedText}" Width="90" />
                   <DataGridTextColumn Header="Output" Binding="{Binding OutputName}" Width="*" />
-                  <DataGridTemplateColumn Header="Action" Width="95">
+                  <DataGridTemplateColumn Header="Actions" Width="230">
                     <DataGridTemplateColumn.CellTemplate>
-                      <DataTemplate><Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2"
-                                            Style="{StaticResource JobActionButtonStyle}" /></DataTemplate>
+                      <DataTemplate>
+                        <StackPanel Orientation="Horizontal">
+                          <Button Content="Edit" Click="EditAutomation_Click" Padding="8,2" Margin="0,0,5,0" />
+                          <Button Content="{Binding ActionText}" Click="JobAction_Click" Padding="8,2" Margin="0,0,5,0"
+                                  Style="{StaticResource JobActionButtonStyle}" />
+                          <Button Content="Remove" Click="RemoveAutomation_Click" Padding="8,2" />
+                        </StackPanel>
+                      </DataTemplate>
                     </DataGridTemplateColumn.CellTemplate>
                   </DataGridTemplateColumn>
                 </DataGrid.Columns>

@@ -75,6 +75,18 @@ public sealed record CameraInfo(
 
 public sealed record CameraThumbnail(byte[] Image, string Source);
 
+public sealed record NativeAutomation(
+    [property: JsonPropertyName("id")] string Id,
+    [property: JsonPropertyName("name")] string Name,
+    [property: JsonPropertyName("status")] string Status,
+    [property: JsonPropertyName("profile_id")] string ProfileId,
+    [property: JsonPropertyName("speed")] string Speed,
+    [property: JsonPropertyName("output_directory")] string OutputDirectory,
+    [property: JsonPropertyName("timezone")] string Timezone,
+    [property: JsonPropertyName("next_day")] string NextDay,
+    [property: JsonPropertyName("last_error")] string? LastError,
+    [property: JsonPropertyName("cameras")] List<CameraInfo> Cameras);
+
 public sealed record BackendEvent
 {
     [JsonPropertyName("id")]
@@ -115,6 +127,12 @@ public sealed record BackendEvent
 
     [JsonPropertyName("thumbnail_source")]
     public string? ThumbnailSource { get; init; }
+
+    [JsonPropertyName("automation")]
+    public NativeAutomation? Automation { get; init; }
+
+    [JsonPropertyName("automations")]
+    public List<NativeAutomation>? Automations { get; init; }
 }
 
 public enum DownloadState
@@ -140,13 +158,16 @@ public sealed class DownloadJob : INotifyPropertyChanged
 
     public Guid Id { get; init; } = Guid.NewGuid();
     public required int GroupNumber { get; init; }
-    public required CameraInfo Camera { get; init; }
+    public required CameraInfo Camera { get; set; }
     public required string OutputPath { get; init; }
     public required ConnectionSettings RequestSettings { get; init; }
     public required string RequestStart { get; init; }
     public required string RequestEnd { get; init; }
     public required string RequestSpeed { get; init; }
     public bool IsDailySchedule { get; init; }
+    public string? AutomationId { get; init; }
+    public string? AutomationProfileId { get; init; }
+    public IReadOnlyList<CameraInfo> AutomationCameras { get; set; } = [];
     public DateTime LastProgressAt { get; private set; }
 
     public DownloadState State
@@ -222,7 +243,7 @@ public sealed class DownloadJob : INotifyPropertyChanged
         DownloadState.Completed => "Show",
         DownloadState.Cancelled or DownloadState.Failed => "Restart",
         DownloadState.Cancelling => "Cancelling…",
-        DownloadState.Stopped => "Delete",
+        DownloadState.Stopped => IsDailySchedule ? "Resume" : "Delete",
         _ => "Cancel",
     };
 

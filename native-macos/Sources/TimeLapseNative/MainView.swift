@@ -77,6 +77,7 @@ struct MainView: View {
             modalBackdrop
             DailyScheduleView(
                 cameras: model.cameras,
+                initialName: model.dailyAutomationDraftName,
                 initialSelectedIDs: model.selectedCameraIDs,
                 initialOutputDirectory: model.outputDirectory,
                 onSave: model.configureDailySchedule,
@@ -207,8 +208,10 @@ struct MainView: View {
                             .disabled(model.selectedCameras.isEmpty)
                         Spacer()
                     }
-                    Toggle("Daily automatic timelapses", isOn: dailyAutomaticBinding)
-                        .help("Export each completed local day while this program remains open.")
+                    Button("Add Daily Automation…", systemImage: "calendar.badge.plus") {
+                        model.requestDailySchedule()
+                    }
+                    .help("Create a durable, named multi-camera daily export.")
                 }
                 .frame(maxWidth: .infinity)
             }
@@ -311,15 +314,6 @@ struct MainView: View {
 
     private var previewCameraSelection: Binding<String?> {
         Binding(get: { model.previewCameraID }, set: { model.selectPreviewCamera($0) })
-    }
-
-    private var dailyAutomaticBinding: Binding<Bool> {
-        Binding(
-            get: { model.dailyAutomaticEnabled },
-            set: { enabled in
-                if enabled { model.requestDailySchedule() } else { model.stopDailySchedule() }
-            }
-        )
     }
 
     private func fullDayBinding(_ isStart: Bool) -> Binding<Date> {
@@ -463,11 +457,18 @@ struct MainView: View {
     private func jobMenu(for job: DownloadJob) -> some View {
         switch job.state {
         case .scheduled:
-            Button("Stop Daily Job", systemImage: "stop.circle") { model.stopDailySchedule() }
+            Button("Edit Daily Automation", systemImage: "pencil") { model.requestEditDailyAutomation(job) }
+            Button("Stop Daily Automation", systemImage: "stop.circle") { model.stopDailySchedule(job) }
         case .stopped:
-            EmptyView()
+            Button("Edit Daily Automation", systemImage: "pencil") { model.requestEditDailyAutomation(job) }
+            Button("Resume Daily Automation", systemImage: "play.circle") { model.resumeDailyAutomation(job) }
         case .cancelled, .failed:
-            Button("Restart", systemImage: "arrow.clockwise") { model.restart(job) }
+            if job.isDailySchedule {
+                Button("Edit Daily Automation", systemImage: "pencil") { model.requestEditDailyAutomation(job) }
+                Button("Resume Daily Automation", systemImage: "play.circle") { model.resumeDailyAutomation(job) }
+            } else {
+                Button("Restart", systemImage: "arrow.clockwise") { model.restart(job) }
+            }
         case .completed:
             Button("Show in Finder", systemImage: "folder") { model.reveal(job) }
         case .preparing, .queued, .downloading, .cancelling:
@@ -475,8 +476,12 @@ struct MainView: View {
                 .disabled(job.state == .cancelling)
         }
         Divider()
-        Button("Delete", systemImage: "trash", role: .destructive) {
-            removeFromList(job)
+        Button(
+            job.isDailySchedule ? "Remove Daily Automation" : "Delete Export Artifact",
+            systemImage: "trash",
+            role: .destructive
+        ) {
+            if job.isDailySchedule { model.removeDailyAutomation(job) } else { removeFromList(job) }
         }
         .disabled(!job.state.isTerminal)
     }
@@ -563,16 +568,19 @@ private struct DownloadActionCell: View {
     var body: some View {
         switch job.state {
         case .scheduled:
-            Button("Stop") { model.stopDailySchedule() }
+            Button("Stop") { model.stopDailySchedule(job) }
         case .stopped:
-            Button("Delete", role: .destructive) { model.remove(job) }
-                .tint(.red)
+            Button("Resume") { model.resumeDailyAutomation(job) }
         case .completed:
             Button("Show") { model.reveal(job) }
                 .help("Show the output location in Finder.")
         case .cancelled, .failed:
-            Button("Restart") { model.restart(job) }
-                .help("Retry this download with its original settings.")
+            if job.isDailySchedule {
+                Button("Resume") { model.resumeDailyAutomation(job) }
+            } else {
+                Button("Restart") { model.restart(job) }
+                    .help("Retry this download with its original settings.")
+            }
         case .preparing, .queued, .downloading, .cancelling:
             Button("Cancel") { model.cancel(job) }
                 .disabled(job.state == .cancelling)

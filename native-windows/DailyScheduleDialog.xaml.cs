@@ -7,13 +7,19 @@ public partial class DailyScheduleDialog : Window
 {
     public List<CameraChoice> Choices { get; }
     public List<CameraInfo> SelectedCameras => Choices.Where(choice => choice.Selected).Select(choice => choice.Camera).ToList();
+    public string AutomationName => NameText.Text.Trim();
     public string OutputDirectory { get; private set; }
 
-    public DailyScheduleDialog(IEnumerable<CameraInfo> cameras, string initialDirectory)
+    public DailyScheduleDialog(
+        IEnumerable<CameraInfo> cameras,
+        string initialDirectory,
+        string initialName = "",
+        IReadOnlySet<string>? selectedCameraIds = null)
     {
         InitializeComponent();
-        Choices = cameras.Select(camera => new CameraChoice(camera, selected: false)).ToList();
+        Choices = cameras.Select(camera => new CameraChoice(camera, selectedCameraIds?.Contains(camera.Id) == true)).ToList();
         CameraList.ItemsSource = Choices;
+        NameText.Text = initialName;
         OutputDirectory = initialDirectory;
         UpdateOutputDisplay();
     }
@@ -33,6 +39,11 @@ public partial class DailyScheduleDialog : Window
 
     private void Ok_Click(object sender, RoutedEventArgs e)
     {
+        if (string.IsNullOrWhiteSpace(AutomationName))
+        {
+            MessageBox.Show(this, "Enter a unique name for this Daily Automation.", "Name Required", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
         if (SelectedCameras.Count == 0)
         {
             MessageBox.Show(this, "Select at least one camera for the daily job.", "No Cameras Selected", MessageBoxButton.OK, MessageBoxImage.Information);

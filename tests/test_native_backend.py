@@ -185,3 +185,95 @@ def test_thumbnail_emits_base64_image(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_invalid_requests_raise_protocol_errors(payload: dict[str, object], message: str) -> None:
     with pytest.raises(backend._ProtocolError, match=message):
         asyncio.run(backend._dispatch(payload))
+
+
+def test_session_requires_version_two_before_accepting_work(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(backend, "_write_event", events.append)
+    supervisor = backend.NativeSessionSupervisor(tmp_path / "automations.json")
+
+    with pytest.raises(backend._ProtocolError, match="version mismatch"):
+        asyncio.run(supervisor.handshake({"id": "hello-1", "command": "handshake", "protocol_version": 1}))
+
+    assert events == [
+        {
+            "id": "hello-1",
+            "event": "error",
+            "code": "protocol_version_mismatch",
+            "message": "protocol version mismatch: backend requires 2, client sent 1",
+        }
+    ]
+
+
+def test_session_rejects_duplicate_ids_and_acks_each_accepted_command(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(backend, "_write_event", events.append)
+
+    async def exercise() -> None:
+        supervisor = backend.NativeSessionSupervisor(tmp_path / "automations.json")
+        supervisor.registry.load()
+        await supervisor.handshake({"id": "hello", "command": "handshake", "protocol_version": 2})
+        request = {
+            "id": "credentials",
+            "command": "hydrate_credentials",
+            "profile_id": "profile-1",
+            "settings": _settings(),
+        }
+        assert await supervisor.accept(request)
+        await asyncio.gather(*supervisor._tasks.values())
+        assert await supervisor.accept(request)
+        await supervisor.close()
+
+    asyncio.run(exercise())
+
+    assert [event["event"] for event in events] == ["complete", "complete", "error"]
+    assert events[-1]["code"] == "duplicate_request_id"
+
+
+def test_native_automation_registry_never_persists_hydrated_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[dict[str, object]] = []
+    output = tmp_path / "exports"
+    output.mkdir()
+    registry_path = tmp_path / "automations.json"
+    monkeypatch.setattr(backend, "_write_event", events.append)
+
+    async def exercise() -> None:
+        supervisor = backend.NativeSessionSupervisor(registry_path)
+        supervisor.registry.load()
+        monkeypatch.setattr(supervisor, "_start_automation", lambda _automation_id: None)
+        requests = [
+            {
+                "id": "credentials",
+                "command": "hydrate_credentials",
+                "profile_id": "profile-1",
+                "settings": _settings(),
+            },
+            {
+                "id": "create",
+                "command": "automation_add",
+                "automation_id": "stable-native-id",
+                "name": "Front Door",
+                "profile_id": "profile-1",
+                "cameras": [{"id": "camera-1", "name": "Front Door"}],
+                "speed": "600x",
+                "output_directory": str(output),
+                "timezone": "America/New_York",
+            },
+        ]
+        for request in requests:
+            await supervisor.accept(request)
+            await asyncio.gather(*supervisor._tasks.values())
+        await supervisor.close()
+
+    asyncio.run(exercise())
+
+    persisted = registry_path.read_text(encoding="utf-8")
+    assert "test-token" not in persisted
+    assert "test-password" not in persisted
+    assert '"kind": "native-profile"' in persisted

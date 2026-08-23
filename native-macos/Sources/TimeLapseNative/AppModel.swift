@@ -11,7 +11,6 @@ final class AppModel: ObservableObject {
     @Published var startDate = Date().addingTimeInterval(-24 * 60 * 60)
     @Published var endDate = Date()
     @Published var fullDayMode = false
-    @Published private(set) var dailyAutomaticEnabled = false
     @Published var speed = "600x"
     @Published var outputDirectory: URL
     @Published var cameras: [CameraInfo] = []
@@ -23,6 +22,7 @@ final class AppModel: ObservableObject {
     @Published var showingConnectionSheet = false
     @Published var showingCameraSheet = false
     @Published var showingDailyScheduleSheet = false
+    @Published private(set) var dailyAutomationDraftName = ""
     @Published var isFirstRun = false
     @Published var alert: AppAlert?
     @Published private(set) var isLoadingCameras = false
@@ -46,12 +46,11 @@ final class AppModel: ObservableObject {
     private var nextGroupNumber = 1
     private var didStart = false
     private var isShuttingDown = false
-    private var shutdownCompletion: (() -> Void)?
+    private var shutdownCompletion: (@MainActor @Sendable () -> Void)?
     private let initialCredentialAlert: AppAlert?
     private let initialMigrationMessage: String?
     private var editingProfileID: UUID?
-    private var dailySchedule: DailySchedule?
-    private var dailyTimer: Timer?
+    private var editingAutomationJob: DownloadJob?
     private var didReportNotificationIssue = false
 
     var isBusy: Bool { isLoadingCameras || !downloadProcesses.isEmpty }
@@ -90,17 +89,6 @@ final class AppModel: ObservableObject {
         case 1: selectedCameras[0].name
         default: "\(selectedCameras.count) cameras selected"
         }
-    }
-
-    private struct DailySchedule {
-        let cameras: [CameraInfo]
-        let outputDirectory: URL
-        let settings: BackendSettings
-        let speed: String
-        let jobID: UUID
-        var lastRunDay: Date?
-        var activeDay: Date?
-        var activeJobIDs: Set<UUID>
     }
 
     private struct ThumbnailCacheKey: Hashable {
@@ -157,6 +145,79 @@ final class AppModel: ObservableObject {
             statusMessage = initialCredentialAlert.title
             alert = initialCredentialAlert
             appendLog(level: "ERROR", message: initialCredentialAlert.message)
+        }
+        restoreDailyAutomations()
+    }
+
+    private func restoreDailyAutomations() {
+        let process = BackendProcess()
+        var snapshot: [NativeAutomation] = []
+        do {
+            try process.start(
+                request: StateSnapshotRequest(id: "state-snapshot-\(UUID().uuidString)"),
+                onEvent: { event in snapshot = event.automations ?? snapshot },
+                onCompletion: { [weak self] completion in
+                    guard let self, completion.exitCode == 0 else { return }
+                    let existing = Set(self.jobs.compactMap(\.automationID))
+                    for automation in snapshot where !existing.contains(automation.id) {
+                        self.projectAutomation(automation)
+                    }
+                    let referencedProfiles = Set(snapshot.filter { $0.status == "active" }.map(\.profileID))
+                    for profile in self.profiles where referencedProfiles.contains(profile.id.uuidString) {
+                        self.hydrateProfile(profile)
+                    }
+                }
+            )
+        } catch {
+            showError(title: "Could Not Restore Daily Automations", message: error.localizedDescription)
+        }
+    }
+
+    private func projectAutomation(_ automation: NativeAutomation) {
+        let state: DownloadState = switch automation.status {
+        case "active": .scheduled
+        case "paused": .failed(automation.lastError ?? "Needs attention")
+        default: .stopped
+        }
+        let profile = profiles.first { $0.id.uuidString == automation.profileID }
+        let job = DownloadJob(
+            groupNumber: nextGroupNumber,
+            camera: CameraInfo(id: automation.id, name: automation.name, state: nil, model: nil),
+            outputURL: URL(fileURLWithPath: automation.outputDirectory),
+            requestSettings: BackendSettings(profile?.settings ?? settings),
+            requestStart: "",
+            requestEnd: "",
+            requestSpeed: automation.speed,
+            isDailySchedule: true,
+            automationID: automation.id,
+            automationProfileID: automation.profileID,
+            automationCameras: automation.cameras,
+            initialState: state
+        )
+        nextGroupNumber += 1
+        jobs.append(job)
+    }
+
+    private func hydrateProfile(_ profile: ConnectionProfile, onHydrated: (@MainActor @Sendable () -> Void)? = nil) {
+        let process = BackendProcess()
+        do {
+            try process.start(
+                request: HydrateCredentialsRequest(
+                    id: "hydrate-\(UUID().uuidString)",
+                    profileID: profile.id.uuidString,
+                    settings: BackendSettings(profile.settings)
+                ),
+                onEvent: { _ in },
+                onCompletion: { [weak self] result in
+                    if result.exitCode == 0 {
+                        onHydrated?()
+                    } else {
+                        self?.showError(title: "Could Not Hydrate Credentials", message: result.stderr)
+                    }
+                }
+            )
+        } catch {
+            showError(title: "Could Not Hydrate Credentials", message: error.localizedDescription)
         }
     }
 
@@ -239,6 +300,9 @@ final class AppModel: ObservableObject {
         showingConnectionSheet = false
         statusMessage = "Saved \(profile.displayName)"
         appendLog(level: "INFO", message: "Saved connection profile: \(profile.displayName)")
+        if jobs.contains(where: { $0.automationProfileID == profile.id.uuidString }) {
+            hydrateProfile(profile)
+        }
         return nil
     }
 
@@ -390,7 +454,8 @@ final class AppModel: ObservableObject {
     }
 
     func requestDailySchedule() {
-        guard !dailyAutomaticEnabled else { return }
+        editingAutomationJob = nil
+        dailyAutomationDraftName = ""
         if cameras.isEmpty {
             openCameraSheetAfterLoad = false
             openDailySheetAfterLoad = true
@@ -403,10 +468,10 @@ final class AppModel: ObservableObject {
     func cancelDailyScheduleSheet() {
         showingDailyScheduleSheet = false
         openDailySheetAfterLoad = false
+        editingAutomationJob = nil
     }
 
-    func configureDailySchedule(cameraIDs: Set<String>, outputDirectory: URL) {
-        guard dailySchedule == nil else { return }
+    func configureDailySchedule(name: String, cameraIDs: Set<String>, outputDirectory: URL) {
         let selected = cameras.filter { cameraIDs.contains($0.id) }
         guard !selected.isEmpty else {
             alert = AppAlert(title: "No Cameras Selected", message: "Select at least one camera for the daily job.")
@@ -423,123 +488,208 @@ final class AppModel: ObservableObject {
             alert = AppAlert(title: "Could Not Create Output Folder", message: error.localizedDescription)
             return
         }
-        let group = nextGroupNumber
-        nextGroupNumber += 1
-        let camera = CameraInfo(
-            id: "daily-schedule-\(UUID().uuidString)",
-            name: selected.count == 1 ? selected[0].name : "\(selected.count) cameras",
-            state: nil,
-            model: nil
-        )
-        let job = DownloadJob(
-            groupNumber: group,
-            camera: camera,
-            outputURL: outputDirectory,
-            requestSettings: BackendSettings(settings),
-            requestStart: "",
-            requestEnd: "",
-            requestSpeed: speed,
-            isDailySchedule: true,
-            initialState: .scheduled
-        )
-        jobs.append(job)
-        dailySchedule = DailySchedule(
+        guard let profile = selectedProfile else {
+            showError(title: "Connection Required", message: "Select a saved connection profile first.")
+            return
+        }
+        showingDailyScheduleSheet = false
+        if let job = editingAutomationJob, let automationID = job.automationID {
+            editingAutomationJob = nil
+            editAutomation(
+                job: job,
+                automationID: automationID,
+                name: name,
+                cameras: selected,
+                profile: profile
+            )
+            return
+        }
+        hydrateAndAddAutomation(
+            name: name,
             cameras: selected,
             outputDirectory: outputDirectory,
-            settings: BackendSettings(settings),
-            speed: speed,
-            jobID: job.id,
-            lastRunDay: nil,
-            activeDay: nil,
-            activeJobIDs: []
+            profile: profile
         )
-        dailyAutomaticEnabled = true
-        showingDailyScheduleSheet = false
-        statusMessage = "Scheduled daily timelapses for \(selected.count) cameras"
-        appendLog(level: "INFO", message: statusMessage)
-        startDailyTimer()
-        runDailyScheduleIfDue()
     }
 
-    func stopDailySchedule() {
-        guard let schedule = dailySchedule else { return }
-        dailyTimer?.invalidate()
-        dailyTimer = nil
-        dailySchedule = nil
-        dailyAutomaticEnabled = false
-        jobs.first { $0.id == schedule.jobID }?.state = .stopped
-        statusMessage = "Stopped daily automatic timelapses"
-        appendLog(level: "INFO", message: statusMessage)
+    func requestEditDailyAutomation(_ job: DownloadJob) {
+        guard job.isDailySchedule else { return }
+        editingAutomationJob = job
+        dailyAutomationDraftName = job.camera.name
+        selectedCameraIDs = Set(job.automationCameras.map(\.id))
+        outputDirectory = job.outputURL
+        showingDailyScheduleSheet = true
     }
 
-    private func startDailyTimer() {
-        dailyTimer?.invalidate()
-        dailyTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.runDailyScheduleIfDue()
-            }
+    private func editAutomation(
+        job: DownloadJob,
+        automationID: String,
+        name: String,
+        cameras: [CameraInfo],
+        profile: ConnectionProfile
+    ) {
+        let process = BackendProcess()
+        do {
+            try process.start(
+                request: AutomationEditRequest(
+                    id: "automation-edit-\(UUID().uuidString)",
+                    automationID: automationID,
+                    name: name,
+                    profileID: profile.id.uuidString,
+                    cameras: cameras
+                ),
+                onEvent: { _ in },
+                onCompletion: { [weak self, weak job] result in
+                    guard let self, let job else { return }
+                    guard result.exitCode == 0 else {
+                        self.showError(title: "Could Not Edit Daily Automation", message: result.stderr)
+                        return
+                    }
+                    job.camera = CameraInfo(id: automationID, name: name, state: nil, model: nil)
+                    job.automationCameras = cameras
+                    job.objectWillChange.send()
+                }
+            )
+        } catch {
+            showError(title: "Could Not Edit Daily Automation", message: error.localizedDescription)
         }
     }
 
-    private func runDailyScheduleIfDue() {
-        guard var schedule = dailySchedule else { return }
-        if !schedule.activeJobIDs.isEmpty {
-            if schedule.activeJobIDs.contains(where: { id in
-                downloadProcesses[id] != nil || jobs.first(where: { $0.id == id })?.state == .queued
-            }) { return }
-            let tracked = jobs.filter { schedule.activeJobIDs.contains($0.id) }
-            let completed = tracked.count == schedule.activeJobIDs.count
-                && tracked.allSatisfy { $0.state == .completed && Self.isValidExport($0.outputURL) }
-            if completed { schedule.lastRunDay = schedule.activeDay }
-            schedule.activeDay = nil
-            schedule.activeJobIDs.removeAll()
-            dailySchedule = schedule
-            if !completed { return }
+    private func hydrateAndAddAutomation(
+        name: String,
+        cameras: [CameraInfo],
+        outputDirectory: URL,
+        profile: ConnectionProfile
+    ) {
+        let hydration = BackendProcess()
+        let hydrationID = "hydrate-\(UUID().uuidString)"
+        do {
+            try hydration.start(
+                request: HydrateCredentialsRequest(
+                    id: hydrationID,
+                    profileID: profile.id.uuidString,
+                    settings: BackendSettings(profile.settings)
+                ),
+                onEvent: { _ in },
+                onCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    guard completion.exitCode == 0 else {
+                        self.showError(title: "Could Not Hydrate Credentials", message: completion.stderr)
+                        return
+                    }
+                    self.addAutomation(
+                        name: name,
+                        cameras: cameras,
+                        outputDirectory: outputDirectory,
+                        profile: profile
+                    )
+                }
+            )
+        } catch {
+            showError(title: "Could Not Hydrate Credentials", message: error.localizedDescription)
         }
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: Date())
-        let firstDay = schedule.lastRunDay.flatMap { calendar.date(byAdding: .day, value: 1, to: $0) }
-            ?? calendar.date(byAdding: .day, value: -1, to: today)
-        guard var day = firstDay else { return }
-        while day < today {
-            guard let end = calendar.date(byAdding: .day, value: 1, to: day) else { break }
-            let missing = schedule.cameras.filter {
-                !Self.isValidExport(Self.expectedOutputURL(
-                    camera: $0,
-                    start: day,
-                    end: end,
-                    speed: schedule.speed,
-                    outputDirectory: schedule.outputDirectory,
-                    daily: true,
-                    fullDay: true
-                ))
-            }
-            if missing.isEmpty {
-                schedule.lastRunDay = day
-                dailySchedule = schedule
-                day = end
-                continue
-            }
-            let group = nextGroupNumber
-            nextGroupNumber += 1
-            schedule.activeDay = day
-            for camera in missing {
-                let job = startDownload(
-                    camera: camera,
-                    group: group,
-                    start: day,
-                    end: end,
-                    speed: schedule.speed,
-                    outputDirectory: schedule.outputDirectory,
-                    requestSettings: schedule.settings,
-                    daily: true
-                )
-                schedule.activeJobIDs.insert(job.id)
-            }
-            dailySchedule = schedule
-            statusMessage = "Started daily job \(group) for \(Self.calendarDay(day))"
-            appendLog(level: "INFO", message: statusMessage)
+    }
+
+    private func addAutomation(
+        name: String,
+        cameras: [CameraInfo],
+        outputDirectory: URL,
+        profile: ConnectionProfile
+    ) {
+        let process = BackendProcess()
+        var created: NativeAutomation?
+        let request = AutomationAddRequest(
+            id: "automation-add-\(UUID().uuidString)",
+            automationID: UUID().uuidString,
+            name: name,
+            profileID: profile.id.uuidString,
+            cameras: cameras,
+            speed: speed,
+            outputDirectory: outputDirectory.path,
+            timezone: TimeZone.current.identifier
+        )
+        do {
+            try process.start(
+                request: request,
+                onEvent: { event in created = event.automation ?? created },
+                onCompletion: { [weak self] completion in
+                    guard let self else { return }
+                    guard completion.exitCode == 0, let automation = created else {
+                        self.showError(title: "Could Not Add Daily Automation", message: completion.stderr)
+                        return
+                    }
+                    let job = DownloadJob(
+                        groupNumber: self.nextGroupNumber,
+                        camera: CameraInfo(id: automation.id, name: automation.name, state: nil, model: nil),
+                        outputURL: URL(fileURLWithPath: automation.outputDirectory),
+                        requestSettings: BackendSettings(profile.settings),
+                        requestStart: "",
+                        requestEnd: "",
+                        requestSpeed: automation.speed,
+                        isDailySchedule: true,
+                        automationID: automation.id,
+                        automationProfileID: automation.profileID,
+                        automationCameras: automation.cameras,
+                        initialState: .scheduled
+                    )
+                    self.nextGroupNumber += 1
+                    self.jobs.append(job)
+                    self.statusMessage = "Added Daily Automation \(automation.name)"
+                    self.appendLog(level: "INFO", message: self.statusMessage)
+                }
+            )
+        } catch {
+            showError(title: "Could Not Add Daily Automation", message: error.localizedDescription)
+        }
+    }
+
+    func stopDailySchedule(_ job: DownloadJob? = nil) {
+        guard let target = job ?? jobs.first(where: { $0.isDailySchedule && !$0.state.isTerminal }),
+              let automationID = target.automationID else { return }
+        performAutomationAction(command: "automation_stop", automationID: automationID) { target.state = .stopped }
+    }
+
+    func resumeDailyAutomation(_ job: DownloadJob) {
+        guard let automationID = job.automationID,
+              let profileID = job.automationProfileID,
+              let profile = profiles.first(where: { $0.id.uuidString == profileID }) else {
+            showError(title: "Could Not Resume Daily Automation", message: "Its connection profile is unavailable.")
             return
+        }
+        hydrateProfile(profile) { [weak self, weak job] in
+            guard let self, let job else { return }
+            self.performAutomationAction(command: "automation_resume", automationID: automationID) {
+                job.state = .scheduled
+            }
+        }
+    }
+
+    func removeDailyAutomation(_ job: DownloadJob) {
+        guard let automationID = job.automationID else { return }
+        performAutomationAction(command: "automation_remove", automationID: automationID) { [weak self, weak job] in
+            guard let self, let job else { return }
+            self.jobs.removeAll { $0.id == job.id }
+        }
+    }
+
+    private func performAutomationAction(command: String, automationID: String, completion: @escaping () -> Void) {
+        let process = BackendProcess()
+        do {
+            try process.start(
+                request: AutomationActionRequest(
+                    id: "\(command)-\(UUID().uuidString)",
+                    command: command,
+                    automationID: automationID
+                ),
+                onEvent: { _ in },
+                onCompletion: { [weak self] result in
+                    guard let self else { return }
+                    if result.exitCode == 0 { completion() }
+                    else { self.showError(title: "Daily Automation Failed", message: result.stderr) }
+                }
+            )
+        } catch {
+            showError(title: "Daily Automation Failed", message: error.localizedDescription)
         }
     }
 
@@ -606,7 +756,7 @@ final class AppModel: ObservableObject {
 
     func cancel(_ job: DownloadJob) {
         if job.isDailySchedule {
-            stopDailySchedule()
+            stopDailySchedule(job)
             return
         }
         guard !job.state.isTerminal, job.state != .cancelling else { return }
@@ -638,6 +788,10 @@ final class AppModel: ObservableObject {
     @discardableResult
     func remove(_ job: DownloadJob) -> Bool {
         guard job.state.isTerminal else { return false }
+        if job.isDailySchedule {
+            removeDailyAutomation(job)
+            return true
+        }
         guard deleteOutput(for: job) else { return false }
         jobs.removeAll { $0.id == job.id }
         statusMessage = "Deleted \(job.camera.name) from the job list"
@@ -741,13 +895,10 @@ final class AppModel: ObservableObject {
         alert = AppAlert(title: "Notifications Are Disabled", message: message)
     }
 
-    func shutdown(completion: @escaping () -> Void) {
+    func shutdown(completion: @escaping @MainActor @Sendable () -> Void) {
         guard !isShuttingDown else { return }
         isShuttingDown = true
         shutdownCompletion = completion
-        dailyTimer?.invalidate()
-        dailyTimer = nil
-        dailySchedule = nil
         for id in rateLimitedDownloadQueue {
             guard let job = jobs.first(where: { $0.id == id }), job.state == .queued else { continue }
             job.state = .cancelled
@@ -1208,7 +1359,7 @@ final class AppModel: ObservableObject {
             return
         }
         shutdownCompletion = nil
-        completion()
+        BackendProcess.shutdown(completion: completion)
     }
 
     private static func iso8601String(_ date: Date) -> String {
