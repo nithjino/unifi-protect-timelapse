@@ -35,13 +35,15 @@ from starlette.templating import Jinja2Templates
 from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.config import SPEED_TO_FPS
 from timelapse.protect import protect_session_scope
-from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
+from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
     from types import FrameType
 
     from starlette.datastructures import FormData
+
+    from timelapse.automation_registry import DailyAutomation
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
@@ -137,9 +139,11 @@ def _job_status(job: ExportJob) -> str:
     return labels[job.status]
 
 
-def _schedule_next_run(schedule: DailySchedule, settings: WebSettings) -> str:
-    if schedule.paused:
+def _schedule_next_run(schedule: DailyAutomation, settings: WebSettings) -> str:
+    if schedule.status == "paused":
         return "paused"
+    if schedule.status == "stopped":
+        return "stopped"
     if schedule.next_retry_at is not None:
         return _format_datetime(schedule.next_retry_at, settings)
     now = settings.now()
@@ -611,13 +615,13 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             context={"jobs": ordered_jobs},
         )
 
-    @application.get("/partials/schedules", response_class=HTMLResponse)
-    async def schedules(request: Request) -> Response:
-        ordered_schedules = sorted(web_state.schedules.values(), key=lambda item: item.created_at, reverse=True)
+    @application.get("/partials/automations", response_class=HTMLResponse)
+    async def automations(request: Request) -> Response:
+        ordered_automations = sorted(web_state.automations.values(), key=lambda item: item.created_at, reverse=True)
         return templates.TemplateResponse(
             request=request,
-            name="partials/schedules.html",
-            context={"schedules": ordered_schedules},
+            name="partials/automations.html",
+            context={"automations": ordered_automations},
         )
 
     @application.post("/actions/export", response_class=HTMLResponse)
@@ -639,22 +643,23 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         noun = "export" if len(created) == 1 else "exports"
         return message_response(request, f"Started {len(created)} {noun}.")
 
-    @application.post("/actions/schedules", response_class=HTMLResponse)
-    async def create_daily_schedule(request: Request) -> Response:
+    @application.post("/actions/automations", response_class=HTMLResponse)
+    async def create_daily_automation(request: Request) -> Response:
         try:
             form = await request.form()
+            name = _required_form_value(form, "automation_name", "Automation name")
             camera_ids = _form_values(form, "camera_ids")
             speed = _parse_speed(form)
-            schedule = await web_state.create_schedule(camera_ids, speed)
+            automation = await web_state.create_automation(name, camera_ids, speed)
         except OperationTimeoutError as exc:
             return message_response(request, str(exc), kind="error", status_code=504)
         except TimelapseError as exc:
             return message_response(request, str(exc), kind="error", status_code=502)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=400)
-        count = len(schedule.cameras)
+        count = len(automation.cameras)
         noun = "camera" if count == 1 else "cameras"
-        return message_response(request, f"Daily exports enabled for {count} {noun}.")
+        return message_response(request, f"Created Daily Automation for {count} {noun}.")
 
     @application.delete("/actions/jobs/{job_id}", response_class=HTMLResponse)
     async def cancel_or_remove_job(request: Request, job_id: JOB_ID) -> Response:
@@ -675,21 +680,29 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             return message_response(request, str(exc), kind="error", status_code=400)
         return message_response(request, "Export queued again.")
 
-    @application.post("/actions/schedules/{schedule_id}/retry", response_class=HTMLResponse)
-    async def retry_schedule(request: Request, schedule_id: SCHEDULE_ID) -> Response:
+    @application.post("/actions/automations/{automation_id}/resume", response_class=HTMLResponse)
+    async def resume_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
         try:
-            await web_state.retry_schedule(schedule_id)
+            await web_state.resume_automation(automation_id)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=400)
-        return message_response(request, "Daily schedule resumed.")
+        return message_response(request, "Daily Automation resumed.")
 
-    @application.delete("/actions/schedules/{schedule_id}", response_class=HTMLResponse)
-    async def remove_schedule(request: Request, schedule_id: SCHEDULE_ID) -> Response:
+    @application.post("/actions/automations/{automation_id}/stop", response_class=HTMLResponse)
+    async def stop_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
         try:
-            await web_state.remove_schedule(schedule_id)
+            await web_state.stop_automation(automation_id)
         except ValueError as exc:
             return message_response(request, str(exc), kind="error", status_code=404)
-        return message_response(request, "Daily schedule stopped.")
+        return message_response(request, "Daily Automation stopped.")
+
+    @application.delete("/actions/automations/{automation_id}", response_class=HTMLResponse)
+    async def remove_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
+        try:
+            await web_state.remove_automation(automation_id)
+        except ValueError as exc:
+            return message_response(request, str(exc), kind="error", status_code=404)
+        return message_response(request, "Daily Automation removed. Existing artifacts were kept.")
 
     @application.get("/api/thumbnails/{camera_id}")
     async def thumbnail(camera_id: str, timestamp: TIMESTAMP_QUERY) -> Response:

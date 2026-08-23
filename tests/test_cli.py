@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -30,42 +29,38 @@ def _daily_config(output: Path) -> Config:
         request_timeout_seconds=0,
         max_download_mib=1024,
         daily=True,
+        connection_kind="dotenv",
+        connection_value=str(output / ".env"),
     )
 
 
-def test_daily_cli_retries_same_day_and_persists_checkpoint(
+def test_daily_cli_imports_checkpoint_before_running_matching_automation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    completed_day = date(2026, 7, 21)
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    attempts: list[date] = []
-    sleeps: list[float] = []
+    checkpoint = cli._daily_checkpoint_path(tmp_path, camera, "600x")
+    cli._save_daily_checkpoint(checkpoint, date(2026, 7, 21))
+    captured = {}
 
-    async def flaky_export(config: Config, _camera: CameraInfo, output: Path) -> None:
-        attempts.append(config.start.date())
-        if len(attempts) < 3:
-            message = "Protect unavailable"
-            raise OSError(message)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"video")  # noqa: ASYNC240 - synchronous test double
-
-    async def controlled_sleep(delay: float) -> None:
-        sleeps.append(delay)
-        if len(sleeps) == 3:
+    class FakeEngine:
+        async def run_forever(self, automation_id: str) -> None:
+            captured["automation"] = captured["registry"].resolve(automation_id)
             raise asyncio.CancelledError
 
-    monkeypatch.setattr(cli, "latest_complete_local_day", lambda: completed_day)
-    monkeypatch.setattr(cli, "seconds_until_next_local_day", lambda: 3600.0)
-    monkeypatch.setattr(cli, "_export", flaky_export)
-    monkeypatch.setattr(cli.asyncio, "sleep", controlled_sleep)
-    monkeypatch.setattr(cli.random, "uniform", lambda _start, _end: 0.0)
+    def engine(registry, _coordinator):
+        captured["registry"] = registry
+        return FakeEngine()
+
+    monkeypatch.setattr(cli, "_automation_engine", engine)
+    monkeypatch.setattr(cli, "_local_timezone_name", lambda: "UTC")
+    monkeypatch.setenv(cli.CLI_REGISTRY_ENV, str(tmp_path / "cli-automations.json"))
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(cli._run_daily(_daily_config(tmp_path), camera))
 
-    assert attempts == [completed_day, completed_day, completed_day]
-    assert sleeps == [30.0, 60.0, 3600.0]
-    checkpoint = cli._daily_checkpoint_path(tmp_path, camera, "600x")
-    payload = json.loads(checkpoint.read_text(encoding="utf-8"))
-    assert payload == {"next_day": "2026-07-22", "version": 1}
+    automation = captured["automation"]
+    assert automation.next_day == date(2026, 7, 21)
+    assert automation.connection.kind == "dotenv"
+    assert not checkpoint.exists()
+    assert checkpoint.with_suffix(f"{checkpoint.suffix}.v1-backup").exists()

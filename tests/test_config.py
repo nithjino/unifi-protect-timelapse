@@ -149,7 +149,7 @@ def test_one_date_only_boundary_creates_full_local_day(
     assert config.full_day is True
 
 
-def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_daily_mode_rejects_ephemeral_bare_credentials(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
     monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
@@ -168,12 +168,10 @@ def test_daily_mode_does_not_require_dates(monkeypatch: pytest.MonkeyPatch, tmp_
         ],
     )
 
-    config = _parse_config()
+    with pytest.raises(SystemExit) as error:
+        parse_args()
 
-    assert config.daily is True
-    assert config.full_day is True
-    assert config.output == tmp_path
-    assert config.speed == "600x"
+    assert error.value.code == 2
 
 
 def test_cli_accepts_normal_speed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

@@ -1,0 +1,53 @@
+{% if not automations %}
+  <div class="empty-state compact">
+    <span class="empty-glyph calendar" aria-hidden="true">31</span>
+    <div>
+      <strong>No Daily Automations</strong>
+      <p>Name an automation, select cameras, and create it to export each completed day.</p>
+    </div>
+  </div>
+{% else %}
+  <div class="schedule-list">
+    {% for automation in automations %}
+      <article class="schedule-card">
+        <span class="schedule-mark" aria-hidden="true">↻</span>
+        <div class="schedule-copy">
+          <strong>{{ automation.name }}</strong>
+          <small>{{ automation.cameras | map(attribute='name') | join(', ') }}</small>
+          {% if automation.status == 'paused' %}
+            <p>Needs Attention · {{ automation.speed }}</p>
+          {% elif automation.status == 'stopped' %}
+            <p>Stopped · {{ automation.speed }}</p>
+          {% else %}
+            <p>Next Run {{ automation | next_run }} · {{ automation.speed }}</p>
+          {% endif %}
+          <small>Last Completed Day: {{ automation.last_run_day | date }}</small>
+          {% if automation.last_error %}<small class="schedule-error">{{ automation.last_error }}</small>{% endif %}
+        </div>
+        {% if automation.status in ['paused', 'stopped'] %}
+          <button
+            class="button button-secondary"
+            type="button"
+            hx-post="/actions/automations/{{ automation.id }}/resume"
+            hx-target="#message-region"
+            hx-swap="innerHTML"
+          >Resume</button>
+        {% else %}
+          <button
+            class="button button-secondary"
+            type="button"
+            hx-post="/actions/automations/{{ automation.id }}/stop"
+            hx-target="#message-region"
+            hx-swap="innerHTML"
+          >Stop</button>
+        {% endif %}
+        <button
+          class="small-button danger"
+          hx-delete="/actions/automations/{{ automation.id }}"
+          hx-target="#notifications"
+          hx-swap="innerHTML"
+        >Remove</button>
+      </article>
+    {% endfor %}
+  </div>
+{% endif %}
