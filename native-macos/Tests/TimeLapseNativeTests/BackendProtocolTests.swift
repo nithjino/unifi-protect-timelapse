@@ -3,6 +3,11 @@ import XCTest
 @testable import TimeLapseNative
 
 final class BackendProtocolTests: XCTestCase {
+    private struct HealthRequest: Encodable, Sendable {
+        let id: String
+        let command = "health"
+    }
+
     @MainActor
     func testDownloadJobFormatsRequestedTimeRange() {
         let settings = BackendSettings(ConnectionSettings())
@@ -65,5 +70,27 @@ final class BackendProtocolTests: XCTestCase {
 
         XCTAssertEqual(event.thumbnailBase64, "anBlZw==")
         XCTAssertEqual(event.thumbnailSource, "live")
+    }
+
+    @MainActor
+    func testSessionMultiplexesInterleavedFixtureRequests() async throws {
+        guard ProcessInfo.processInfo.environment["TIMELAPSE_BACKEND_PATH"] != nil else { return }
+        let first = BackendProcess()
+        let second = BackendProcess()
+        let completed = expectation(description: "Both requests complete")
+        completed.expectedFulfillmentCount = 2
+        try first.start(request: HealthRequest(id: "health-one"), onEvent: { _ in }) { completion in
+            XCTAssertEqual(completion.exitCode, 0)
+            completed.fulfill()
+        }
+        try second.start(request: HealthRequest(id: "health-two"), onEvent: { _ in }) { completion in
+            XCTAssertEqual(completion.exitCode, 0)
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 10)
+
+        let shutdown = expectation(description: "Supervisor shuts down")
+        BackendProcess.shutdown { shutdown.fulfill() }
+        await fulfillment(of: [shutdown], timeout: 10)
     }
 }

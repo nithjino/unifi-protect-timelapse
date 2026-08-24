@@ -3,35 +3,42 @@ import SwiftUI
 
 struct DailyScheduleView: View {
     let cameras: [CameraInfo]
+    let initialName: String
     let initialSelectedIDs: Set<String>
     let initialOutputDirectory: URL
-    let onSave: (Set<String>, URL) -> Void
+    let onSave: (String, Set<String>, URL) -> Void
     let onCancel: () -> Void
 
     @State private var selectedIDs: Set<String>
     @State private var outputDirectory: URL
+    @State private var name: String
 
     init(
         cameras: [CameraInfo],
+        initialName: String = "",
         initialSelectedIDs: Set<String>,
         initialOutputDirectory: URL,
-        onSave: @escaping (Set<String>, URL) -> Void,
+        onSave: @escaping (String, Set<String>, URL) -> Void,
         onCancel: @escaping () -> Void
     ) {
         self.cameras = cameras
+        self.initialName = initialName
         self.initialSelectedIDs = initialSelectedIDs
         self.initialOutputDirectory = initialOutputDirectory
         self.onSave = onSave
         self.onCancel = onCancel
         _selectedIDs = State(initialValue: initialSelectedIDs)
         _outputDirectory = State(initialValue: initialOutputDirectory)
+        _name = State(initialValue: initialName)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Daily Automatic Timelapses").font(.title2.bold())
+            Text("Daily Automation").font(.title2.bold())
             Text("The latest completed day is exported now, then each completed local day is exported while TimeLapse stays open.")
                 .foregroundStyle(.secondary)
+            TextField("Unique automation name", text: $name)
+                .textFieldStyle(.roundedBorder)
             List(cameras) { camera in
                 Toggle(isOn: selectionBinding(for: camera.id)) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -57,9 +64,9 @@ struct DailyScheduleView: View {
                 Button("Clear") { selectedIDs.removeAll() }
                 Spacer()
                 Button("Cancel", action: onCancel)
-                Button("Enable Daily Job") { onSave(selectedIDs, outputDirectory) }
+                Button("Save Automation") { onSave(name.trimmingCharacters(in: .whitespacesAndNewlines), selectedIDs, outputDirectory) }
                     .buttonStyle(.borderedProminent)
-                    .disabled(selectedIDs.isEmpty)
+                    .disabled(selectedIDs.isEmpty || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(20)

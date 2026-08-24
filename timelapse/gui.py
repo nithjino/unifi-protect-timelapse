@@ -7,8 +7,10 @@ import json
 import logging
 import os
 import sys
+import threading
 import uuid
 from collections import deque
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -16,7 +18,7 @@ from functools import partial
 from pathlib import Path
 from threading import Lock
 from time import monotonic
-from typing import TYPE_CHECKING, ClassVar, Protocol, cast
+from typing import ClassVar, Protocol, cast
 
 import keyring
 from dotenv import load_dotenv
@@ -72,14 +74,19 @@ from PySide6.QtWidgets import (
 )
 
 from timelapse import ProtectRateLimitError, TimelapseError, __version__
+from timelapse.automation_registry import (
+    AutomationCamera,
+    AutomationRegistry,
+    ConnectionReference,
+    DailyAutomation,
+    RegistryError,
+)
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import DownloadProgress, default_output_path
+from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo, parse_connection
-from timelapse.schedule import config_for_local_day, daily_output_path, latest_complete_local_day
+from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
 
 _URL_TOOLTIP = (
     "The UniFi Protect Integration API address used to connect to your Protect console, for example "
@@ -130,6 +137,7 @@ _COLUMN_EXPECTED = 6
 _COLUMN_SPEED = 7
 _COLUMN_OUTPUT = 8
 _COLUMN_ACTION = 9
+_ManualExporter = Callable[[Config, CameraInfo, Path, Callable[[DownloadProgress], None]], Awaitable[None]]
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
 
@@ -339,6 +347,7 @@ class _DownloadEntry:
     terminal: bool = False
     completed: bool = False
     daily_schedule: bool = False
+    automation_id: str | None = None
     scheduled_day: date | None = None
     queued_for_rate_limit: bool = False
 
@@ -360,14 +369,204 @@ def _format_time_range(config: Config) -> str:
     return f"{_format_job_datetime(start)} → {_format_job_datetime(end)}"
 
 
-@dataclass
-class _DailySchedule:
-    cameras: tuple[CameraInfo, ...]
-    output_directory: Path
-    speed: str
-    entry: _DownloadEntry
-    last_run_day: date | None = None
-    active_day: date | None = None
+class _QtAutomationRuntime:
+    """Own the Qt registry and automation engine on one asyncio thread."""
+
+    def __init__(self, path: Path, profiles: tuple[_ConnectionProfile, ...]) -> None:
+        self._path = path
+        self._profiles = {profile.profile_id: profile for profile in profiles}
+        self._ready = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._registry: AutomationRegistry | None = None
+        self._engine: DailyAutomationEngine | None = None
+        self._coordinator: ExportJobCoordinator | None = None
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._startup_error: BaseException | None = None
+        self._thread = threading.Thread(target=self._run, name="qt-automation-runtime", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=5)
+        if self._startup_error is not None:
+            raise self._startup_error
+        if self._loop is None:
+            message = "the Daily Automation runtime did not start"
+            raise RegistryError(message)
+
+    def _run(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        registry = AutomationRegistry(self._path)
+        coordinator = ExportJobCoordinator.from_environment()
+        engine = DailyAutomationEngine(
+            registry,
+            coordinator,
+            resolve_connection=self._resolve_connection,
+            exporter=export_timelapse,
+        )
+        self._registry = registry
+        self._coordinator = coordinator
+        self._engine = engine
+        try:
+            with registry.owner(endpoint="qt-session"):
+                registry.load()
+                for automation in registry.list():
+                    if automation.status == "active":
+                        self._start(automation.id)
+                self._ready.set()
+                loop.run_forever()
+        except BaseException as exc:
+            self._startup_error = exc
+            self._ready.set()
+        finally:
+            pending = tuple(self._tasks.values())
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            loop.run_until_complete(coordinator.close())
+            loop.close()
+
+    async def _resolve_connection(self, automation: DailyAutomation) -> ResolvedAutomation:
+        profile = self._profiles.get(automation.connection.value)
+        if profile is None:
+            message = f"Qt connection profile {automation.connection.value!r} is unavailable"
+            raise RegistryError(message)
+        now = datetime.now().astimezone()
+        config = profile.settings.make_config(now, now + timedelta(seconds=1), automation.speed)
+        return ResolvedAutomation(config, tuple(await list_available_cameras(config)))
+
+    def _submit(self, operation: Callable[[], object]) -> object:
+        loop = self._loop
+        if loop is None:
+            message = "the Daily Automation runtime is not available"
+            raise RegistryError(message)
+
+        async def invoke() -> object:
+            result = operation()
+            return await cast("Awaitable[object]", result) if isinstance(result, Awaitable) else result
+
+        return asyncio.run_coroutine_threadsafe(invoke(), loop).result(timeout=10)
+
+    def _start(self, automation_id: str) -> None:
+        if self._engine is None:
+            return
+        task = self._tasks.get(automation_id)
+        if task is None or task.done():
+            self._tasks[automation_id] = asyncio.create_task(
+                self._engine.run_forever(automation_id),
+                name=f"qt-automation:{automation_id}",
+            )
+
+    def update_profiles(self, profiles: tuple[_ConnectionProfile, ...]) -> None:
+        self._submit(lambda: setattr(self, "_profiles", {profile.profile_id: profile for profile in profiles}))
+
+    def list(self) -> list[DailyAutomation]:
+        return cast("list[DailyAutomation]", self._submit(lambda: self._required_registry().list()))
+
+    def add(
+        self,
+        *,
+        name: str,
+        cameras: tuple[CameraInfo, ...],
+        profile_id: str,
+        speed: str,
+        output_directory: Path,
+        timezone: str,
+    ) -> DailyAutomation:
+        def create() -> DailyAutomation:
+            automation = self._required_registry().add(
+                name=name,
+                cameras=tuple(AutomationCamera(camera.id, camera.name) for camera in cameras),
+                connection=ConnectionReference("python-profile", profile_id),
+                speed=speed,
+                output_directory=output_directory,
+                timezone=timezone,
+            )
+            self._start(automation.id)
+            return automation
+
+        return cast("DailyAutomation", self._submit(create))
+
+    def edit(self, automation_id: str, *, name: str, cameras: tuple[CameraInfo, ...], profile_id: str) -> None:
+        self._submit(
+            lambda: self._required_registry().edit(
+                automation_id,
+                name=name,
+                cameras=tuple(AutomationCamera(camera.id, camera.name) for camera in cameras),
+                connection=ConnectionReference("python-profile", profile_id),
+            )
+        )
+
+    def stop(self, automation_id: str) -> None:
+        self._submit(lambda: self._required_engine().stop(automation_id))
+
+    def resume(self, automation_id: str) -> None:
+        async def resume() -> None:
+            await self._required_engine().resume(automation_id)
+            self._start(automation_id)
+
+        self._submit(resume)
+
+    def remove(self, automation_id: str) -> None:
+        self._submit(lambda: self._required_engine().remove(automation_id))
+
+    async def export_manual(
+        self,
+        config: Config,
+        camera: CameraInfo,
+        output: Path,
+        progress_callback: Callable[[DownloadProgress], None],
+    ) -> None:
+        loop = self._loop
+        coordinator = self._coordinator
+        if loop is None or coordinator is None:
+            message = "the Qt export coordinator is unavailable"
+            raise TimelapseError(message)
+        job_id = f"qt-manual:{uuid.uuid4()}"
+
+        async def coordinate() -> None:
+            jobs = await coordinator.submit(
+                [
+                    ExportJobSpec.create(
+                        output=output,
+                        operation=lambda: export_timelapse(config, camera, output, progress_callback),
+                        job_id=job_id,
+                    )
+                ]
+            )
+            try:
+                await coordinator.wait(jobs)
+            except asyncio.CancelledError:
+                await coordinator.cancel(job_id)
+                raise
+            if jobs[0].status == "failed":
+                raise TimelapseError(jobs[0].error or "manual export failed")
+
+        future = asyncio.run_coroutine_threadsafe(coordinate(), loop)
+        try:
+            await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def close(self) -> None:
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        loop.call_soon_threadsafe(loop.stop)
+        self._thread.join(timeout=5)
+
+    def _required_registry(self) -> AutomationRegistry:
+        if self._registry is None:
+            message = "the Qt automation registry is unavailable"
+            raise RegistryError(message)
+        return self._registry
+
+    def _required_engine(self) -> DailyAutomationEngine:
+        if self._engine is None:
+            message = "the Qt automation engine is unavailable"
+            raise RegistryError(message)
+        return self._engine
 
 
 class _LogEmitter(QObject):
@@ -686,8 +885,16 @@ class _CameraSelectionDialog(QDialog):
         return [camera for camera in self._cameras if camera.id in selected_ids]
 
 
-class _DailyScheduleDialog(QDialog):
-    def __init__(self, cameras: list[CameraInfo], initial_directory: Path, parent: QWidget | None) -> None:
+class _DailyAutomationDialog(QDialog):
+    def __init__(
+        self,
+        cameras: list[CameraInfo],
+        initial_directory: Path,
+        parent: QWidget | None,
+        *,
+        name: str = "",
+        selected_ids: set[str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._cameras = cameras
         self.setWindowTitle("Daily Automatic Timelapses")
@@ -699,13 +906,21 @@ class _DailyScheduleDialog(QDialog):
         )
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self._name_edit = QLineEdit(name)
+        self._name_edit.setPlaceholderText("Front doors")
+        name_row.addWidget(self._name_edit, stretch=1)
+        layout.addLayout(name_row)
         self._camera_list = QListWidget()
         self._camera_list.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         for camera in cameras:
             item = QListWidgetItem(camera.name)
             item.setData(Qt.ItemDataRole.UserRole, camera.id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(
+                Qt.CheckState.Checked if camera.id in (selected_ids or set()) else Qt.CheckState.Unchecked
+            )
             self._camera_list.addItem(item)
         layout.addWidget(self._camera_list)
         output_row = QHBoxLayout()
@@ -748,10 +963,16 @@ class _DailyScheduleDialog(QDialog):
     def output_directory(self) -> Path:
         return Path(self._output_edit.text()).expanduser()
 
+    def automation_name(self) -> str:
+        return self._name_edit.text().strip()
+
     def accept(self) -> None:
         """Validate the daily schedule before closing the dialog."""
         if not self.selected_cameras():
             QMessageBox.warning(self, "No Cameras Selected", "Select at least one camera for the daily job.")
+            return
+        if not self.automation_name():
+            QMessageBox.warning(self, "Name Required", "Enter a unique name for this Daily Automation.")
             return
         output = self.output_directory()
         if output.exists() and not output.is_dir():
@@ -932,21 +1153,33 @@ class _DownloadWorker(QThread):
     download_rate_limited: ClassVar[Signal] = Signal(str)
     download_cancelled: ClassVar[Signal] = Signal()
 
-    def __init__(self, config: Config, camera: CameraInfo, output: Path, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        camera: CameraInfo,
+        output: Path,
+        parent: QWidget | None = None,
+        *,
+        exporter: _ManualExporter = export_timelapse,
+    ) -> None:
         super().__init__(parent)
         self._config = config
         self._camera = camera
         self._output = output
+        self._exporter = exporter
         self._lock = Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._task: asyncio.Task[None] | None = None
+        self._task: asyncio.Future[None] | None = None
         self._cancel_requested = False
 
     def run(self) -> None:
         """Download one camera inside this thread's private asyncio event loop."""
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        task = loop.create_task(export_timelapse(self._config, self._camera, self._output, self._report_progress))
+        task = asyncio.ensure_future(
+            self._exporter(self._config, self._camera, self._output, self._report_progress),
+            loop=loop,
+        )
         with self._lock:
             self._loop = loop
             self._task = task
@@ -1024,7 +1257,7 @@ class _MainWindow(QMainWindow):
         self._entries: list[_DownloadEntry] = []
         self._reserved_paths: set[str] = set()
         self._next_job_number = 1
-        self._daily_schedule: _DailySchedule | None = None
+        self._automation_runtime: _QtAutomationRuntime | None = None
         self._adjusting_full_day = False
         self._closing = False
         self._log_handler_attached = False
@@ -1038,15 +1271,25 @@ class _MainWindow(QMainWindow):
         self._install_styles()
         self._build_menu()
         self._build_interface()
+        registry_directory = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+        try:
+            self._automation_runtime = _QtAutomationRuntime(
+                registry_directory / "qt-automations.json",
+                tuple(self._profiles),
+            )
+            self._refresh_daily_automations()
+        except RegistryError as exc:
+            self._add_automation_button.setEnabled(False)
+            QMessageBox.critical(self, "Daily Automations Unavailable", _exception_text(exc))
         self._thumbnail_popup = _ThumbnailPopup(self)
         self._speed_timer = QTimer(self)
         self._speed_timer.setInterval(1000)
         self._speed_timer.timeout.connect(self._clear_stalled_speeds)
         self._speed_timer.start()
-        self._daily_timer = QTimer(self)
-        self._daily_timer.setInterval(60_000)
-        self._daily_timer.timeout.connect(self._run_daily_schedule_if_due)
-        self._daily_timer.start()
+        self._automation_refresh_timer = QTimer(self)
+        self._automation_refresh_timer.setInterval(5_000)
+        self._automation_refresh_timer.timeout.connect(self._refresh_daily_automations)
+        self._automation_refresh_timer.start()
         self._install_log_handler()
         self._update_profile_controls()
         self._update_camera_summary()
@@ -1228,10 +1471,10 @@ class _MainWindow(QMainWindow):
         self._preview_camera_combo.currentIndexChanged.connect(self._preview_camera_changed)
         details_form.addRow("Preview:", self._preview_camera_combo)
 
-        self._daily_checkbox = QCheckBox("Daily automatic timelapses")
-        self._daily_checkbox.setToolTip("Export each completed local day while this program remains open.")
-        self._daily_checkbox.toggled.connect(self._daily_toggled)
-        details_form.addRow("", self._daily_checkbox)
+        self._add_automation_button = QPushButton("Add Daily Automation…")
+        self._add_automation_button.setToolTip("Create a durable, named multi-camera daily export.")
+        self._add_automation_button.clicked.connect(self._show_daily_schedule_dialog)
+        details_form.addRow("", self._add_automation_button)
 
         self._start_button = QPushButton("Start Downloads")
         self._start_button.setProperty("primary", "true")
@@ -1516,6 +1759,8 @@ class _MainWindow(QMainWindow):
             self._profiles = previous_profiles
             return
         self._settings = updated.settings
+        if self._automation_runtime is not None:
+            self._automation_runtime.update_profiles(tuple(self._profiles))
         self._cameras.clear()
         self._selected_cameras.clear()
         self._clear_thumbnail_previews()
@@ -1549,6 +1794,8 @@ class _MainWindow(QMainWindow):
             self._profiles.remove(created)
             return
         self._settings = created.settings
+        if self._automation_runtime is not None:
+            self._automation_runtime.update_profiles(tuple(self._profiles))
         self._cameras.clear()
         self._selected_cameras.clear()
         self._clear_thumbnail_previews()
@@ -1652,7 +1899,6 @@ class _MainWindow(QMainWindow):
         self._selected_cameras = [camera for camera in self._cameras if camera.id in selected_ids]
         if not self._cameras:
             self._open_daily_dialog_after_load = False
-            self._set_daily_checkbox(checked=False)
             QMessageBox.information(self, "No Cameras", "No cameras were returned by UniFi Protect.")
             return
         self.statusBar().showMessage(f"Loaded {len(self._cameras)} cameras", 5000)
@@ -1667,7 +1913,6 @@ class _MainWindow(QMainWindow):
     def _camera_load_failed(self, message: str) -> None:
         if not self._closing:
             self._open_daily_dialog_after_load = False
-            self._set_daily_checkbox(checked=False)
             QMessageBox.critical(self, "Could Not Load Cameras", message)
             self.statusBar().showMessage("Camera loading failed", 5000)
             _LOGGER.error("Camera loading failed: %s", message)
@@ -1733,25 +1978,15 @@ class _MainWindow(QMainWindow):
         self._update_preview_camera_options()
         self._start_button.setEnabled(count > 0 and not self._closing)
 
-    @Slot(bool)
-    def _daily_toggled(self, enabled: bool) -> None:  # noqa: FBT001 - Qt signal signature
-        if not enabled:
-            if self._daily_schedule is not None:
-                self._stop_daily_schedule()
-            return
-        if self._daily_schedule is not None:
-            return
+    @Slot()
+    def _show_daily_schedule_dialog(self) -> None:
         if not self._cameras:
             self._open_camera_dialog_after_load = False
             self._open_daily_dialog_after_load = True
             self._load_cameras(open_dialog=False)
             return
-        self._show_daily_schedule_dialog()
-
-    def _show_daily_schedule_dialog(self) -> None:
-        dialog = _DailyScheduleDialog(self._cameras, Path(self._output_edit.text()).expanduser(), self)
+        dialog = _DailyAutomationDialog(self._cameras, Path(self._output_edit.text()).expanduser(), self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            self._set_daily_checkbox(checked=False)
             return
         output_directory = dialog.output_directory()
         cameras = tuple(dialog.selected_cameras())
@@ -1759,29 +1994,35 @@ class _MainWindow(QMainWindow):
             output_directory.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             QMessageBox.critical(self, "Could Not Create Output Folder", _exception_text(exc))
-            self._set_daily_checkbox(checked=False)
             return
-        entry = self._add_daily_schedule_row(cameras, output_directory)
-        self._daily_schedule = _DailySchedule(
-            cameras=cameras,
-            output_directory=output_directory,
-            speed=self._speed_combo.currentText(),
-            entry=entry,
-        )
-        self.statusBar().showMessage(f"Scheduled daily timelapses for {len(cameras)} cameras", 5000)
-        _LOGGER.info("Scheduled daily timelapses for %d cameras in %s", len(cameras), output_directory)
-        self._run_daily_schedule_if_due()
+        runtime = self._automation_runtime
+        if runtime is None:
+            QMessageBox.critical(self, "Daily Automations Unavailable", "The automation runtime is not available.")
+            return
+        try:
+            from tzlocal import get_localzone_name  # noqa: PLC0415
 
-    def _add_daily_schedule_row(
-        self,
-        cameras: tuple[CameraInfo, ...],
-        output_directory: Path,
-    ) -> _DownloadEntry:
+            automation = runtime.add(
+                name=dialog.automation_name(),
+                cameras=cameras,
+                profile_id=self._selected_profile_id or "",
+                speed=self._speed_combo.currentText(),
+                output_directory=output_directory,
+                timezone=get_localzone_name(),
+            )
+        except (RegistryError, OSError, TimeoutError) as exc:
+            QMessageBox.critical(self, "Could Not Add Daily Automation", _exception_text(exc))
+            return
+        self._refresh_daily_automations()
+        self.statusBar().showMessage(f"Added Daily Automation {automation.name!r}", 5000)
+        _LOGGER.info("Added Daily Automation %s (%s)", automation.name, automation.id)
+
+    def _add_daily_automation_row(self, automation: DailyAutomation) -> _DownloadEntry:
         now = datetime.now().astimezone()
-        config = self._settings.make_config(now, now + timedelta(seconds=1), self._speed_combo.currentText())
+        config = self._settings.make_config(now, now + timedelta(seconds=1), automation.speed)
         camera = CameraInfo(
-            id="daily-schedule",
-            name=f"{len(cameras)} cameras" if len(cameras) != 1 else cameras[0].name,
+            id=automation.id,
+            name=automation.name,
             state=None,
             model=None,
         )
@@ -1790,37 +2031,40 @@ class _MainWindow(QMainWindow):
         values = {
             _COLUMN_JOB: str(self._next_job_number),
             _COLUMN_CAMERA: camera.name,
-            _COLUMN_TIME_RANGE: "Next completed day",
-            _COLUMN_STATUS: "Scheduled daily",
+            _COLUMN_TIME_RANGE: f"Next day: {automation.next_day.isoformat()}",
+            _COLUMN_STATUS: automation.status.title(),
             _COLUMN_DOWNLOADED: "—",
             _COLUMN_EXPECTED: "—",
             _COLUMN_SPEED: "—",
-            _COLUMN_OUTPUT: output_directory.name or str(output_directory),
+            _COLUMN_OUTPUT: automation.output_path.name or str(automation.output_path),
         }
         self._next_job_number += 1
         for column, value in values.items():
             item = QTableWidgetItem(value)
             if column == _COLUMN_OUTPUT:
-                item.setToolTip(str(output_directory))
+                item.setToolTip(str(automation.output_path))
             self._daily_automations.setItem(row, column, item)
         progress_bar = QProgressBar()
         progress_bar.setRange(0, 1)
         progress_bar.setValue(0)
         progress_bar.setFormat("Daily")
         self._daily_automations.setCellWidget(row, _COLUMN_PROGRESS, progress_bar)
-        stop_button = QPushButton("Stop")
-        stop_button.clicked.connect(self._stop_daily_schedule)
-        self._daily_automations.setCellWidget(row, _COLUMN_ACTION, stop_button)
+        action_button = QPushButton("Stop" if automation.status == "active" else "Resume")
+        callback = self._stop_daily_automation if automation.status == "active" else self._resume_daily_automation
+        action_button.clicked.connect(partial(callback, automation.id))
+        self._daily_automations.setCellWidget(row, _COLUMN_ACTION, action_button)
         entry = _DownloadEntry(
             row=row,
             job_number=self._next_job_number - 1,
-            output=output_directory,
+            output=automation.output_path,
             camera=camera,
             config=config,
             worker=None,
             progress_bar=progress_bar,
-            action_button=stop_button,
+            action_button=action_button,
             daily_schedule=True,
+            automation_id=automation.id,
+            terminal=automation.status in {"stopped", "paused"},
         )
         self._entries.append(entry)
         self._sync_download_view()
@@ -1828,82 +2072,74 @@ class _MainWindow(QMainWindow):
         return entry
 
     @Slot()
-    def _stop_daily_schedule(self) -> None:
-        schedule = self._daily_schedule
-        if schedule is None:
+    def _refresh_daily_automations(self) -> None:
+        runtime = self._automation_runtime
+        if runtime is None or self._closing:
             return
-        self._daily_schedule = None
-        schedule.entry.terminal = True
-        self._set_entry_text(schedule.entry, _COLUMN_STATUS, "Stopped")
-        self._set_action_button(
-            schedule.entry,
-            "Delete",
-            partial(self._remove_entry, schedule.entry),
-            danger=True,
-        )
-        self._set_daily_checkbox(checked=False)
+        try:
+            automations = runtime.list()
+        except (RegistryError, TimeoutError):
+            return
+        daily_entries = (item for item in self._entries if item.daily_schedule)
+        for entry in sorted(daily_entries, key=lambda item: item.row, reverse=True):
+            self._daily_automations.removeRow(entry.row)
+            self._entries.remove(entry)
+        for automation in automations:
+            self._add_daily_automation_row(automation)
+        self._sync_download_view()
         self._update_bulk_buttons()
-        self.statusBar().showMessage("Stopped daily automatic timelapses", 5000)
-        _LOGGER.info("Stopped daily automatic timelapses")
 
-    def _set_daily_checkbox(self, *, checked: bool) -> None:
-        self._daily_checkbox.blockSignals(True)  # noqa: FBT003 - Qt API
-        self._daily_checkbox.setChecked(checked)
-        self._daily_checkbox.blockSignals(False)  # noqa: FBT003 - Qt API
+    def _stop_daily_automation(self, automation_id: str) -> None:
+        self._run_automation_action("Stop", lambda runtime: runtime.stop(automation_id))
 
-    @Slot()
-    def _run_daily_schedule_if_due(self) -> None:
-        schedule = self._daily_schedule
-        if schedule is None:
+    def _resume_daily_automation(self, automation_id: str) -> None:
+        self._run_automation_action("Resume", lambda runtime: runtime.resume(automation_id))
+
+    def _remove_daily_automation(self, automation_id: str) -> None:
+        self._run_automation_action("Remove", lambda runtime: runtime.remove(automation_id))
+
+    def _edit_daily_automation(self, automation_id: str) -> None:
+        runtime = self._automation_runtime
+        if runtime is None:
             return
-        if schedule.active_day is not None:
-            active = any(
-                entry.scheduled_day == schedule.active_day
-                and (entry.worker in self._workers or entry.queued_for_rate_limit)
-                for entry in self._entries
+        try:
+            automation = next(item for item in runtime.list() if item.id == automation_id)
+        except (RegistryError, StopIteration, TimeoutError) as exc:
+            QMessageBox.critical(self, "Could Not Edit Daily Automation", _exception_text(exc))
+            return
+        dialog = _DailyAutomationDialog(
+            self._cameras,
+            automation.output_path,
+            self,
+            name=automation.name,
+            selected_ids={camera.id for camera in automation.cameras},
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            runtime.edit(
+                automation_id,
+                name=dialog.automation_name(),
+                cameras=tuple(dialog.selected_cameras()),
+                profile_id=self._selected_profile_id or automation.connection.value,
             )
-            if active:
-                return
-            active_config = config_for_local_day(schedule.entry.config, schedule.active_day)
-            if all(
-                self._valid_export(daily_output_path(active_config, camera, schedule.output_directory))
-                for camera in schedule.cameras
-            ):
-                schedule.last_run_day = schedule.active_day
-            schedule.active_day = None
-
-        latest_day = latest_complete_local_day()
-        day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day is not None else latest_day
-        while day <= latest_day:
-            config = config_for_local_day(schedule.entry.config, day)
-            missing = [
-                camera
-                for camera in schedule.cameras
-                if not self._valid_export(daily_output_path(config, camera, schedule.output_directory))
-            ]
-            if not missing:
-                schedule.last_run_day = day
-                day += timedelta(days=1)
-                continue
-            job_number = self._next_job_number
-            self._next_job_number += 1
-            started = 0
-            for camera in missing:
-                preferred = daily_output_path(config, camera, schedule.output_directory)
-                if not self._reserve_daily_output_path(preferred):
-                    continue
-                output = preferred.resolve()
-                worker = _DownloadWorker(config, camera, output, self)
-                entry = self._add_download_row(job_number, camera, output, worker, config=config)
-                entry.scheduled_day = day
-                self._start_download_worker(entry, worker)
-                started += 1
-                _LOGGER.info("Started daily camera download: %s -> %s", camera.name, output)
-            schedule.active_day = day
-            if started:
-                self.statusBar().showMessage(f"Started daily job {job_number} for {day.isoformat()}")
+        except (RegistryError, TimeoutError) as exc:
+            QMessageBox.critical(self, "Could Not Edit Daily Automation", _exception_text(exc))
             return
-        self._update_activity_indicator()
+        self._refresh_daily_automations()
+        self.statusBar().showMessage(f"Edited Daily Automation {automation.name!r}", 5000)
+
+    def _run_automation_action(self, verb: str, action: Callable[[_QtAutomationRuntime], None]) -> None:
+        runtime = self._automation_runtime
+        if runtime is None:
+            return
+        try:
+            action(runtime)
+        except (RegistryError, TimeoutError) as exc:
+            QMessageBox.critical(self, f"Could Not {verb} Daily Automation", _exception_text(exc))
+            return
+        self._refresh_daily_automations()
+        self.statusBar().showMessage(f"{verb} completed", 5000)
 
     @Slot()
     def _queue_downloads(self) -> None:
@@ -1925,7 +2161,7 @@ class _MainWindow(QMainWindow):
         for camera in self._selected_cameras:
             preferred = output_directory / default_output_path(config, camera).name
             output = self._reserve_output_path(preferred)
-            worker = _DownloadWorker(config, camera, output, self)
+            worker = self._new_download_worker(config, camera, output)
             entry = self._add_download_row(job_number, camera, output, worker, config=config)
             self._start_download_worker(entry, worker)
             _LOGGER.info("Started camera download: %s -> %s", camera.name, output)
@@ -1942,20 +2178,9 @@ class _MainWindow(QMainWindow):
         self._reserved_paths.add(self._reservation_key(candidate))
         return candidate
 
-    def _reserve_daily_output_path(self, preferred: Path) -> bool:
-        candidate = preferred.resolve()
-        key = self._reservation_key(candidate)
-        if candidate.exists() or key in self._reserved_paths:
-            return False
-        self._reserved_paths.add(key)
-        return True
-
-    @staticmethod
-    def _valid_export(path: Path) -> bool:
-        try:
-            return path.is_file() and path.stat().st_size > 0
-        except OSError:
-            return False
+    def _new_download_worker(self, config: Config, camera: CameraInfo, output: Path) -> _DownloadWorker:
+        exporter = self._automation_runtime.export_manual if self._automation_runtime is not None else export_timelapse
+        return _DownloadWorker(config, camera, output, self, exporter=exporter)
 
     @staticmethod
     def _reservation_key(path: Path) -> str:
@@ -2037,8 +2262,12 @@ class _MainWindow(QMainWindow):
     @Slot()
     def _cancel_all_jobs(self) -> None:
         if self._shows_daily_automations:
-            if self._daily_schedule is not None:
-                self._stop_daily_schedule()
+            runtime = self._automation_runtime
+            if runtime is not None:
+                for automation in runtime.list():
+                    if automation.status == "active":
+                        runtime.stop(automation.id)
+                self._refresh_daily_automations()
             return
         queued = list(self._rate_limited_queue)
         for entry in queued:
@@ -2052,6 +2281,17 @@ class _MainWindow(QMainWindow):
 
     @Slot()
     def _clear_finished_jobs(self) -> None:
+        if self._shows_daily_automations:
+            runtime = self._automation_runtime
+            if runtime is None:
+                return
+            removable = [item for item in runtime.list() if item.status in {"paused", "stopped"}]
+            for automation in removable:
+                runtime.remove(automation.id)
+            self._refresh_daily_automations()
+            if removable:
+                self.statusBar().showMessage(f"Removed {len(removable)} Daily Automations", 5000)
+            return
         removable = [entry for entry in self._visible_entries() if self._is_removable(entry)]
         deleted_count = 0
         for entry in sorted(removable, key=lambda item: item.row, reverse=True):
@@ -2065,7 +2305,7 @@ class _MainWindow(QMainWindow):
         self._clear_all_button.setEnabled(any(self._is_removable(entry) for entry in self._visible_entries()))
         self._cancel_all_button.setText("Stop All" if self._shows_daily_automations else "Cancel All")
         has_cancellable_jobs = (
-            self._daily_schedule is not None
+            any(not entry.terminal for entry in self._visible_entries())
             if self._shows_daily_automations
             else bool(self._rate_limited_queue)
             or any(not entry.terminal and not entry.cancelling for entry in self._workers.values())
@@ -2081,11 +2321,18 @@ class _MainWindow(QMainWindow):
         if entry is None:
             return
         menu = QMenu(self)
-        if entry.daily_schedule and not entry.terminal:
-            stop_action = menu.addAction("Stop Daily Job")
-            stop_action.triggered.connect(self._stop_daily_schedule)
-        elif entry.daily_schedule:
-            pass
+        if entry.daily_schedule and entry.automation_id is not None:
+            automation_id = entry.automation_id
+            edit_action = menu.addAction("Edit Daily Automation…")
+            edit_action.triggered.connect(partial(self._edit_daily_automation, automation_id))
+            if entry.terminal:
+                resume_action = menu.addAction("Resume Daily Automation")
+                resume_action.triggered.connect(partial(self._resume_daily_automation, automation_id))
+            else:
+                stop_action = menu.addAction("Stop Daily Automation")
+                stop_action.triggered.connect(partial(self._stop_daily_automation, automation_id))
+            remove_action = menu.addAction("Remove Daily Automation")
+            remove_action.triggered.connect(partial(self._remove_daily_automation, automation_id))
         elif entry.completed:
             open_action = menu.addAction("Open Video")
             open_action.triggered.connect(partial(self._open_entry_video, entry))
@@ -2101,10 +2348,11 @@ class _MainWindow(QMainWindow):
             cancel_action.setEnabled(not entry.cancelling and worker is not None)
             if worker is not None:
                 cancel_action.triggered.connect(partial(self._cancel_download, worker))
-        menu.addSeparator()
-        delete_action = menu.addAction("Delete")
-        delete_action.setEnabled(self._is_removable(entry))
-        delete_action.triggered.connect(partial(self._remove_entry, entry))
+        if not entry.daily_schedule:
+            menu.addSeparator()
+            delete_action = menu.addAction("Delete Export Artifact")
+            delete_action.setEnabled(self._is_removable(entry))
+            delete_action.triggered.connect(partial(self._remove_entry, entry))
         menu.exec(table.viewport().mapToGlobal(position))
 
     def _open_completed_video(self, table: QTableWidget, row: int, _column: int) -> None:
@@ -2295,7 +2543,7 @@ class _MainWindow(QMainWindow):
             self._set_entry_text(entry, _COLUMN_SPEED, "—")
             entry.progress_bar.setRange(0, 0)
             entry.progress_bar.setFormat("")
-            worker = _DownloadWorker(entry.config, entry.camera, entry.output, self)
+            worker = self._new_download_worker(entry.config, entry.camera, entry.output)
             self._set_action_button(entry, "Cancel", partial(self._cancel_download, worker))
             self._start_download_worker(entry, worker)
             _LOGGER.info("Retrying queued camera download: %s", entry.camera_name)
@@ -2392,7 +2640,7 @@ class _MainWindow(QMainWindow):
         self._set_entry_text(entry, _COLUMN_SPEED, "—")
         entry.progress_bar.setRange(0, 0)
         entry.progress_bar.setFormat("")
-        worker = _DownloadWorker(entry.config, entry.camera, entry.output, self)
+        worker = self._new_download_worker(entry.config, entry.camera, entry.output)
         self._set_action_button(entry, "Cancel", partial(self._cancel_download, worker))
         self._start_download_worker(entry, worker)
         self.statusBar().showMessage(f"Restarted download for {entry.camera_name}", 5000)
@@ -2441,7 +2689,10 @@ class _MainWindow(QMainWindow):
         """Cancel background work before allowing the native window to close."""
         has_background_work = self._camera_loader is not None or bool(self._workers) or bool(self._thumbnail_loaders)
         if not has_background_work:
-            self._daily_schedule = None
+            self._automation_refresh_timer.stop()
+            if self._automation_runtime is not None:
+                self._automation_runtime.close()
+                self._automation_runtime = None
             self._preferences.setValue("output_directory", self._output_edit.text())
             self._logs_window.close()
             self._notification_icon.hide()
@@ -2471,8 +2722,10 @@ class _MainWindow(QMainWindow):
             event.ignore()
             return
         self._closing = True
-        self._daily_schedule = None
-        self._daily_timer.stop()
+        self._automation_refresh_timer.stop()
+        if self._automation_runtime is not None:
+            self._automation_runtime.close()
+            self._automation_runtime = None
         self._start_button.setEnabled(False)
         self.statusBar().showMessage("Cancelling active work…")
         _LOGGER.info("Application close requested; cancelling active work")

@@ -1,20 +1,26 @@
 <Window x:Class="TimeLapseNative.DailyScheduleDialog"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Daily Automatic Timelapses" Width="590" Height="520"
+        Title="Daily Automation" Width="590" Height="560"
         WindowStartupLocation="CenterOwner" ShowInTaskbar="False">
   <Grid Margin="20">
     <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="*" />
       <RowDefinition Height="Auto" />
       <RowDefinition Height="Auto" />
     </Grid.RowDefinitions>
-    <TextBlock Text="Daily Automatic Timelapses" FontSize="21" FontWeight="SemiBold" />
+    <TextBlock Text="Daily Automation" FontSize="21" FontWeight="SemiBold" />
     <TextBlock Grid.Row="1" Margin="0,5,0,12" Foreground="#666" TextWrapping="Wrap"
                Text="Select cameras and a destination. The latest completed day is exported now, then each completed local day is exported while TimeLapse stays open." />
-    <ListBox x:Name="CameraList" Grid.Row="2">
+    <Grid Grid.Row="2" Margin="0,0,0,10">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+      <TextBlock Text="Name" Foreground="#666" VerticalAlignment="Center" Margin="0,0,10,0" />
+      <TextBox x:Name="NameText" Grid.Column="1" />
+    </Grid>
+    <ListBox x:Name="CameraList" Grid.Row="3">
       <ListBox.ItemTemplate>
         <DataTemplate>
           <CheckBox IsChecked="{Binding Selected}" Margin="7,5">
@@ -26,16 +32,16 @@
         </DataTemplate>
       </ListBox.ItemTemplate>
     </ListBox>
-    <Grid Grid.Row="3" Margin="0,12,0,0">
+    <Grid Grid.Row="4" Margin="0,12,0,0">
       <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
       <TextBlock Text="Save to" Foreground="#666" VerticalAlignment="Center" Margin="0,0,10,0" />
       <TextBlock x:Name="OutputText" Grid.Column="1" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" Margin="0,0,10,0" />
       <Button Grid.Column="2" Content="Choose…" Click="Choose_Click" />
     </Grid>
-    <DockPanel Grid.Row="4" Margin="0,12,0,0">
+    <DockPanel Grid.Row="5" Margin="0,12,0,0">
       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
         <Button Content="Cancel" IsCancel="True" Margin="0,0,8,0" />
-        <Button Content="Enable Daily Job" IsDefault="True" Click="Ok_Click" Background="#1769C2" Foreground="White" />
+        <Button Content="Save Automation" IsDefault="True" Click="Ok_Click" Background="#1769C2" Foreground="White" />
       </StackPanel>
       <Button Content="Select All" Click="SelectAll_Click" />
     </DockPanel>

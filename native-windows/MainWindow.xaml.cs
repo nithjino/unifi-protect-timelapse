@@ -37,7 +37,6 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, string> _thumbnailFailures = [];
     private readonly Dictionary<string, BackendProcess> _thumbnailRequests = [];
     private readonly HashSet<string> _reservedOutputPaths = new(StringComparer.OrdinalIgnoreCase);
-    private readonly DispatcherTimer _dailyTimer = new() { Interval = TimeSpan.FromMinutes(1) };
     private readonly DispatcherTimer _startThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
     private readonly DispatcherTimer _endThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
     private ConnectionProfile? _selectedProfile;
@@ -48,25 +47,11 @@ public partial class MainWindow : Window
     private bool _isLoadingCameras;
     private bool _allowClose;
     private bool _adjustingFullDay;
-    private bool _updatingDailyToggle;
     private bool _updatingPreviewCamera;
     private string? _previewCameraId;
     private string? _hoveredThumbnailBoundary;
     private string? _visibleThumbnailKey;
     private int _thumbnailGeneration;
-    private DailySchedule? _dailySchedule;
-
-    private sealed class DailySchedule
-    {
-        public required List<CameraInfo> Cameras { get; init; }
-        public required string OutputDirectory { get; init; }
-        public required ConnectionSettings Settings { get; init; }
-        public required string Speed { get; init; }
-        public required DownloadJob Job { get; init; }
-        public DateTime? LastRunDay { get; set; }
-        public DateTime? ActiveDay { get; set; }
-        public HashSet<Guid> ActiveJobIds { get; } = [];
-    }
 
     public MainWindow()
     {
@@ -94,12 +79,10 @@ public partial class MainWindow : Window
         EndTimeText.Text = end.ToString("t", CultureInfo.CurrentCulture);
         _startThumbnailTimer.Tick += (_, _) => ThumbnailTimerElapsed("start", _startThumbnailTimer);
         _endThumbnailTimer.Tick += (_, _) => ThumbnailTimerElapsed("end", _endThumbnailTimer);
-        _dailyTimer.Tick += (_, _) => RunDailyScheduleIfDue();
-        _dailyTimer.Start();
         UpdateDownloadsDisplay();
     }
 
-    private void Window_Loaded(object sender, RoutedEventArgs e)
+    private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
         try
         {
@@ -118,6 +101,62 @@ public partial class MainWindow : Window
         finally { _loadingProfiles = false; }
 
         if (_profiles.Count == 0) ShowConnectionDialog(null, firstRun: true);
+        else await RestoreDailyAutomationsAsync();
+    }
+
+    private async Task RestoreDailyAutomationsAsync()
+    {
+        using var process = new BackendProcess();
+        List<NativeAutomation> automations = [];
+        var completion = await process.RunAsync(new
+        {
+            id = $"state-snapshot-{Guid.NewGuid()}",
+            command = "state_snapshot",
+        }, backendEvent => automations = backendEvent.Automations ?? automations);
+        if (completion.ExitCode != 0)
+        {
+            ShowError("Could Not Restore Daily Automations", completion.StandardError);
+            return;
+        }
+        foreach (var profile in _profiles.Where(profile => automations.Any(item =>
+                     item.Status == "active" && item.ProfileId.Equals(profile.Id.ToString(), StringComparison.OrdinalIgnoreCase))))
+        {
+            await process.RunAsync(new
+            {
+                id = $"hydrate-{Guid.NewGuid()}",
+                command = "hydrate_credentials",
+                profile_id = profile.Id.ToString(),
+                settings = profile.Settings,
+            }, _ => { });
+        }
+        foreach (var automation in automations)
+        {
+            var profile = _profiles.FirstOrDefault(item =>
+                item.Id.ToString().Equals(automation.ProfileId, StringComparison.OrdinalIgnoreCase));
+            var job = new DownloadJob
+            {
+                GroupNumber = _nextGroupNumber++,
+                Camera = new CameraInfo(automation.Id, automation.Name, null, null),
+                OutputPath = automation.OutputDirectory,
+                RequestSettings = profile?.Settings ?? _selectedProfile?.Settings ?? new ConnectionSettings(),
+                RequestStart = "",
+                RequestEnd = "",
+                RequestSpeed = automation.Speed,
+                IsDailySchedule = true,
+                AutomationId = automation.Id,
+                AutomationProfileId = automation.ProfileId,
+                AutomationCameras = automation.Cameras,
+                State = automation.Status switch
+                {
+                    "active" => DownloadState.Scheduled,
+                    "paused" => DownloadState.Failed,
+                    _ => DownloadState.Stopped,
+                },
+                Error = automation.LastError ?? "",
+            };
+            DailyAutomationJobs.Add(job);
+        }
+        UpdateDownloadsDisplay();
     }
 
     private void NewProfile_Click(object sender, RoutedEventArgs e) => ShowConnectionDialog(null, firstRun: false);
@@ -146,6 +185,8 @@ public partial class MainWindow : Window
         UpdateCameraSummary();
         StatusText.Text = $"Saved {replacement.DisplayName}";
         AppendLog("INFO", StatusText.Text);
+        if (DailyAutomationJobs.Any(job => job.AutomationProfileId == replacement.Id.ToString()))
+            _ = HydrateProfileAsync(replacement);
     }
 
     private void ProfileCombo_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -164,6 +205,21 @@ public partial class MainWindow : Window
     }
 
     private void SaveProfiles() => ProfileStore.Save(new ProfileState(_profiles.ToList(), _selectedProfile?.Id));
+
+    private async Task<bool> HydrateProfileAsync(ConnectionProfile profile)
+    {
+        using var process = new BackendProcess();
+        var completion = await process.RunAsync(new
+        {
+            id = $"hydrate-{Guid.NewGuid()}",
+            command = "hydrate_credentials",
+            profile_id = profile.Id.ToString(),
+            settings = profile.Settings,
+        }, _ => { });
+        if (completion.ExitCode == 0) return true;
+        ShowError("Could Not Hydrate Credentials", completion.StandardError);
+        return false;
+    }
 
     private void UpdateConnectionDisplay()
     {
@@ -458,130 +514,170 @@ public partial class MainWindow : Window
         foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();
     }
 
-    private async void DailyAutomatic_Checked(object sender, RoutedEventArgs e)
+    private async void AddDailyAutomation_Click(object sender, RoutedEventArgs e)
     {
-        if (_updatingDailyToggle || _dailySchedule is not null) return;
         if (_cameras.Count == 0) await LoadCamerasAsync(openSelection: false);
-        if (DailyAutomaticCheckBox.IsChecked != true) return;
-        if (_cameras.Count == 0) { SetDailyToggle(false); return; }
+        if (_cameras.Count == 0) return;
         var dialog = new DailyScheduleDialog(_cameras, _outputDirectory) { Owner = this };
-        if (dialog.ShowDialog() != true) { SetDailyToggle(false); return; }
-        if (!TryEnsureOutputDirectory(dialog.OutputDirectory)) { SetDailyToggle(false); return; }
-        ConfigureDailySchedule(dialog.SelectedCameras, dialog.OutputDirectory);
+        if (dialog.ShowDialog() != true) return;
+        if (!TryEnsureOutputDirectory(dialog.OutputDirectory)) return;
+        await ConfigureDailyAutomationAsync(dialog.AutomationName, dialog.SelectedCameras, dialog.OutputDirectory);
     }
 
-    private void DailyAutomatic_Unchecked(object sender, RoutedEventArgs e)
-    {
-        if (!_updatingDailyToggle) StopDailySchedule();
-    }
-
-    private void ConfigureDailySchedule(List<CameraInfo> cameras, string outputDirectory)
+    private async Task ConfigureDailyAutomationAsync(string name, List<CameraInfo> cameras, string outputDirectory)
     {
         if (_selectedProfile is null) return;
-        var group = _nextGroupNumber++;
-        var scheduleCamera = new CameraInfo(
-            $"daily-schedule-{Guid.NewGuid()}",
-            cameras.Count == 1 ? cameras[0].Name : $"{cameras.Count} cameras",
-            null,
-            null);
+        if (!TimeZoneInfo.TryConvertWindowsIdToIanaId(TimeZoneInfo.Local.Id, out var timezone))
+        {
+            ShowError("Timezone Unavailable", "Windows could not convert the local timezone to an IANA identifier.");
+            return;
+        }
+        var process = new BackendProcess();
+        var profileId = _selectedProfile.Id.ToString();
+        var hydration = await process.RunAsync(new
+        {
+            id = $"hydrate-{Guid.NewGuid()}",
+            command = "hydrate_credentials",
+            profile_id = profileId,
+            settings = _selectedProfile.Settings,
+        }, _ => { });
+        if (hydration.ExitCode != 0)
+        {
+            ShowError("Could Not Store Session Credentials", hydration.StandardError);
+            return;
+        }
+        NativeAutomation? created = null;
+        var speed = (SpeedCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "600x";
+        var completion = await process.RunAsync(new
+        {
+            id = $"automation-add-{Guid.NewGuid()}",
+            command = "automation_add",
+            automation_id = Guid.NewGuid().ToString(),
+            name,
+            profile_id = profileId,
+            cameras,
+            speed,
+            output_directory = outputDirectory,
+            timezone,
+        }, backendEvent => created = backendEvent.Automation ?? created);
+        if (completion.ExitCode != 0 || created is null)
+        {
+            ShowError("Could Not Add Daily Automation", completion.StandardError);
+            return;
+        }
         var job = new DownloadJob
         {
-            GroupNumber = group,
-            Camera = scheduleCamera,
-            OutputPath = outputDirectory,
+            GroupNumber = _nextGroupNumber++,
+            Camera = new CameraInfo(created.Id, created.Name, null, null),
+            OutputPath = created.OutputDirectory,
             RequestSettings = _selectedProfile.Settings,
             RequestStart = "",
             RequestEnd = "",
-            RequestSpeed = (SpeedCombo.SelectedItem as ComboBoxItem)?.Content?.ToString() ?? "600x",
+            RequestSpeed = created.Speed,
             IsDailySchedule = true,
+            AutomationId = created.Id,
+            AutomationProfileId = created.ProfileId,
+            AutomationCameras = created.Cameras,
             State = DownloadState.Scheduled,
         };
         DailyAutomationJobs.Add(job);
-        _dailySchedule = new DailySchedule
-        {
-            Cameras = cameras,
-            OutputDirectory = outputDirectory,
-            Settings = _selectedProfile.Settings,
-            Speed = job.RequestSpeed,
-            Job = job,
-        };
         UpdateDownloadsDisplay();
-        StatusText.Text = $"Scheduled daily timelapses for {cameras.Count} cameras";
+        StatusText.Text = $"Added Daily Automation {created.Name}";
         AppendLog("INFO", StatusText.Text);
-        RunDailyScheduleIfDue();
     }
 
-    private void RunDailyScheduleIfDue()
+    private async void StopDailySchedule(DownloadJob? target = null)
     {
-        var schedule = _dailySchedule;
-        if (schedule is null) return;
-        if (schedule.ActiveJobIds.Count > 0)
+        var job = target ?? DailyAutomationJobs.FirstOrDefault(item => !item.IsTerminal);
+        if (job?.AutomationId is null) return;
+        using var process = new BackendProcess();
+        var completion = await process.RunAsync(new
         {
-            if (schedule.ActiveJobIds.Any(id =>
-                    _downloadProcesses.ContainsKey(id)
-                    || DownloadJobs.FirstOrDefault(job => job.Id == id)?.State == DownloadState.Queued))
-                return;
-            var tracked = DownloadJobs.Where(job => schedule.ActiveJobIds.Contains(job.Id)).ToList();
-            var completed = tracked.Count == schedule.ActiveJobIds.Count
-                && tracked.All(job => job.State == DownloadState.Completed && IsValidExport(job.OutputPath));
-            if (completed) schedule.LastRunDay = schedule.ActiveDay;
-            schedule.ActiveDay = null;
-            schedule.ActiveJobIds.Clear();
-            if (!completed) return;
-        }
-        var today = DateTime.Today;
-        var day = schedule.LastRunDay?.AddDays(1) ?? today.AddDays(-1);
-        while (day < today)
+            id = $"automation-stop-{Guid.NewGuid()}",
+            command = "automation_stop",
+            automation_id = job.AutomationId,
+        }, _ => { });
+        if (completion.ExitCode != 0)
         {
-            var missing = schedule.Cameras
-                .Where(camera => !IsValidExport(ExpectedOutputPath(
-                    camera, day, day.AddDays(1), schedule.Speed, schedule.OutputDirectory, daily: true)))
-                .ToList();
-            if (missing.Count == 0)
-            {
-                schedule.LastRunDay = day;
-                day = day.AddDays(1);
-                continue;
-            }
-            var group = _nextGroupNumber++;
-            schedule.ActiveDay = day;
-            foreach (var camera in missing)
-            {
-                var job = StartDownload(
-                    camera,
-                    group,
-                    day,
-                    day.AddDays(1),
-                    schedule.Speed,
-                    schedule.OutputDirectory,
-                    daily: true,
-                    fullDay: true,
-                    requestSettings: schedule.Settings);
-                schedule.ActiveJobIds.Add(job.Id);
-            }
-            StatusText.Text = $"Started daily job {group} for {day:yyyy-MM-dd}";
-            AppendLog("INFO", StatusText.Text);
+            ShowError("Could Not Stop Daily Automation", completion.StandardError);
             return;
         }
-    }
-
-    private void StopDailySchedule()
-    {
-        var schedule = _dailySchedule;
-        if (schedule is null) return;
-        _dailySchedule = null;
-        schedule.Job.State = DownloadState.Stopped;
-        SetDailyToggle(false);
+        job.State = DownloadState.Stopped;
         UpdateDownloadsDisplay();
-        StatusText.Text = "Stopped daily automatic timelapses";
+        StatusText.Text = $"Stopped Daily Automation {job.Camera.Name}";
         AppendLog("INFO", StatusText.Text);
     }
 
-    private void SetDailyToggle(bool value)
+    private async void ResumeDailyAutomation(DownloadJob job)
     {
-        _updatingDailyToggle = true;
-        DailyAutomaticCheckBox.IsChecked = value;
-        _updatingDailyToggle = false;
+        if (job.AutomationId is null) return;
+        var profile = _profiles.FirstOrDefault(item => item.Id.ToString() == job.AutomationProfileId);
+        if (profile is null || !await HydrateProfileAsync(profile)) return;
+        using var process = new BackendProcess();
+        var completion = await process.RunAsync(new
+        {
+            id = $"automation-resume-{Guid.NewGuid()}",
+            command = "automation_resume",
+            automation_id = job.AutomationId,
+        }, _ => { });
+        if (completion.ExitCode != 0)
+        {
+            ShowError("Could Not Resume Daily Automation", completion.StandardError);
+            return;
+        }
+        job.State = DownloadState.Scheduled;
+        UpdateDownloadsDisplay();
+    }
+
+    private async void RemoveDailyAutomation(DownloadJob job)
+    {
+        if (job.AutomationId is null) return;
+        using var process = new BackendProcess();
+        var completion = await process.RunAsync(new
+        {
+            id = $"automation-remove-{Guid.NewGuid()}",
+            command = "automation_remove",
+            automation_id = job.AutomationId,
+        }, _ => { });
+        if (completion.ExitCode != 0)
+        {
+            ShowError("Could Not Remove Daily Automation", completion.StandardError);
+            return;
+        }
+        DailyAutomationJobs.Remove(job);
+        UpdateDownloadsDisplay();
+    }
+
+    private async void EditAutomation_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is not DownloadJob job || job.AutomationId is null) return;
+        if (_cameras.Count == 0) await LoadCamerasAsync(openSelection: false);
+        var selectedIds = job.AutomationCameras.Select(camera => camera.Id).ToHashSet();
+        var dialog = new DailyScheduleDialog(_cameras, job.OutputPath, job.Camera.Name, selectedIds) { Owner = this };
+        if (dialog.ShowDialog() != true || _selectedProfile is null) return;
+        using var process = new BackendProcess();
+        var completion = await process.RunAsync(new
+        {
+            id = $"automation-edit-{Guid.NewGuid()}",
+            command = "automation_edit",
+            automation_id = job.AutomationId,
+            name = dialog.AutomationName,
+            profile_id = _selectedProfile.Id.ToString(),
+            cameras = dialog.SelectedCameras,
+        }, _ => { });
+        if (completion.ExitCode != 0)
+        {
+            ShowError("Could Not Edit Daily Automation", completion.StandardError);
+            return;
+        }
+        job.Camera = new CameraInfo(job.AutomationId, dialog.AutomationName, null, null);
+        job.AutomationCameras = dialog.SelectedCameras;
+        job.NotifyAll();
+    }
+
+    private void RemoveAutomation_Click(object sender, RoutedEventArgs e)
+    {
+        if ((sender as FrameworkElement)?.DataContext is DownloadJob job) RemoveDailyAutomation(job);
     }
 
     private async void SelectCameras_Click(object sender, RoutedEventArgs e)
@@ -886,7 +982,9 @@ public partial class MainWindow : Window
         if ((sender as FrameworkElement)?.DataContext is not DownloadJob job) return;
         switch (job.State)
         {
-            case DownloadState.Scheduled: StopDailySchedule(); break;
+            case DownloadState.Scheduled: StopDailySchedule(job); break;
+            case DownloadState.Stopped when job.IsDailySchedule: ResumeDailyAutomation(job); break;
+            case DownloadState.Failed when job.IsDailySchedule: ResumeDailyAutomation(job); break;
             case DownloadState.Stopped: DeleteJob(job); break;
             case DownloadState.Completed: Reveal(job); break;
             case DownloadState.Cancelled or DownloadState.Failed: Restart(job); break;
@@ -896,7 +994,7 @@ public partial class MainWindow : Window
 
     private void Cancel(DownloadJob job)
     {
-        if (job.IsDailySchedule) { StopDailySchedule(); return; }
+        if (job.IsDailySchedule) { StopDailySchedule(job); return; }
         if (job.IsTerminal || job.State == DownloadState.Cancelling) return;
         if (job.State == DownloadState.Queued)
         {
@@ -938,14 +1036,19 @@ public partial class MainWindow : Window
 
     private void ClearAll_Click(object sender, RoutedEventArgs e)
     {
+        if (ShowingDailyAutomations)
+        {
+            var removable = DailyAutomationJobs.Where(job => job.IsTerminal).ToList();
+            foreach (var job in removable) RemoveDailyAutomation(job);
+            if (removable.Count > 0) StatusText.Text = $"Removing {removable.Count} Daily Automations";
+            return;
+        }
         var jobs = ShowingDailyAutomations ? DailyAutomationJobs : DownloadJobs;
         var deletedCount = 0;
         foreach (var job in jobs.Where(job => job.IsTerminal).ToList())
             if (DeleteJob(job, updateDisplay: false, showStatus: false)) deletedCount++;
         if (deletedCount > 0)
-            StatusText.Text = ShowingDailyAutomations
-                ? $"Deleted {deletedCount} stopped daily automations"
-                : $"Deleted {deletedCount} finished downloads";
+            StatusText.Text = $"Deleted {deletedCount} finished downloads";
         UpdateDownloadsDisplay();
     }
 
@@ -982,7 +1085,7 @@ public partial class MainWindow : Window
     {
         if (ShowingDailyAutomations)
         {
-            StopDailySchedule();
+            foreach (var job in DailyAutomationJobs.Where(item => !item.IsTerminal).ToList()) StopDailySchedule(job);
             return;
         }
         var cancellable = DownloadJobs.Where(job => !job.IsTerminal && job.State != DownloadState.Cancelling).ToList();
@@ -1046,7 +1149,7 @@ public partial class MainWindow : Window
         ClearAllButton.IsEnabled = visibleJobs.Any(job => job.IsTerminal);
         CancelAllButton.Content = ShowingDailyAutomations ? "Stop All" : "Cancel All";
         CancelAllButton.IsEnabled = ShowingDailyAutomations
-            ? _dailySchedule is not null
+            ? DailyAutomationJobs.Any(job => !job.IsTerminal)
             : DownloadJobs.Any(job => !job.IsTerminal && job.State != DownloadState.Cancelling);
         foreach (var job in DownloadJobs.Concat(DailyAutomationJobs)) job.NotifyAll();
     }
@@ -1066,7 +1169,7 @@ public partial class MainWindow : Window
     {
         if (_allowClose || (_cameraProcess is null && _downloadProcesses.Count == 0 && _thumbnailProcesses.Count == 0))
         {
-            _dailyTimer.Stop();
+            _ = BackendProcess.ShutdownAsync();
             _notificationIcon.Visible = false;
             _notificationIcon.Dispose();
             return;
@@ -1083,7 +1186,7 @@ public partial class MainWindow : Window
             return;
         }
         _allowClose = true;
-        _dailyTimer.Stop();
+        _ = BackendProcess.ShutdownAsync();
         _cameraProcess?.Cancel();
         foreach (var process in _downloadProcesses.Values.ToList()) process.Cancel();
         foreach (var process in _thumbnailProcesses.ToList()) process.Cancel();

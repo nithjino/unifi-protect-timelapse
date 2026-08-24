@@ -41,6 +41,8 @@ class Config:
     max_download_mib: int
     daily: bool = False
     full_day: bool = False
+    connection_kind: str | None = None
+    connection_value: str | None = None
 
 
 @dataclass(frozen=True)
@@ -181,6 +183,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         "--profile",
         metavar="NAME",
         help="load connection details from a named profile",
+    )
+    profile_group.add_argument(
+        "--dotenv",
+        type=Path,
+        help="load restart-safe connection details from an absolute .env path",
     )
     parser.add_argument(
         "--speed",
@@ -336,7 +343,13 @@ def _resolve_connection(
 
 def parse_args() -> Config | CreateProfile:
     """Load .env defaults and parse the command line."""
-    dotenv_path = Path.cwd() / ".env"
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--dotenv", type=Path)
+    pre_args, _ = pre_parser.parse_known_args()
+    dotenv_path = pre_args.dotenv or (Path.cwd() / ".env")
+    if pre_args.dotenv is not None and not pre_args.dotenv.expanduser().is_absolute():
+        pre_parser.error("--dotenv must use an absolute path")
+    dotenv_path = dotenv_path.expanduser().resolve(strict=False)
     load_dotenv(dotenv_path=dotenv_path, override=False)
     parser = _argument_parser()
     args = parser.parse_args()
@@ -345,6 +358,8 @@ def parse_args() -> Config | CreateProfile:
         return _create_profile_request(parser)
     if dotenv_path.is_file() and args.profile is not None:
         parser.error("--profile cannot be used while .env exists; remove or rename .env to use a named profile")
+    if args.dotenv is not None and not dotenv_path.is_file():
+        parser.error(f"--dotenv does not exist: {dotenv_path}")
 
     connection = _resolve_connection(
         parser,
@@ -359,6 +374,8 @@ def parse_args() -> Config | CreateProfile:
     start, end, full_day = _date_range(parser, args.start_date, args.end_date, daily=args.daily)
     if end <= start:
         parser.error("--end-date must be after --start-date")
+    if args.daily and args.profile is None and args.dotenv is None and not (Path.cwd() / ".env").is_file():
+        parser.error("--daily requires --profile NAME or --dotenv /absolute/path/.env")
 
     return Config(
         instance_url=connection.instance_url,
@@ -374,4 +391,10 @@ def parse_args() -> Config | CreateProfile:
         max_download_mib=args.max_download_mib,
         daily=args.daily,
         full_day=full_day,
+        connection_kind="python-profile" if args.profile is not None else "dotenv" if dotenv_path.is_file() else None,
+        connection_value=args.profile
+        if args.profile is not None
+        else str(dotenv_path)
+        if dotenv_path.is_file()
+        else None,
     )

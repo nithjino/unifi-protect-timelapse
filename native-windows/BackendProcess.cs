@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
 using System.Security.Cryptography;
@@ -10,10 +11,9 @@ public sealed record BackendCompletion(int ExitCode, bool WasCancelled, string S
 public sealed class BackendProcess : IDisposable
 {
     private const string EmbeddedBackendName = "TimeLapseNative.timelapse-backend.exe";
-    private static readonly TimeSpan CancellationGracePeriod = TimeSpan.FromSeconds(5);
-    private Process? _process;
+    private static readonly BackendSession SharedSession = new();
+    private string? _requestId;
     private bool _cancelRequested;
-    private string? _cancellationPath;
 
     public static string ExecutablePath()
     {
@@ -28,6 +28,32 @@ public sealed class BackendProcess : IDisposable
         return match ?? throw new FileNotFoundException(
             $"The bundled timelapse backend could not be found. Checked:{Environment.NewLine}{string.Join(Environment.NewLine, candidates)}");
     }
+
+    public async Task<BackendCompletion> RunAsync(
+        object request,
+        Action<BackendEvent> onEvent,
+        CancellationToken cancellationToken = default,
+        string? cancellationPath = null)
+    {
+        _ = cancellationPath;
+        _cancelRequested = false;
+        var serialized = JsonSerializer.Serialize(request);
+        using var document = JsonDocument.Parse(serialized);
+        _requestId = document.RootElement.GetProperty("id").GetString()
+            ?? throw new InvalidOperationException("Backend requests require a non-empty ID.");
+        using var registration = cancellationToken.Register(Cancel);
+        var completion = await SharedSession.SendAsync(serialized, _requestId, onEvent);
+        _requestId = null;
+        return completion with { WasCancelled = completion.WasCancelled || _cancelRequested };
+    }
+
+    public void Cancel()
+    {
+        _cancelRequested = true;
+        if (_requestId is not null) _ = SharedSession.CancelAsync(_requestId);
+    }
+
+    public static Task ShutdownAsync() => SharedSession.ShutdownAsync();
 
     private static string? ExtractEmbeddedBackend()
     {
@@ -79,99 +105,199 @@ public sealed class BackendProcess : IDisposable
         return Convert.ToHexString(SHA256.HashData(stream)).Equals(expectedHash, StringComparison.OrdinalIgnoreCase);
     }
 
-    public async Task<BackendCompletion> RunAsync(
-        object request,
-        Action<BackendEvent> onEvent,
-        CancellationToken cancellationToken = default,
-        string? cancellationPath = null)
-    {
-        _cancelRequested = false;
-        _cancellationPath = cancellationPath;
-        DeleteCancellationSentinel();
-        var startInfo = new ProcessStartInfo(ExecutablePath())
-        {
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        _process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
-        if (!_process.Start()) throw new InvalidOperationException("The timelapse backend could not be started.");
+    public void Dispose() => GC.SuppressFinalize(this);
+}
 
+internal sealed class BackendSession
+{
+    private sealed record Pending(Action<BackendEvent> OnEvent, TaskCompletionSource<BackendCompletion> Completion);
+
+    private readonly ConcurrentDictionary<string, Pending> _pending = new();
+    private readonly SemaphoreSlim _lifecycleLock = new(1, 1);
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ConcurrentDictionary<string, string> _hydrationRequests = new();
+    private Process? _process;
+    private StreamWriter? _input;
+    private string _standardError = "";
+    private DateTimeOffset _startedAt;
+    private int _recentCrashes;
+    private bool _shuttingDown;
+
+    public async Task<BackendCompletion> SendAsync(string serialized, string requestId, Action<BackendEvent> onEvent)
+    {
+        await EnsureStartedAsync();
+        using (var request = JsonDocument.Parse(serialized))
+        {
+            if (request.RootElement.TryGetProperty("command", out var command)
+                && command.GetString() == "hydrate_credentials"
+                && request.RootElement.TryGetProperty("profile_id", out var profileId)
+                && profileId.GetString() is { } value)
+                _hydrationRequests[value] = serialized;
+        }
+        var completion = new TaskCompletionSource<BackendCompletion>(TaskCreationOptions.RunContinuationsAsynchronously);
+        if (!_pending.TryAdd(requestId, new Pending(onEvent, completion)))
+            throw new InvalidOperationException($"The backend request ID is already active: {requestId}");
         try
         {
-            using var registration = cancellationToken.Register(Cancel);
-            await _process.StandardInput.WriteLineAsync(JsonSerializer.Serialize(request));
-            _process.StandardInput.Close();
-            var stderrTask = _process.StandardError.ReadToEndAsync();
-            string? line;
-            while ((line = await _process.StandardOutput.ReadLineAsync()) is not null)
+            await WriteAsync(serialized);
+        }
+        catch
+        {
+            _pending.TryRemove(requestId, out _);
+            throw;
+        }
+        return await completion.Task;
+    }
+
+    public async Task CancelAsync(string targetId)
+    {
+        if (_process is not { HasExited: false }) return;
+        var request = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["id"] = $"cancel-{Guid.NewGuid()}",
+            ["command"] = "cancel",
+            ["target_id"] = targetId,
+        });
+        await WriteAsync(request);
+    }
+
+    public async Task ShutdownAsync()
+    {
+        if (_process is not { HasExited: false }) return;
+        _shuttingDown = true;
+        var requestId = $"shutdown-{Guid.NewGuid()}";
+        var request = JsonSerializer.Serialize(new Dictionary<string, object>
+        {
+            ["id"] = requestId,
+            ["command"] = "shutdown",
+        });
+        await SendAsync(request, requestId, _ => { });
+    }
+
+    private async Task EnsureStartedAsync()
+    {
+        if (_process is { HasExited: false })
+        {
+            if (DateTimeOffset.UtcNow - _startedAt >= TimeSpan.FromMinutes(5)) _recentCrashes = 0;
+            return;
+        }
+        await _lifecycleLock.WaitAsync();
+        try
+        {
+            if (_process is { HasExited: false }) return;
+            var startInfo = new ProcessStartInfo(BackendProcess.ExecutablePath())
             {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                try
-                {
-                    var backendEvent = JsonSerializer.Deserialize<BackendEvent>(line);
-                    if (backendEvent is not null) onEvent(backendEvent);
-                }
-                catch (JsonException exception)
-                {
-                    onEvent(new BackendEvent { Event = "log", Level = "WARNING", Message = $"Invalid backend event: {exception.Message}" });
-                }
-            }
-            await _process.WaitForExitAsync();
-            return new BackendCompletion(_process.ExitCode, _cancelRequested, await stderrTask);
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardInput = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            var process = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
+            if (!process.Start()) throw new InvalidOperationException("The timelapse backend could not be started.");
+            _process = process;
+            _input = process.StandardInput;
+            _standardError = "";
+            _startedAt = DateTimeOffset.UtcNow;
+            _shuttingDown = false;
+            _ = ReadEventsAsync(process);
+            _ = ReadStandardErrorAsync(process);
+            process.Exited += (_, _) => ProcessExited(process);
+
+            var handshakeId = $"handshake-{Guid.NewGuid()}";
+            var handshakeCompletion = new TaskCompletionSource<BackendCompletion>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pending[handshakeId] = new Pending(_ => { }, handshakeCompletion);
+            var handshake = new Dictionary<string, object>
+            {
+                ["id"] = handshakeId,
+                ["command"] = "handshake",
+                ["protocol_version"] = 2,
+            };
+            if (_recentCrashes >= 2) handshake["recovery_mode"] = "quiescent";
+            await WriteAsync(JsonSerializer.Serialize(handshake));
+            var handshakeResult = await handshakeCompletion.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            if (handshakeResult.ExitCode != 0) throw new InvalidOperationException("Backend protocol version 2 was rejected.");
         }
         finally
         {
-            DeleteCancellationSentinel();
+            _lifecycleLock.Release();
         }
     }
 
-    public void Cancel()
+    private async Task WriteAsync(string serialized)
     {
-        _cancelRequested = true;
-        var process = _process;
-        if (process is not { HasExited: false }) return;
-        if (_cancellationPath is not null)
+        await _writeLock.WaitAsync();
+        try
         {
+            var input = _input ?? throw new InvalidOperationException("The backend session is not running.");
+            await input.WriteLineAsync(serialized);
+            await input.FlushAsync();
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task ReadEventsAsync(Process process)
+    {
+        string? line;
+        while ((line = await process.StandardOutput.ReadLineAsync()) is not null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            BackendEvent? backendEvent;
             try
             {
-                File.WriteAllText(_cancellationPath, "cancel");
-                _ = ForceKillAfterGracePeriodAsync(process);
-                return;
+                backendEvent = JsonSerializer.Deserialize<BackendEvent>(line);
             }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
+            catch (JsonException)
+            {
+                continue;
+            }
+            if (backendEvent?.Id is null || !_pending.TryGetValue(backendEvent.Id, out var pending)) continue;
+            pending.OnEvent(backendEvent);
+            if (backendEvent.Event is not ("complete" or "cancelled" or "error")) continue;
+            _pending.TryRemove(backendEvent.Id, out _);
+            pending.Completion.TrySetResult(new BackendCompletion(
+                backendEvent.Event == "error" ? 1 : 0,
+                backendEvent.Event == "cancelled",
+                _standardError));
         }
+    }
+
+    private async Task ReadStandardErrorAsync(Process process)
+    {
+        _standardError = (await process.StandardError.ReadToEndAsync()).Trim();
+    }
+
+    private void ProcessExited(Process process)
+    {
+        if (!ReferenceEquals(process, _process)) return;
+        _process = null;
+        _input = null;
+        _recentCrashes = DateTimeOffset.UtcNow - _startedAt < TimeSpan.FromMinutes(5) ? _recentCrashes + 1 : 0;
+        var completion = new BackendCompletion(process.ExitCode == 0 ? 1 : process.ExitCode, false, _standardError);
+        foreach (var (id, pending) in _pending.ToArray())
+        {
+            if (_pending.TryRemove(id, out _)) pending.Completion.TrySetResult(completion);
+        }
+        process.Dispose();
+        if (!_shuttingDown && _recentCrashes <= 2 && _hydrationRequests.Count > 0)
+            _ = RestartAfterCrashAsync();
+    }
+
+    private async Task RestartAfterCrashAsync()
+    {
+        await Task.Delay(TimeSpan.FromSeconds(1));
         try
         {
-            process.Kill(entireProcessTree: true);
+            await EnsureStartedAsync();
+            if (_recentCrashes < 2)
+                foreach (var hydration in _hydrationRequests.Values) await WriteAsync(hydration);
         }
-        catch (InvalidOperationException) { }
-    }
-
-    private static async Task ForceKillAfterGracePeriodAsync(Process process)
-    {
-        await Task.Delay(CancellationGracePeriod);
-        try
+        catch
         {
-            if (!process.HasExited) process.Kill(entireProcessTree: true);
+            // The next explicit request reports the unavailable supervisor.
         }
-        catch (InvalidOperationException) { }
-    }
-
-    private void DeleteCancellationSentinel()
-    {
-        if (_cancellationPath is null) return;
-        try { File.Delete(_cancellationPath); }
-        catch (IOException) { }
-        catch (UnauthorizedAccessException) { }
-    }
-
-    public void Dispose()
-    {
-        _process?.Dispose();
-        GC.SuppressFinalize(this);
     }
 }

@@ -6,7 +6,6 @@ import asyncio
 import json
 import logging
 import os
-import random
 import secrets
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -16,11 +15,24 @@ from pathlib import Path
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from timelapse import ProtectRateLimitError
+from timelapse.automation_registry import (
+    AutomationCamera,
+    AutomationRegistry,
+    ConnectionReference,
+    DailyAutomation,
+    RegistryError,
+)
 from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
+from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo
-from timelapse.schedule import daily_output_path
+from timelapse.schedule import (
+    DailyAutomationEngine,
+    ResolvedAutomation,
+    daily_output_path,
+    local_day_bounds,
+    seconds_until_next_local_day,
+)
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
 JobStatus = Literal["queued", "running", "completed", "failed", "cancelled", "skipped"]
@@ -291,20 +303,7 @@ class ExportJob:
             return None
 
 
-@dataclass
-class DailySchedule:
-    """A persistent daily export schedule."""
-
-    id: str
-    cameras: list[CameraInfo]
-    speed: str
-    created_at: datetime = field(default_factory=lambda: datetime.now().astimezone())
-    last_run_day: date | None = None
-    last_error: str | None = None
-    failure_count: int = 0
-    next_retry_at: datetime | None = None
-    paused: bool = False
-    task: asyncio.Task[None] | None = field(default=None, repr=False)
+DailySchedule = DailyAutomation
 
 
 class WebState:
@@ -321,7 +320,8 @@ class WebState:
         """Initialize state with overridable service operations for tests."""
         self.settings = settings
         self.jobs: dict[str, ExportJob] = {}
-        self.schedules: dict[str, DailySchedule] = {}
+        self.automations: dict[str, DailyAutomation] = {}
+        self.schedules = self.automations
         self.version = 0
         self._camera_loader = camera_loader
         self._thumbnail_loader = thumbnail_loader
@@ -330,6 +330,11 @@ class WebState:
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
         self._export_semaphore = asyncio.Semaphore(settings.web_max_active_exports)
+        self._coordinator = ExportJobCoordinator(
+            max_active=settings.web_max_active_exports,
+            max_queued=settings.web_max_queued_exports,
+            on_transition=self._coordinator_transition,
+        )
         self._download_terminal_condition = asyncio.Condition()
         self._download_terminal_generation = 0
         self._job_mutation_lock = asyncio.Lock()
@@ -339,6 +344,14 @@ class WebState:
         self._job_persist_lock = asyncio.Lock()
         self._schedule_state_file = settings.data_dir / "web-schedules.json"
         self._job_state_file = settings.data_dir / "web-jobs.json"
+        self._automation_registry = AutomationRegistry(settings.data_dir / "web-automations.json")
+        self._automation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._automation_engine = DailyAutomationEngine(
+            self._automation_registry,
+            self._coordinator,
+            resolve_connection=self._resolve_web_automation,
+            exporter=self._export_automation_job,
+        )
 
     async def start(self) -> None:
         """Prepare storage and resume persisted schedules."""
@@ -353,23 +366,39 @@ class WebState:
                 )
                 raise RuntimeError(message) from exc
         await self._load_jobs()
-        await self._load_schedules()
-        for schedule in self.schedules.values():
-            if not schedule.paused:
-                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
+        self._automation_registry.load()
+        if self._schedule_state_file.exists():
+            try:
+                self._automation_registry.migrate_web_v1(
+                    self._schedule_state_file,
+                    output_directory=self.settings.output_dir,
+                    timezone=self.settings.timezone_name,
+                )
+            except RegistryError as exc:
+                quarantined = self._schedule_state_file.with_name(
+                    f"{self._schedule_state_file.stem}.invalid-{secrets.token_hex(4)}{self._schedule_state_file.suffix}"
+                )
+                try:
+                    self._schedule_state_file.replace(quarantined)
+                except OSError:
+                    _LOGGER.exception("Could not quarantine invalid legacy Web schedule state")
+                else:
+                    _LOGGER.warning("Moved invalid legacy Web schedule state to %s: %s", quarantined, exc)
+        self.automations.clear()
+        self.automations.update(self._automation_registry.state.automations)
+        for automation in self.automations.values():
+            if automation.status == "active":
+                self._start_automation_task(automation.id)
 
     async def close(self) -> None:
         """Cancel background work during server shutdown."""
         tasks = [job.task for job in self.jobs.values() if job.task is not None and not job.task.done()]
-        tasks.extend(
-            schedule.task
-            for schedule in self.schedules.values()
-            if schedule.task is not None and not schedule.task.done()
-        )
+        tasks.extend(task for task in self._automation_tasks.values() if not task.done())
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._coordinator.close()
         await self._persist_jobs()
 
     async def cameras(self, *, refresh: bool = False) -> list[CameraInfo]:
@@ -512,7 +541,14 @@ class WebState:
                 message = "That export is no longer in the job list."
                 raise ValueError(message)
             if job.terminal:
-                await asyncio.to_thread(job.output.unlink, missing_ok=True)
+                if job.daily and job.id in self._automation_registry.state.jobs:
+                    record = self._automation_registry.state.jobs[job.id]
+                    if record.status not in {"completed", "failed", "cancelled"}:
+                        message = "That Daily Automation export is still being finalized. Try again shortly."
+                        raise ValueError(message)
+                    self._automation_registry.delete_artifact(job.id)
+                else:
+                    await asyncio.to_thread(job.output.unlink, missing_ok=True)
                 del self.jobs[job_id]
                 try:
                     await self._persist_jobs()
@@ -521,7 +557,9 @@ class WebState:
                     raise
                 self._changed()
                 return "removed"
-        if job.task is not None:
+        if job.daily:
+            await self._coordinator.cancel(job.id)
+        elif job.task is not None:
             job.task.cancel()
         return "cancelled"
 
@@ -542,8 +580,8 @@ class WebState:
             )
         )[0]
 
-    async def create_schedule(self, camera_ids: list[str], speed: str) -> DailySchedule:
-        """Persist and start a daily schedule for selected cameras."""
+    async def create_automation(self, name: str, camera_ids: list[str], speed: str) -> DailyAutomation:
+        """Persist and start a named Daily Automation."""
         cameras = await self.cameras()
         by_id = {camera.id: camera for camera in cameras}
         selected = [by_id[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in by_id]
@@ -553,221 +591,188 @@ class WebState:
         if speed not in SPEED_TO_FPS:
             message = "Choose a supported timelapse speed."
             raise ValueError(message)
-        schedule = DailySchedule(
-            id=secrets.token_urlsafe(9),
-            cameras=selected,
+        automation = self._automation_registry.add(
+            name=name,
+            cameras=tuple(AutomationCamera(camera.id, camera.name) for camera in selected),
+            connection=ConnectionReference("web-environment", "default"),
             speed=speed,
-            created_at=self.settings.now(),
+            output_directory=self.settings.output_dir,
+            timezone=self.settings.timezone_name,
+            now=self.settings.now(),
         )
         async with self._schedule_mutation_lock:
-            self.schedules[schedule.id] = schedule
-            try:
-                await self._persist_schedules()
-                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
-            except Exception:
-                self.schedules.pop(schedule.id, None)
-                await self._persist_schedules()
-                raise
+            self._sync_automations()
+            self._start_automation_task(automation.id)
             self._changed()
-            return schedule
+            return automation
+
+    async def create_schedule(self, camera_ids: list[str], speed: str) -> DailyAutomation:
+        """Create a generated-name automation for older in-process callers."""
+        base_name = "Web Daily Automation"
+        name = base_name
+        suffix = 2
+        while any(item.name.casefold() == name.casefold() for item in self.automations.values()):
+            name = f"{base_name} {suffix}"
+            suffix += 1
+        return await self.create_automation(name, camera_ids, speed)
+
+    async def stop_automation(self, automation_id: str) -> DailyAutomation:
+        """Stop future batches without removing the automation."""
+        async with self._schedule_mutation_lock:
+            automation = await self._automation_engine.stop(automation_id)
+            self._sync_automations()
+            self._changed()
+            return automation
+
+    async def remove_automation(self, automation_id: str) -> None:
+        """Remove an automation after its submitted batch drains."""
+        async with self._schedule_mutation_lock:
+            if automation_id not in self.automations:
+                message = "That Daily Automation no longer exists."
+                raise ValueError(message)
+            await self._automation_engine.remove(automation_id)
+            task = self._automation_tasks.pop(automation_id, None)
+            if task is not None:
+                task.cancel()
+            self._sync_automations()
+            self._changed()
 
     async def remove_schedule(self, schedule_id: str) -> None:
-        """Stop and remove a persistent daily schedule."""
-        async with self._schedule_mutation_lock:
-            schedule = self.schedules.pop(schedule_id, None)
-            if schedule is None:
-                message = "That daily schedule no longer exists."
-                raise ValueError(message)
-            try:
-                await self._persist_schedules()
-            except Exception:
-                self.schedules[schedule_id] = schedule
-                raise
-            if schedule.task is not None:
-                schedule.task.cancel()
-            self._changed()
+        """Compatibility wrapper for in-process callers renamed in version 2."""
+        await self.remove_automation(schedule_id)
 
-    async def retry_schedule(self, schedule_id: str) -> DailySchedule:
-        """Resume a paused daily schedule after operator intervention."""
+    async def resume_automation(self, automation_id: str) -> DailyAutomation:
+        """Resume a paused or stopped automation after operator intervention."""
         async with self._schedule_mutation_lock:
-            schedule = self.schedules.get(schedule_id)
-            if schedule is None:
-                message = "That daily schedule no longer exists."
-                raise ValueError(message)
-            if not schedule.paused:
-                message = "That daily schedule is already active."
-                raise ValueError(message)
-            previous = (schedule.failure_count, schedule.next_retry_at, schedule.paused, schedule.last_error)
-            schedule.failure_count = 0
-            schedule.next_retry_at = None
-            schedule.paused = False
-            schedule.last_error = None
-            try:
-                await self._persist_schedules()
-                schedule.task = asyncio.create_task(self._run_schedule(schedule), name=f"daily-{schedule.id}")
-            except Exception:
-                schedule.failure_count, schedule.next_retry_at, schedule.paused, schedule.last_error = previous
-                await self._persist_schedules()
-                raise
+            automation = await self._automation_engine.resume(automation_id)
+            self._sync_automations()
+            self._start_automation_task(automation.id)
             self._changed()
-            return schedule
+            return automation
+
+    async def retry_schedule(self, schedule_id: str) -> DailyAutomation:
+        """Compatibility wrapper for the version-2 Resume action."""
+        return await self.resume_automation(schedule_id)
 
     async def _run_job(self, job: ExportJob) -> None:
+        """Submit one persisted manual export to the runtime-wide coordinator."""
+        config = self.settings.config(
+            job.start,
+            job.end,
+            job.speed,
+            daily=job.daily,
+            full_day=job.full_day,
+        )
+
+        def report_progress(progress: DownloadProgress) -> None:
+            job.downloaded_bytes = progress.downloaded_bytes
+            job.total_bytes = progress.total_bytes
+            job.bytes_per_second = progress.bytes_per_second
+            job.elapsed_seconds = progress.elapsed_seconds
+            self._changed()
+
+        async def operation() -> None:
+            if job.output.exists():
+                message = "A file already exists for this camera and time range."
+                raise ValueError(message)
+            await self._exporter(config, job.camera, job.output, report_progress)
+
+        runtime_jobs = await self._coordinator.submit(
+            [
+                ExportJobSpec.create(
+                    output=job.output,
+                    operation=operation,
+                    job_id=job.id,
+                )
+            ]
+        )
+        runtime = runtime_jobs[0]
         try:
-            while True:
-                try:
-                    retry_generation = await self._run_job_attempt(job)
-                except asyncio.CancelledError:
-                    job.status = "cancelled"
-                    break
-                except Exception as exc:
-                    job.status = "failed"
-                    job.error = str(exc) or type(exc).__name__
-                    break
-
-                self._changed()
-                await self._persist_jobs()
-                if retry_generation is None:
-                    break
-                await self._wait_for_download_terminal(retry_generation)
-                job.downloaded_bytes = 0
-                job.total_bytes = None
-                job.bytes_per_second = 0
-                job.elapsed_seconds = 0
-
-            job.finished_at = self.settings.now()
-            self._changed()
-            await self._persist_jobs()
-            if job.status in {"completed", "cancelled"}:
-                await self._record_download_terminal()
+            await self._coordinator.wait(runtime_jobs)
         except asyncio.CancelledError:
-            job.status = "cancelled"
-            job.finished_at = self.settings.now()
-            self._changed()
-            await self._persist_jobs()
-            await self._record_download_terminal()
+            await self._coordinator.cancel(runtime.id)
+            raise
         finally:
             self._reserved_output_paths.discard(self._output_key(job.output))
 
-    async def _run_job_attempt(self, job: ExportJob) -> int | None:
-        """Run one export attempt and return the terminal generation to wait after a 429."""
-        async with self._export_semaphore:
-            job.status = "running"
-            job.error = None
-            job.started_at = self.settings.now()
-            job.finished_at = None
-            self._changed()
-            await self._persist_jobs()
-            if job.output.exists():
-                valid_existing_export = job.output.is_file() and job.output.stat().st_size > 0
-                job.status = "skipped" if job.daily and valid_existing_export else "failed"
-                job.error = "A file already exists for this camera and time range."
-                return None
+    async def _coordinator_transition(self, runtime: CoordinatorJob) -> None:
+        """Project coordinator state into the retained Web job history."""
+        job = self.jobs.get(runtime.id)
+        if job is None and runtime.spec.automation_id is not None:
+            record = self._automation_registry.state.jobs.get(runtime.id)
+            batch = self._automation_registry.state.batches.get(runtime.spec.batch_id or "")
+            automation = self._automation_registry.state.automations.get(runtime.spec.automation_id)
+            if record is not None and batch is not None and automation is not None:
+                start, end = local_day_bounds(batch.day, automation.timezone)
+                job = ExportJob(
+                    id=runtime.id,
+                    camera=CameraInfo(record.camera.id, record.camera.name, None, None),
+                    start=start,
+                    end=end,
+                    speed=automation.speed,
+                    output=Path(record.output),
+                    daily=True,
+                    full_day=True,
+                    created_at=record.created_at.astimezone(self.settings.timezone),
+                )
+                self.jobs[job.id] = job
+        if job is None:
+            return
+        projected_status = "queued" if runtime.status == "pending" else runtime.status
+        job.status = cast("JobStatus", projected_status)
+        job.started_at = runtime.started_at.astimezone(self.settings.timezone) if runtime.started_at else None
+        job.finished_at = runtime.finished_at.astimezone(self.settings.timezone) if runtime.finished_at else None
+        job.error = runtime.error
+        if runtime.status != "running":
+            job.bytes_per_second = 0
+        self._changed()
+        if runtime.terminal:
+            self._trim_jobs()
+        await self._persist_jobs()
 
-            config = self.settings.config(
-                job.start,
-                job.end,
-                job.speed,
-                daily=job.daily,
-                full_day=job.full_day,
-            )
-
-            def report_progress(progress: DownloadProgress) -> None:
-                job.downloaded_bytes = progress.downloaded_bytes
-                job.total_bytes = progress.total_bytes
-                job.bytes_per_second = progress.bytes_per_second
-                job.elapsed_seconds = progress.elapsed_seconds
-                self._changed()
-
-            try:
-                await self._exporter(config, job.camera, job.output, report_progress)
-            except ProtectRateLimitError as exc:
-                job.status = "queued"
-                job.error = f"{exc} Queued until another download completes or is cancelled."
-                job.bytes_per_second = 0
-                return self._download_terminal_generation
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                job.status = "failed"
-                job.error = str(exc) or type(exc).__name__
-            else:
-                job.status = "completed"
-            return None
-
-    async def _wait_for_download_terminal(self, generation: int) -> None:
-        """Wait until another download completes or is cancelled."""
-        async with self._download_terminal_condition:
-            await self._download_terminal_condition.wait_for(lambda: self._download_terminal_generation > generation)
-
-    async def _record_download_terminal(self) -> None:
-        """Wake one rate-limited job after a terminal download event."""
-        async with self._download_terminal_condition:
-            self._download_terminal_generation += 1
-            self._download_terminal_condition.notify(1)
-
-    async def _run_schedule(self, schedule: DailySchedule) -> None:
+    async def _run_automation(self, automation_id: str) -> None:
+        """Project shared-engine transitions into Web state notifications."""
         try:
-            while schedule.id in self.schedules and not schedule.paused:
-                latest_day = self.settings.now().date() - timedelta(days=1)
-                day = schedule.last_run_day + timedelta(days=1) if schedule.last_run_day else latest_day
-                while day <= latest_day and schedule.id in self.schedules:
-                    start, end = self.settings.day_bounds(day)
-                    try:
-                        jobs = await self.create_jobs(
-                            [camera.id for camera in schedule.cameras],
-                            start,
-                            end,
-                            schedule.speed,
-                            daily=True,
-                        )
-                        tasks = [job.task for job in jobs if job.task is not None]
-                        await asyncio.gather(*tasks)
-                    except Exception as exc:
-                        delay = await self._record_schedule_failure(schedule, str(exc) or type(exc).__name__)
-                        if delay is None:
-                            return
-                        await asyncio.sleep(delay)
-                        continue
-                    failed_jobs = [job for job in jobs if job.status in {"failed", "cancelled"}]
-                    if failed_jobs:
-                        error = f"{len(failed_jobs)} daily export(s) failed."
-                        delay = await self._record_schedule_failure(schedule, error)
-                        if delay is None:
-                            return
-                        await asyncio.sleep(delay)
-                        continue
-                    schedule.last_error = None
-                    schedule.failure_count = 0
-                    schedule.next_retry_at = None
-                    schedule.last_run_day = day
-                    await self._persist_schedules()
-                    self._changed()
-                    day += timedelta(days=1)
-                now = self.settings.now()
-                next_midnight = self.settings.day_bounds(now.date())[1]
-                await asyncio.sleep(max(next_midnight.timestamp() - now.timestamp(), 1.0))
+            while True:
+                result = await self._automation_engine.run_due_once(automation_id)
+                self._sync_automations()
+                self._changed()
+                if automation_id not in self._automation_registry.state.automations:
+                    return
+                if result is not None:
+                    continue
+                automation = self._automation_registry.resolve(automation_id)
+                delay = (
+                    seconds_until_next_local_day(self.settings.now(), automation.timezone)
+                    if automation.status == "active"
+                    else 60.0
+                )
+                await asyncio.sleep(delay)
         except asyncio.CancelledError:
             return
+        finally:
+            self._sync_automations()
+            self._changed()
 
-    async def _record_schedule_failure(self, schedule: DailySchedule, error: str) -> float | None:
-        schedule.failure_count += 1
-        if schedule.failure_count >= SCHEDULE_RETRY_MAX_FAILURES:
-            schedule.paused = True
-            schedule.next_retry_at = None
-            schedule.last_error = f"{error} Paused after {schedule.failure_count} failed attempts."
-            delay = None
-        else:
-            base_delay = min(
-                SCHEDULE_RETRY_INITIAL_SECONDS * 2 ** (schedule.failure_count - 1),
-                SCHEDULE_RETRY_MAX_SECONDS,
+    async def _resolve_web_automation(self, _automation: DailyAutomation) -> ResolvedAutomation:
+        now = self.settings.now()
+        config = self.settings.config(now, now + timedelta(seconds=1), "600x", daily=True)
+        return ResolvedAutomation(config, tuple(await self.cameras(refresh=True)))
+
+    async def _export_automation_job(self, config: Config, camera: CameraInfo, output: Path) -> None:
+        await self._exporter(config, camera, output, None)
+
+    def _start_automation_task(self, automation_id: str) -> None:
+        task = self._automation_tasks.get(automation_id)
+        if task is None or task.done():
+            self._automation_tasks[automation_id] = asyncio.create_task(
+                self._run_automation(automation_id),
+                name=f"daily-automation-{automation_id}",
             )
-            delay = base_delay + random.uniform(0, base_delay * 0.2)  # noqa: S311 - retry jitter is not security-sensitive
-            schedule.next_retry_at = self.settings.now() + timedelta(seconds=delay)
-            schedule.last_error = error
-        await self._persist_schedules()
-        self._changed()
-        return delay
+
+    def _sync_automations(self) -> None:
+        self.automations.clear()
+        self.automations.update(self._automation_registry.state.automations)
 
     async def _ensure_export_capacity(self, requested_jobs: int) -> None:
         active_jobs = sum(not job.terminal for job in self.jobs.values())
@@ -954,164 +959,6 @@ class WebState:
                 await self._write_state_safely(self._job_state_file, serialized)
             except Exception:
                 _LOGGER.exception("Failed to persist web export state to %s", self._job_state_file)
-                raise
-
-    def _stored_schedule(self, item: dict[object, object]) -> DailySchedule:
-        schedule_id = item.get("id")
-        speed = item.get("speed")
-        camera_payload = item.get("cameras")
-        if not isinstance(schedule_id, str) or not schedule_id:
-            message = "stored schedule requires a non-empty ID"
-            raise ValueError(message)
-        if not isinstance(speed, str) or speed not in SPEED_TO_FPS:
-            message = "stored schedule speed is invalid"
-            raise ValueError(message)
-        if not isinstance(camera_payload, list) or not camera_payload:
-            message = "stored schedule requires at least one camera"
-            raise ValueError(message)
-        cameras: list[CameraInfo] = []
-        for payload in camera_payload:
-            if not isinstance(payload, dict):
-                message = "stored schedule camera must be an object"
-                raise TypeError(message)
-            camera_id = payload.get("id")
-            camera_name = payload.get("name")
-            if not isinstance(camera_id, str) or not camera_id or not isinstance(camera_name, str) or not camera_name:
-                message = "stored schedule camera requires an ID and name"
-                raise ValueError(message)
-            state = payload.get("state")
-            model = payload.get("model")
-            if state is not None and not isinstance(state, str):
-                message = "stored schedule camera state must be text"
-                raise TypeError(message)
-            if model is not None and not isinstance(model, str):
-                message = "stored schedule camera model must be text"
-                raise TypeError(message)
-            cameras.append(CameraInfo(id=camera_id, name=camera_name, state=state, model=model))
-
-        created_at = _stored_datetime(item.get("created_at"), required=True)
-        if created_at is None:
-            message = "stored schedule creation time is invalid"
-            raise ValueError(message)
-        last_run_value = item.get("last_run_day")
-        if last_run_value is not None and not isinstance(last_run_value, str):
-            message = "stored schedule last-run day must be text"
-            raise TypeError(message)
-        last_run = date.fromisoformat(last_run_value) if last_run_value else None
-        last_error = item.get("last_error")
-        if last_error is not None and not isinstance(last_error, str):
-            message = "stored schedule error must be text"
-            raise TypeError(message)
-        paused = item.get("paused", False)
-        if not isinstance(paused, bool):
-            message = "stored schedule paused flag must be a boolean"
-            raise TypeError(message)
-        return DailySchedule(
-            id=schedule_id,
-            cameras=cameras,
-            speed=speed,
-            created_at=created_at,
-            last_run_day=last_run,
-            last_error=last_error,
-            failure_count=_stored_nonnegative_integer(item.get("failure_count")),
-            next_retry_at=_stored_datetime(item.get("next_retry_at")),
-            paused=paused,
-        )
-
-    async def _load_schedules(self) -> None:
-        if not self._schedule_state_file.exists():
-            return
-        try:
-            raw = await asyncio.to_thread(self._schedule_state_file.read_text, encoding="utf-8")
-            payload = json.loads(raw)
-        except OSError:
-            _LOGGER.exception("Failed to read web schedule state from %s", self._schedule_state_file)
-            return
-        except json.JSONDecodeError as exc:
-            await self._quarantine_schedule_state(exc)
-            return
-        try:
-            version, restored = self._restore_schedules(payload)
-        except (KeyError, TypeError, ValueError) as exc:
-            await self._quarantine_schedule_state(exc)
-            return
-        self.schedules = restored
-        if version == 0:
-            await self._persist_schedules()
-
-    def _restore_schedules(self, payload: object) -> tuple[int, dict[str, DailySchedule]]:
-        if not isinstance(payload, dict):
-            message = "schedule state root must be an object"
-            raise TypeError(message)
-        version = payload.get("version", 0)
-        if isinstance(version, bool) or not isinstance(version, int) or version not in {0, SCHEDULE_STATE_VERSION}:
-            message = f"unsupported schedule state version: {version!r}"
-            raise ValueError(message)
-        items = payload.get("schedules")
-        if not isinstance(items, list):
-            message = "schedule state must contain a schedules list"
-            raise TypeError(message)
-        restored: dict[str, DailySchedule] = {}
-        for item in items:
-            if not isinstance(item, dict):
-                message = "stored schedule must be an object"
-                raise TypeError(message)
-            schedule = self._stored_schedule(item)
-            if schedule.id in restored:
-                message = f"duplicate stored schedule ID: {schedule.id}"
-                raise ValueError(message)
-            restored[schedule.id] = schedule
-        return version, restored
-
-    async def _quarantine_schedule_state(self, error: Exception) -> None:
-        quarantined = self._schedule_state_file.with_name(
-            f"{self._schedule_state_file.stem}.invalid-{secrets.token_hex(4)}{self._schedule_state_file.suffix}"
-        )
-        try:
-            await asyncio.to_thread(self._schedule_state_file.replace, quarantined)
-        except OSError:
-            _LOGGER.exception(
-                "Invalid web schedule state in %s could not be quarantined: %s",
-                self._schedule_state_file,
-                error,
-            )
-            return
-        _LOGGER.warning(
-            "Moved invalid web schedule state from %s to %s: %s", self._schedule_state_file, quarantined, error
-        )
-
-    async def _persist_schedules(self) -> None:
-        payload = {
-            "version": SCHEDULE_STATE_VERSION,
-            "schedules": [
-                {
-                    "id": schedule.id,
-                    "cameras": [
-                        {
-                            "id": camera.id,
-                            "name": camera.name,
-                            "state": camera.state,
-                            "model": camera.model,
-                        }
-                        for camera in schedule.cameras
-                    ],
-                    "speed": schedule.speed,
-                    "created_at": schedule.created_at.isoformat(),
-                    "last_run_day": schedule.last_run_day.isoformat() if schedule.last_run_day else None,
-                    "last_error": schedule.last_error,
-                    "failure_count": schedule.failure_count,
-                    "next_retry_at": schedule.next_retry_at.isoformat() if schedule.next_retry_at else None,
-                    "paused": schedule.paused,
-                }
-                for schedule in self.schedules.values()
-            ],
-        }
-        serialized = json.dumps(payload, indent=2, sort_keys=True)
-        async with self._schedule_persist_lock:
-            try:
-                await self._write_state_safely(self._schedule_state_file, serialized)
-            except Exception:
-                _LOGGER.exception("Failed to persist web schedule state to %s", self._schedule_state_file)
                 raise
 
     async def _write_state_safely(self, state_file: Path, serialized: str) -> None:

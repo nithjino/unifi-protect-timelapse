@@ -15,11 +15,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from timelapse import OperationTimeoutError, TimelapseError, __version__
+from timelapse.automation_registry import AutomationCamera, ConnectionReference
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
 from timelapse.web import APP_CSS_VERSION, create_app, main
-from timelapse.web_state import DailySchedule, ExportJob, WebCapacityError, WebSettings, WebState
+from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -125,7 +126,7 @@ def test_dashboard_and_local_assets_render(tmp_path: Path) -> None:
     assert '<h3 id="timelapse-speed-title">Timelapse Speed</h3>' in response.text
     assert response.text.index('name="speed" value="1x"') < response.text.index('name="speed" value="60x"')
     assert '<h2 id="exports-title">Export Activity</h2>' in response.text
-    assert '<h2 id="schedules-title">Daily Automations</h2>' in response.text
+    assert '<h2 id="automations-title">Daily Automations</h2>' in response.text
     assert "Set the pace" not in response.text
     assert "timezone-chip" not in response.text
     assert "<h3>Camera Preview</h3>" in response.text
@@ -710,21 +711,24 @@ def test_server_status_reports_host_storage_and_low_capacity(
     assert f"{free_bytes} B free of 1000 B ({expected_percent}% available)" in " ".join(status.text.split())
 
 
-def test_daily_schedule_is_persisted(tmp_path: Path) -> None:
+def test_daily_automation_is_persisted_without_credentials(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
 
     async def exercise() -> None:
         await state.start()
-        schedule = await state.create_schedule(["camera-1"], "600x")
-        assert schedule.id in state.schedules
+        automation = await state.create_automation("Front Door", ["camera-1"], "600x")
+        assert automation.id in state.automations
         await state.close()
 
     asyncio.run(exercise())
 
-    payload = json.loads((settings.data_dir / "web-schedules.json").read_text(encoding="utf-8"))
-    assert payload["schedules"][0]["cameras"][0]["id"] == "camera-1"
-    assert payload["schedules"][0]["speed"] == "600x"
+    registry_path = settings.data_dir / "web-automations.json"
+    payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert payload["automations"][0]["cameras"][0]["id"] == "camera-1"
+    assert payload["automations"][0]["connection"] == {"kind": "web-environment", "value": "default"}
+    assert settings.token not in registry_path.read_text(encoding="utf-8")
 
 
 def test_export_list_is_restored_after_restart(tmp_path: Path) -> None:
@@ -968,23 +972,23 @@ def test_web_state_fails_fast_when_storage_is_not_writable(
         asyncio.run(state.start())
 
 
-def test_schedule_persistence_failure_rolls_back_without_starting_task(
+def test_automation_persistence_failure_rolls_back_without_starting_task(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     state = WebState(_settings(tmp_path), camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
-    persist = AsyncMock(side_effect=[OSError("disk full"), None])
-    monkeypatch.setattr(state, "_persist_schedules", persist)
 
     async def exercise() -> None:
         await state.start()
+        monkeypatch.setattr(state._automation_registry, "persist", lambda: (_ for _ in ()).throw(OSError("disk full")))
         with pytest.raises(OSError, match="disk full"):
-            await state.create_schedule(["camera-1"], "600x")
+            await state.create_automation("Front Door", ["camera-1"], "600x")
+        await state.close()
 
     asyncio.run(exercise())
 
-    assert not state.schedules
-    assert persist.await_count == 2
+    assert not state.automations
+    assert not state._automation_tasks
 
 
 @pytest.mark.parametrize("payload", [[], {"version": 1, "schedules": ["invalid"]}])
@@ -1006,7 +1010,7 @@ def test_invalid_schedule_state_is_quarantined_without_blocking_startup(tmp_path
     assert len(list(settings.data_dir.glob("web-schedules.invalid-*.json"))) == 1
 
 
-def test_legacy_schedule_state_is_migrated_to_versioned_schema(tmp_path: Path) -> None:
+def test_legacy_schedule_state_is_migrated_to_common_registry(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     settings.data_dir.mkdir(parents=True)
     state_file = settings.data_dir / "web-schedules.json"
@@ -1031,62 +1035,88 @@ def test_legacy_schedule_state_is_migrated_to_versioned_schema(tmp_path: Path) -
 
     async def exercise() -> None:
         await state.start()
-        assert state.schedules["legacy-schedule"].paused is True
+        assert len(state.automations) == 1
+        assert next(iter(state.automations.values())).paused is True
         await state.close()
 
     asyncio.run(exercise())
 
-    assert json.loads(state_file.read_text(encoding="utf-8"))["version"] == 1
+    assert not state_file.exists()
+    assert state_file.with_name(f"{state_file.name}.v1-backup").exists()
+    assert json.loads((settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))["version"] == 2
 
 
-def test_daily_schedule_pauses_after_bounded_backoff_and_can_be_resumed(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_web_automation_can_be_stopped_and_resumed(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
-    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    schedule = DailySchedule(id="schedule-1", cameras=[camera], speed="600x")
-    monkeypatch.setattr("timelapse.web_state.random.uniform", lambda _start, _end: 0.0)
 
     async def exercise() -> None:
         await state.start()
-        state.schedules[schedule.id] = schedule
-        delays = [await state._record_schedule_failure(schedule, "Protect unavailable") for _attempt in range(5)]
-        assert delays == [60.0, 120.0, 240.0, 480.0, None]
-        assert schedule.paused is True
-        assert schedule.failure_count == 5
-        assert schedule.next_retry_at is None
-        resumed = await state.retry_schedule(schedule.id)
-        assert resumed.paused is False
-        assert resumed.failure_count == 0
-        assert resumed.last_error is None
-        assert resumed.task is not None
-        resumed.task.cancel()
-        await asyncio.gather(resumed.task, return_exceptions=True)
+        automation = await state.create_automation("Front Door", ["camera-1"], "600x")
+        stopped = await state.stop_automation(automation.id)
+        assert stopped.status == "stopped"
+        resumed = await state.resume_automation(automation.id)
+        assert resumed.status == "active"
+        assert resumed.consecutive_failures == 0
         await state.close()
 
     asyncio.run(exercise())
 
-    stored = json.loads((settings.data_dir / "web-schedules.json").read_text(encoding="utf-8"))
-    assert stored["schedules"][0]["paused"] is False
+    stored = json.loads((settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))
+    assert stored["automations"][0]["status"] == "active"
 
 
-def test_paused_schedule_is_visible_as_needing_attention(tmp_path: Path) -> None:
+def test_daily_artifact_is_projected_and_deleted_through_the_registry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+
+    async def export_daily(_config: Config, _camera: CameraInfo, output: Path, _progress: object) -> None:
+        output.write_bytes(b"\0\0\0\x18ftypisom")  # noqa: ASYNC240 - synchronous test double
+
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export_daily)
+
+    async def exercise() -> None:
+        await state.start()
+        automation = await state.create_automation("Front Door", ["camera-1"], "600x")
+        for _ in range(100):
+            daily_jobs = [job for job in state.jobs.values() if job.daily and job.terminal]
+            if daily_jobs:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("Daily Automation artifact did not reach terminal Web history")
+        job = daily_jobs[0]
+        assert job.status == "completed"
+        assert job.output.exists()
+        processed_day = state.automations[automation.id].last_run_day
+
+        assert await state.cancel_or_remove_job(job.id) == "removed"
+        assert not job.output.exists()
+        assert job.id not in state._automation_registry.state.jobs
+        assert state.automations[automation.id].last_run_day == processed_day
+        await state.close()
+
+    asyncio.run(exercise())
+
+
+def test_paused_automation_is_visible_as_needing_attention(tmp_path: Path) -> None:
     app, state = _app(tmp_path)
-    state.schedules["schedule-1"] = DailySchedule(
-        id="schedule-1",
-        cameras=[CameraInfo(id="camera-1", name="Front Door", state=None, model=None)],
+    state.settings.data_dir.mkdir(parents=True)
+    state.settings.output_dir.mkdir(parents=True)
+    state._automation_registry.load()
+    automation = state._automation_registry.add(
+        name="Front Door",
+        cameras=(AutomationCamera("camera-1", "Front Door"),),
+        connection=ConnectionReference("web-environment", "default"),
         speed="600x",
-        last_error="Protect unavailable. Paused after 5 failed attempts.",
-        failure_count=5,
-        paused=True,
+        output_directory=state.settings.output_dir,
+        timezone="UTC",
     )
+    state._automation_registry.pause(automation.id, "Protect unavailable. Paused after 5 failed attempts.")
 
     with _client(app) as client:
-        response = client.get("/partials/schedules")
+        response = client.get("/partials/automations")
 
     assert response.status_code == 200
     assert "Needs Attention" in response.text
-    assert ">Retry</button>" in response.text
+    assert ">Resume</button>" in response.text
     assert "Paused after 5 failed attempts" in response.text

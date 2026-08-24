@@ -10,7 +10,7 @@ import random
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path  # noqa: TC003 - constructs the module-level session directory
 from typing import TYPE_CHECKING, BinaryIO
@@ -371,9 +371,11 @@ def rate_limit_error(retry_after: float | None) -> ProtectRateLimitError:
         if retry_after is not None and retry_after > 0
         else " Let the console's authentication rate-limit window clear before trying again."
     )
+    retry_not_before = datetime.now(UTC) + timedelta(seconds=retry_after) if retry_after is not None else None
     return ProtectRateLimitError(
         "UniFi Protect returned HTTP 429 after bounded retries."
-        f"{wait} TimeLapse will reuse the saved session; do not rotate accounts or start repeated copies."
+        f"{wait} TimeLapse will reuse the saved session; do not rotate accounts or start repeated copies.",
+        retry_not_before=retry_not_before,
     )
 
 

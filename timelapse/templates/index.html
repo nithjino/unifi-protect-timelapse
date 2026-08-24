@@ -198,6 +198,10 @@
               </div>
 
               <div class="form-actions">
+                <label class="field automation-name-field" for="automation-name">
+                  <span>Automation Name</span>
+                  <input id="automation-name" name="automation_name" type="text" maxlength="120" placeholder="Front doors" />
+                </label>
                 <button
                   class="primary-button"
                   type="button"
@@ -213,12 +217,12 @@
                 <button
                   class="secondary-button"
                   type="button"
-                  hx-post="/actions/schedules"
+                  hx-post="/actions/automations"
                   hx-include="closest form"
                   hx-target="#notifications"
                   hx-swap="innerHTML"
                   hx-disabled-elt="this"
-                >Enable Daily Exports</button>
+                >Create Daily Automation</button>
               </div>
             </form>
           </section>
@@ -241,19 +245,19 @@
               </div>
             </section>
 
-            <section class="panel" aria-labelledby="schedules-title">
+            <section class="panel" aria-labelledby="automations-title">
               <div class="panel-heading">
                 <div>
-                  <h2 id="schedules-title">Daily Automations</h2>
+                  <h2 id="automations-title">Daily Automations</h2>
                 </div>
               </div>
               <div
-                id="schedules-list"
-                hx-get="/partials/schedules"
+                id="automations-list"
+                hx-get="/partials/automations"
                 hx-trigger="load, stateChanged from:body, every 30s"
                 hx-swap="innerHTML"
               >
-                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Schedules…</div>
+                <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Daily Automations…</div>
               </div>
             </section>
           </div>

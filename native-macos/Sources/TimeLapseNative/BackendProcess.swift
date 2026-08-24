@@ -32,8 +32,9 @@ final class BackendProcess: @unchecked Sendable {
     typealias EventHandler = @MainActor @Sendable (BackendEvent) -> Void
     typealias CompletionHandler = @MainActor @Sendable (BackendCompletion) -> Void
 
+    private static let session = BackendSession()
     private let lock = NSLock()
-    private var process: Process?
+    private var requestID: String?
     private var cancelRequested = false
 
     static func executableURL(fileManager: FileManager = .default, bundle: Bundle = .main) throws -> URL {
@@ -62,111 +63,221 @@ final class BackendProcess: @unchecked Sendable {
     ) throws {
         let requestData: Data
         do {
-            requestData = try JSONEncoder().encode(request) + Data([0x0A])
+            requestData = try JSONEncoder().encode(request)
         } catch {
             throw BackendProcessError.couldNotEncodeRequest(error)
         }
-
-        let executableURL = try Self.executableURL()
-        let process = Process()
-        let input = Pipe()
-        let output = Pipe()
-        let errorOutput = Pipe()
-        process.executableURL = executableURL
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errorOutput
-
+        let identifier: String
+        do {
+            guard
+                let payload = try JSONSerialization.jsonObject(with: requestData) as? [String: Any],
+                let value = payload["id"] as? String,
+                !value.isEmpty
+            else {
+                throw CocoaError(.propertyListReadCorrupt)
+            }
+            identifier = value
+        } catch {
+            throw BackendProcessError.couldNotEncodeRequest(error)
+        }
         lock.withLock {
+            requestID = identifier
             cancelRequested = false
-            self.process = process
         }
-        do {
-            try process.run()
-        } catch {
-            lock.withLock { self.process = nil }
-            throw BackendProcessError.couldNotLaunch(error)
-        }
-
-        do {
-            try input.fileHandleForWriting.write(contentsOf: requestData)
-            try input.fileHandleForWriting.close()
-        } catch {
-            let writeError = error
-            try? input.fileHandleForWriting.close()
-            if process.isRunning {
-                kill(process.processIdentifier, SIGKILL)
-                process.waitUntilExit()
-            }
-            lock.withLock { self.process = nil }
-            throw BackendProcessError.couldNotWriteRequest(writeError)
-        }
-
-        let group = DispatchGroup()
-        let stderrBox = LockedBox("")
-
-        group.enter()
-        DispatchQueue.global(qos: .userInitiated).async {
-            defer { group.leave() }
-            Self.readEvents(from: output.fileHandleForReading, onEvent: onEvent)
-        }
-
-        group.enter()
-        DispatchQueue.global(qos: .utility).async {
-            defer { group.leave() }
-            let data = errorOutput.fileHandleForReading.readDataToEndOfFile()
-            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-            stderrBox.set(text)
-            if !text.isEmpty {
-                let event = BackendEvent(
-                    id: nil,
-                    event: "log",
-                    code: nil,
-                    level: "ERROR",
-                    message: text,
-                    cameras: nil,
-                    downloadedBytes: nil,
-                    totalBytes: nil,
-                    bytesPerSecond: nil,
-                    elapsedSeconds: nil,
-                    output: nil,
-                    thumbnailBase64: nil,
-                    thumbnailSource: nil
+        try Self.session.send(
+            requestData,
+            requestID: identifier,
+            onEvent: onEvent
+        ) { [weak self] completion in
+            let wasCancelled = self?.lock.withLock { self?.cancelRequested ?? false } ?? false
+            self?.lock.withLock { self?.requestID = nil }
+            onCompletion(
+                BackendCompletion(
+                    exitCode: completion.exitCode,
+                    wasCancelled: wasCancelled || completion.wasCancelled,
+                    stderr: completion.stderr
                 )
-                DispatchQueue.main.async { onEvent(event) }
-            }
-        }
-
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            process.waitUntilExit()
-            group.wait()
-            let cancelled = self?.lock.withLock { self?.cancelRequested ?? false } ?? false
-            self?.lock.withLock { self?.process = nil }
-            let completion = BackendCompletion(
-                exitCode: process.terminationStatus,
-                wasCancelled: cancelled,
-                stderr: stderrBox.get()
             )
-            DispatchQueue.main.async { onCompletion(completion) }
         }
     }
 
     func cancel() {
-        let runningProcess: Process? = lock.withLock {
+        let identifier = lock.withLock { () -> String? in
             cancelRequested = true
-            return process
+            return requestID
         }
-        guard let runningProcess, runningProcess.isRunning else { return }
-        runningProcess.terminate()
-        let processIdentifier = runningProcess.processIdentifier
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3) {
-            if runningProcess.isRunning {
-                kill(processIdentifier, SIGKILL)
-            }
+        guard let identifier else { return }
+        Self.session.cancel(requestID: identifier)
+    }
+
+    static func shutdown(completion: @escaping @MainActor @Sendable () -> Void) {
+        session.shutdown(completion: completion)
+    }
+}
+
+private final class BackendSession: @unchecked Sendable {
+    private struct Pending: Sendable {
+        let onEvent: BackendProcess.EventHandler
+        let onCompletion: BackendProcess.CompletionHandler
+    }
+
+    private let stateLock = NSLock()
+    private let writeLock = NSLock()
+    private var process: Process?
+    private var input: FileHandle?
+    private var pending: [String: Pending] = [:]
+    private var stderr = ""
+    private var lastStartedAt = Date.distantPast
+    private var recentCrashCount = 0
+    private var hydrationRequests: [String: Data] = [:]
+    private var shuttingDown = false
+    private var handshakeWaiters: [String: DispatchSemaphore] = [:]
+    private var failedHandshakes: Set<String> = []
+
+    func send(
+        _ requestData: Data,
+        requestID: String,
+        onEvent: @escaping BackendProcess.EventHandler,
+        onCompletion: @escaping BackendProcess.CompletionHandler
+    ) throws {
+        try ensureStarted()
+        if
+            let payload = try? JSONSerialization.jsonObject(with: requestData) as? [String: Any],
+            payload["command"] as? String == "hydrate_credentials",
+            let profileID = payload["profile_id"] as? String
+        {
+            stateLock.withLock { hydrationRequests[profileID] = requestData }
+        }
+        let entry = Pending(onEvent: onEvent, onCompletion: onCompletion)
+        let duplicate = stateLock.withLock { () -> Bool in
+            if pending[requestID] != nil { return true }
+            pending[requestID] = entry
+            return false
+        }
+        if duplicate {
+            let message = "The backend request ID is already active: \(requestID)"
+            throw BackendProcessError.couldNotWriteRequest(CocoaError(.fileWriteFileExists, userInfo: [NSLocalizedDescriptionKey: message]))
+        }
+        do {
+            try write(requestData + Data([0x0A]))
+        } catch {
+            _ = stateLock.withLock { pending.removeValue(forKey: requestID) }
+            throw BackendProcessError.couldNotWriteRequest(error)
         }
     }
 
-    private static func readEvents(from handle: FileHandle, onEvent: @escaping EventHandler) {
+    func cancel(requestID: String) {
+        let cancelID = "cancel-\(UUID().uuidString)"
+        let payload: [String: String] = ["id": cancelID, "command": "cancel", "target_id": requestID]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        try? write(data + Data([0x0A]))
+    }
+
+    func shutdown(completion: @escaping @MainActor @Sendable () -> Void) {
+        stateLock.withLock { shuttingDown = true }
+        let shutdownID = "shutdown-\(UUID().uuidString)"
+        let payload: [String: String] = ["id": shutdownID, "command": "shutdown"]
+        guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
+            DispatchQueue.main.async { completion() }
+            return
+        }
+        do {
+            try send(
+                data,
+                requestID: shutdownID,
+                onEvent: { _ in },
+                onCompletion: { _ in completion() }
+            )
+        } catch {
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    private func ensureStarted() throws {
+        if stateLock.withLock({ process?.isRunning == true }) {
+            stateLock.withLock {
+                if Date().timeIntervalSince(lastStartedAt) >= 300 { recentCrashCount = 0 }
+            }
+            return
+        }
+        let executableURL = try BackendProcess.executableURL()
+        let launchedProcess = Process()
+        let input = Pipe()
+        let output = Pipe()
+        let errorOutput = Pipe()
+        launchedProcess.executableURL = executableURL
+        launchedProcess.standardInput = input
+        launchedProcess.standardOutput = output
+        launchedProcess.standardError = errorOutput
+        do {
+            try launchedProcess.run()
+        } catch {
+            throw BackendProcessError.couldNotLaunch(error)
+        }
+        stateLock.withLock {
+            self.process = launchedProcess
+            self.input = input.fileHandleForWriting
+            stderr = ""
+            lastStartedAt = Date()
+            shuttingDown = false
+        }
+        startReaders(process: launchedProcess, output: output, errorOutput: errorOutput)
+        let handshakeID = "handshake-\(UUID().uuidString)"
+        let handshakeWaiter = DispatchSemaphore(value: 0)
+        stateLock.withLock { handshakeWaiters[handshakeID] = handshakeWaiter }
+        var handshake: [String: Any] = [
+            "id": handshakeID,
+            "command": "handshake",
+            "protocol_version": 2,
+        ]
+        if stateLock.withLock({ recentCrashCount >= 2 }) {
+            handshake["recovery_mode"] = "quiescent"
+        }
+        do {
+            try write(try JSONSerialization.data(withJSONObject: handshake) + Data([0x0A]))
+        } catch {
+            _ = stateLock.withLock { handshakeWaiters.removeValue(forKey: handshakeID) }
+            launchedProcess.terminate()
+            throw BackendProcessError.couldNotWriteRequest(error)
+        }
+        guard handshakeWaiter.wait(timeout: .now() + 10) == .success else {
+            _ = stateLock.withLock { handshakeWaiters.removeValue(forKey: handshakeID) }
+            launchedProcess.terminate()
+            throw BackendProcessError.couldNotWriteRequest(
+                CocoaError(.fileWriteUnknown, userInfo: [NSLocalizedDescriptionKey: "Backend handshake timed out."])
+            )
+        }
+        if stateLock.withLock({ failedHandshakes.remove(handshakeID) != nil }) {
+            launchedProcess.terminate()
+            throw BackendProcessError.couldNotWriteRequest(CocoaError(.fileWriteUnknown))
+        }
+    }
+
+    private func write(_ data: Data) throws {
+        try writeLock.withLock {
+            guard let input = stateLock.withLock({ input }) else {
+                throw CocoaError(.fileNoSuchFile)
+            }
+            try input.write(contentsOf: data)
+        }
+    }
+
+    private func startReaders(process: Process, output: Pipe, errorOutput: Pipe) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.readEvents(from: output.fileHandleForReading)
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = errorOutput.fileHandleForReading.readDataToEndOfFile()
+            let text = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
+            self?.stateLock.withLock { self?.stderr = text }
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            process.waitUntilExit()
+            self?.processExited(process.terminationStatus)
+        }
+    }
+
+    private func readEvents(from handle: FileHandle) {
         var buffer = Data()
         while true {
             let data = handle.availableData
@@ -175,54 +286,74 @@ final class BackendProcess: @unchecked Sendable {
             while let newline = buffer.firstIndex(of: 0x0A) {
                 let line = buffer[..<newline]
                 buffer.removeSubrange(...newline)
-                decodeAndDeliver(Data(line), onEvent: onEvent)
+                deliver(Data(line))
             }
         }
-        if !buffer.isEmpty {
-            decodeAndDeliver(buffer, onEvent: onEvent)
+        if !buffer.isEmpty { deliver(buffer) }
+    }
+
+    private func deliver(_ data: Data) {
+        guard !data.isEmpty, let event = try? JSONDecoder().decode(BackendEvent.self, from: data) else { return }
+        guard let identifier = event.id else { return }
+        if let waiter = stateLock.withLock({ () -> DispatchSemaphore? in
+            guard ["complete", "cancelled", "error"].contains(event.event) else { return nil }
+            if event.event == "error" { failedHandshakes.insert(identifier) }
+            return handshakeWaiters.removeValue(forKey: identifier)
+        }) {
+            waiter.signal()
+            return
+        }
+        let entry = stateLock.withLock { pending[identifier] }
+        guard let entry else { return }
+        DispatchQueue.main.async { entry.onEvent(event) }
+        guard ["complete", "cancelled", "error"].contains(event.event) else { return }
+        _ = stateLock.withLock { pending.removeValue(forKey: identifier) }
+        let completion = BackendCompletion(
+            exitCode: event.event == "error" ? 1 : 0,
+            wasCancelled: event.event == "cancelled",
+            stderr: stateLock.withLock { stderr }
+        )
+        DispatchQueue.main.async { entry.onCompletion(completion) }
+    }
+
+    private func processExited(_ status: Int32) {
+        let recovery = stateLock.withLock { () -> (entries: [Pending], waiters: [DispatchSemaphore], shouldRestart: Bool) in
+            process = nil
+            input = nil
+            if Date().timeIntervalSince(lastStartedAt) < 300 {
+                recentCrashCount += 1
+            } else {
+                recentCrashCount = 0
+            }
+            let values = Array(pending.values)
+            pending.removeAll()
+            let waiters = Array(handshakeWaiters.values)
+            handshakeWaiters.removeAll()
+            return (values, waiters, !shuttingDown && recentCrashCount <= 2 && !hydrationRequests.isEmpty)
+        }
+        let completion = BackendCompletion(
+            exitCode: status == 0 ? 1 : status,
+            wasCancelled: false,
+            stderr: stateLock.withLock { stderr }
+        )
+        for entry in recovery.entries {
+            DispatchQueue.main.async { entry.onCompletion(completion) }
+        }
+        for waiter in recovery.waiters { waiter.signal() }
+        if recovery.shouldRestart {
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.restartAfterCrash()
+            }
         }
     }
 
-    private static func decodeAndDeliver(_ data: Data, onEvent: @escaping EventHandler) {
-        guard !data.isEmpty else { return }
+    private func restartAfterCrash() {
         do {
-            let event = try JSONDecoder().decode(BackendEvent.self, from: data)
-            DispatchQueue.main.async { onEvent(event) }
+            try ensureStarted()
+            let requests = stateLock.withLock { recentCrashCount < 2 ? Array(hydrationRequests.values) : [] }
+            for request in requests { try write(request + Data([0x0A])) }
         } catch {
-            let line = String(decoding: data, as: UTF8.self)
-            let event = BackendEvent(
-                id: nil,
-                event: "log",
-                code: nil,
-                level: "WARNING",
-                message: "Ignored malformed backend output: \(line)",
-                cameras: nil,
-                downloadedBytes: nil,
-                totalBytes: nil,
-                bytesPerSecond: nil,
-                elapsedSeconds: nil,
-                output: nil,
-                thumbnailBase64: nil,
-                thumbnailSource: nil
-            )
-            DispatchQueue.main.async { onEvent(event) }
+            // The next explicit request reports an unavailable supervisor.
         }
-    }
-}
-
-private final class LockedBox<Value: Sendable>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: Value
-
-    init(_ value: Value) {
-        self.value = value
-    }
-
-    func set(_ value: Value) {
-        lock.withLock { self.value = value }
-    }
-
-    func get() -> Value {
-        lock.withLock { value }
     }
 }

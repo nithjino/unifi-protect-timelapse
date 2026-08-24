@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
 
@@ -8,6 +9,7 @@ from PySide6.QtCore import Qt
 
 import timelapse.gui as gui_module
 from timelapse import __version__
+from timelapse.automation_registry import AutomationCamera, ConnectionReference, DailyAutomation
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
@@ -52,6 +54,58 @@ class _MemoryProfileStore(gui_module._ProfileStore):
         self.state = state
 
 
+class _FakeAutomationRuntime:
+    def __init__(self, *_args: object) -> None:
+        self.automations: list[DailyAutomation] = []
+
+    def list(self) -> list[DailyAutomation]:
+        return list(self.automations)
+
+    def update_profiles(self, _profiles: object) -> None:
+        return
+
+    def add(self, **values: object) -> DailyAutomation:
+        cameras = values["cameras"]
+        assert isinstance(cameras, tuple)
+        automation = DailyAutomation(
+            id=f"auto_{len(self.automations) + 1:032x}",
+            name=str(values["name"]),
+            cameras=tuple(AutomationCamera(camera.id, camera.name) for camera in cameras),
+            connection=ConnectionReference("python-profile", str(values["profile_id"])),
+            speed=str(values["speed"]),
+            output_directory=str(values["output_directory"]),
+            timezone=str(values["timezone"]),
+            created_at=datetime(2026, 7, 13, tzinfo=UTC),
+            status="active",
+            next_day=date(2026, 7, 12),
+        )
+        self.automations.append(automation)
+        return automation
+
+    def edit(self, automation_id: str, **_values: object) -> None:
+        assert any(item.id == automation_id for item in self.automations)
+
+    def stop(self, automation_id: str) -> None:
+        self._status(automation_id, "stopped")
+
+    def resume(self, automation_id: str) -> None:
+        self._status(automation_id, "active")
+
+    def remove(self, automation_id: str) -> None:
+        self.automations = [item for item in self.automations if item.id != automation_id]
+
+    def close(self) -> None:
+        return
+
+    async def export_manual(self, config, camera, output, progress_callback) -> None:
+        await gui_module.export_timelapse(config, camera, output, progress_callback)
+
+    def _status(self, automation_id: str, status: str) -> None:
+        self.automations = [
+            replace(item, status=status) if item.id == automation_id else item for item in self.automations
+        ]
+
+
 def _connection_settings() -> gui_module._ConnectionSettings:
     return gui_module._ConnectionSettings(
         instance_url="https://protect.local/proxy/protect/integration/v1",
@@ -78,6 +132,7 @@ def main_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> gui_module._MainWindow:
     monkeypatch.setattr(gui_module, "QSettings", _MemorySettings)
+    monkeypatch.setattr(gui_module, "_QtAutomationRuntime", _FakeAutomationRuntime)
     window = gui_module._MainWindow(_connection_settings())
     qtbot.add_widget(window)
     return window
@@ -198,64 +253,48 @@ def test_datetime_change_prefetches_without_hover(
     assert requests == [("start", False)]
 
 
-def test_daily_schedule_adds_list_row_and_daily_downloads(
+def test_daily_automation_list_projects_multiple_durable_automations(
     main_window: gui_module._MainWindow,
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    cameras = (CameraInfo(id="camera-1", name="Front Door", state=None, model=None),)
-    schedule_entry = main_window._add_daily_schedule_row(cameras, tmp_path)
-    main_window._daily_schedule = gui_module._DailySchedule(cameras, tmp_path, "600x", schedule_entry)
-    started: list[gui_module._DownloadEntry] = []
-    monkeypatch.setattr(gui_module, "latest_complete_local_day", lambda: date(2026, 7, 12))
-    monkeypatch.setattr(main_window, "_start_download_worker", lambda entry, _worker: started.append(entry))
-
-    main_window._run_daily_schedule_if_due()
-
-    assert main_window._job_tabs.tabText(0) == "Downloads"
-    assert main_window._job_tabs.tabText(1) == "Daily Automations"
-    assert main_window._daily_automations.rowCount() == 1
-    assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Scheduled daily"
-    assert len(started) == 1
-    assert started[0].output.name.startswith("timelapse_Front_Door_2026_07_12_2026_07_13_600x_")
-    assert main_window._downloads.rowCount() == 1
-
-    main_window._stop_daily_schedule()
-    assert _entry_text(main_window, schedule_entry, gui_module._COLUMN_STATUS) == "Stopped"
-
-
-def test_daily_schedule_retries_only_missing_cameras_before_advancing(
-    main_window: gui_module._MainWindow,
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     cameras = (
-        CameraInfo(id="camera-1", name="Same Name", state=None, model=None),
-        CameraInfo(id="camera-2", name="Same Name", state=None, model=None),
+        CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
+        CameraInfo(id="camera-2", name="Back Door", state=None, model=None),
     )
-    schedule_entry = main_window._add_daily_schedule_row(cameras, tmp_path)
-    schedule = gui_module._DailySchedule(cameras, tmp_path, "600x", schedule_entry)
-    main_window._daily_schedule = schedule
-    started: list[gui_module._DownloadEntry] = []
-    monkeypatch.setattr(gui_module, "latest_complete_local_day", lambda: date(2026, 7, 12))
-    monkeypatch.setattr(main_window, "_start_download_worker", lambda entry, _worker: started.append(entry))
+    runtime = main_window._automation_runtime
+    assert isinstance(runtime, _FakeAutomationRuntime)
+    first = runtime.add(
+        name="Doors",
+        cameras=cameras,
+        profile_id="test-profile",
+        speed="600x",
+        output_directory=tmp_path / "doors",
+        timezone="UTC",
+    )
+    second = runtime.add(
+        name="Back only",
+        cameras=(cameras[1],),
+        profile_id="test-profile",
+        speed="120x",
+        output_directory=tmp_path / "back",
+        timezone="UTC",
+    )
 
-    main_window._run_daily_schedule_if_due()
-    assert len(started) == 2
-    assert started[0].output != started[1].output
-    assert schedule.last_run_day is None
+    main_window._refresh_daily_automations()
 
-    started[0].output.write_bytes(b"video")
-    main_window._reserved_paths.clear()
-    main_window._run_daily_schedule_if_due()
-    assert len(started) == 3
-    assert started[2].camera.id == "camera-2"
-    assert schedule.last_run_day is None
+    assert main_window._job_tabs.tabText(0) == "Downloads"
+    assert main_window._job_tabs.tabText(1) == "Daily Automations"
+    assert main_window._daily_automations.rowCount() == 2
+    assert {entry.automation_id for entry in main_window._entries if entry.daily_schedule} == {first.id, second.id}
 
-    started[2].output.write_bytes(b"video")
-    main_window._reserved_paths.clear()
-    main_window._run_daily_schedule_if_due()
-    assert schedule.last_run_day == date(2026, 7, 12)
+    main_window._stop_daily_automation(first.id)
+    stopped = next(item for item in main_window._entries if item.automation_id == first.id)
+    assert _entry_text(main_window, stopped, gui_module._COLUMN_STATUS) == "Stopped"
+    assert stopped.action_button.text() == "Resume"
+
+    main_window._resume_daily_automation(first.id)
+    resumed = next(item for item in main_window._entries if item.automation_id == first.id)
+    assert _entry_text(main_window, resumed, gui_module._COLUMN_STATUS) == "Active"
 
 
 def test_logs_button_opens_separate_window_and_displays_logs(
@@ -563,24 +602,33 @@ def test_bulk_controls_only_affect_the_active_job_tab(
     worker = gui_module._DownloadWorker(config, camera, tmp_path / "active.mp4", main_window)
     download_entry = main_window._add_download_row(1, camera, tmp_path / "active.mp4", worker)
     main_window._workers[worker] = download_entry
-    schedule_entry = main_window._add_daily_schedule_row((camera,), tmp_path)
-    main_window._daily_schedule = gui_module._DailySchedule((camera,), tmp_path, "600x", schedule_entry)
+    runtime = main_window._automation_runtime
+    assert isinstance(runtime, _FakeAutomationRuntime)
+    automation = runtime.add(
+        name="Front Door",
+        cameras=(camera,),
+        profile_id="test-profile",
+        speed="600x",
+        output_directory=tmp_path,
+        timezone="UTC",
+    )
+    main_window._refresh_daily_automations()
 
     main_window._job_tabs.setCurrentIndex(0)
     main_window._update_bulk_buttons()
     assert main_window._cancel_all_button.text() == "Cancel All"
     main_window._cancel_all_jobs()
     assert download_entry.cancelling is True
-    assert main_window._daily_schedule is not None
+    assert runtime.list()[0].status == "active"
 
     main_window._job_tabs.setCurrentIndex(1)
     assert main_window._cancel_all_button.text() == "Stop All"
     main_window._cancel_all_jobs()
-    assert main_window._daily_schedule is None
+    assert runtime.list()[0].status == "stopped"
+    schedule_entry = next(entry for entry in main_window._entries if entry.automation_id == automation.id)
     assert schedule_entry.terminal is True
-    assert schedule_entry.action_button.text() == "Delete"
-    assert schedule_entry.action_button.property("danger") == "true"
-    schedule_entry.action_button.click()
+    assert schedule_entry.action_button.text() == "Resume"
+    main_window._clear_finished_jobs()
     assert tmp_path.exists()
     assert schedule_entry not in main_window._entries
     main_window._workers.clear()

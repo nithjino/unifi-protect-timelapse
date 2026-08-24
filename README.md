@@ -16,7 +16,7 @@ TimeLapse supports exact ranges, full local calendar days, and recurring daily e
 - Multi-camera exports with progress, retry, cancellation, and notifications
 - Speeds from normal playback (`1x`) through `600x`
 - Start and end thumbnail previews
-- Daily automatic exports
+- Durable, named Daily Automations with multi-camera catch-up
 - Credentials stored in the OS credential store
 
 ## Requirements
@@ -89,11 +89,31 @@ uv run timelapse \
   --speed 120x
 ```
 
-Daily exports:
+Create a durable Daily Automation. The output directory and `.env` path must be absolute; a saved profile can be used instead of `--dotenv`:
 
 ```bash
-uv run timelapse --daily --speed 600x --output ./daily-timelapses
+mkdir -p "$PWD/daily-timelapses"
+uv run timelapse automation add \
+  --name "Front doors" \
+  --camera "Front Door" \
+  --speed 600x \
+  --output "$PWD/daily-timelapses" \
+  --timezone America/New_York \
+  --dotenv "$PWD/.env"
+uv run timelapse automation run
 ```
+
+Manage automations by name or immutable ID:
+
+```bash
+uv run timelapse automation list --json
+uv run timelapse automation stop "Front doors"
+uv run timelapse automation resume "Front doors"
+uv run timelapse automation re-export "Front doors" 2026-07-30
+uv run timelapse automation remove "Front doors"
+```
+
+The legacy `--daily` option remains as an importer and single-automation runner. It requires `--profile NAME` or an absolute `--dotenv PATH`; command-line credentials are intentionally rejected because an automation must resolve them again after restart.
 
 Create and use a saved connection profile:
 
@@ -176,7 +196,7 @@ mkdir -p data
 docker compose up --build -d
 ```
 
-Exports, job history, and daily schedules live in `./data`. Recreate the container after changing `.env`:
+Exports, job history, and Daily Automations live in `./data`. Recreate the container after changing `.env`:
 
 ```bash
 docker compose up -d --force-recreate timelapse-web
@@ -191,12 +211,20 @@ Keep the web app on a trusted LAN, behind a VPN, or behind an HTTPS reverse prox
 | `TIMELAPSE_OUTPUT` | Generated filename | Output file or daily output directory |
 | `TIMELAPSE_REQUEST_TIMEOUT_SECONDS` | `0` | Whole-operation timeout; `0` disables it |
 | `TIMELAPSE_MAX_DOWNLOAD_MIB` | `10240` | Maximum export size; `0` disables it |
+| `TIMELAPSE_MAX_ACTIVE_EXPORTS` | `4` | Concurrent exports in CLI and desktop runtimes |
+| `TIMELAPSE_MAX_QUEUED_EXPORTS` | `20` | Coordinator-admitted queued exports in CLI and desktop runtimes |
 | `TIMELAPSE_WEB_SESSION_HOURS` | `168` | Web session length |
 | `TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS` | `4` | Concurrent web exports |
 | `TIMELAPSE_WEB_MAX_QUEUED_EXPORTS` | `20` | Queued web exports |
 | `TIMELAPSE_WEB_STORAGE_QUOTA_MIB` | `102400` | Total web export storage |
 
 Existing files are never overwritten. Downloads use a temporary `.part` file and are renamed only after they finish.
+
+## Version 2 compatibility changes
+
+Version 2.0 uses one automation engine, registry, and export coordinator in each CLI, Web, or desktop runtime. Each runtime allows four active and twenty queued exports by default; manual and daily work share those limits and rate-limit recovery. A lone rate-limited job becomes eligible again after 60 seconds when Protect supplies no `Retry-After` value.
+
+Daily Automations are durable and may contain multiple cameras. Desktop apps keep one long-lived version-2 Python supervisor so jobs share capacity and output reservations. The Web interface now distinguishes **Stop** (retain the automation) from **Remove** (remove it after submitted work drains); **Delete** is reserved for an exported MP4. CLI Daily Automations require a named profile or absolute `.env` reference. Existing Web schedule state and legacy CLI daily checkpoints are backed up and migrated on first use.
 
 ## Troubleshooting
 

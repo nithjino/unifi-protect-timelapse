@@ -35,13 +35,13 @@ def test_windows_native_gui_declares_core_controls_and_bindings() -> None:
 
     assert {
         "FullDayCheckBox",
-        "DailyAutomaticCheckBox",
+        "AddDailyAutomationButton",
         "DownloadsGrid",
         "DailyAutomationsGrid",
         "ThumbnailPopup",
     } <= elements.keys()
     assert elements["FullDayCheckBox"].get("Checked") == "FullDay_Checked"
-    assert elements["DailyAutomaticCheckBox"].get("Checked") == "DailyAutomatic_Checked"
+    assert elements["AddDailyAutomationButton"].get("Click") == "AddDailyAutomation_Click"
     assert elements["DownloadsGrid"].get("ItemsSource") == "{Binding DownloadJobs}"
     assert elements["DailyAutomationsGrid"].get("ItemsSource") == "{Binding DailyAutomationJobs}"
 
@@ -64,6 +64,21 @@ def test_macos_native_gui_lists_normal_speed_first() -> None:
     app_model = (ROOT / "native-macos" / "Sources" / "TimeLapseNative" / "AppModel.swift").read_text(encoding="utf-8")
 
     assert 'let speeds = ["1x", "60x", "120x", "300x", "600x"]' in app_model
+
+
+def test_native_apps_project_shared_daily_automation_policy_instead_of_scheduling_locally() -> None:
+    macos_model = (ROOT / "native-macos" / "Sources" / "TimeLapseNative" / "AppModel.swift").read_text(encoding="utf-8")
+    windows_model = (ROOT / "native-windows" / "MainWindow.xaml.cs").read_text(encoding="utf-8")
+
+    assert "runDailyScheduleIfDue" not in macos_model
+    assert "Timer.scheduledTimer" not in macos_model
+    assert 'command: "automation_add"' not in macos_model  # typed request owns the fixed command
+    assert "AutomationAddRequest" in macos_model
+    assert "automation_stop" in macos_model
+    assert "RunDailyScheduleIfDue" not in windows_model
+    assert "DispatcherTimer _dailyTimer" not in windows_model
+    assert 'command = "automation_add"' in windows_model
+    assert 'command = "automation_stop"' in windows_model
 
 
 def test_windows_build_packages_native_app_and_backend() -> None:
