@@ -786,3 +786,43 @@ def test_double_click_completed_job_opens_video(
     main_window._open_completed_video(main_window._downloads, entry.row, gui_module._COLUMN_CAMERA)
 
     assert opened == [str(output)]
+
+
+def test_qt_automation_resolves_connection_without_export_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    settings = replace(_connection_settings(), request_timeout_seconds=37, max_download_mib=321, verify_ssl=False)
+    profile = gui_module._ConnectionProfile("test-profile", "Home", settings)
+    camera = CameraInfo("camera-1", "Front", None, None)
+    exports = []
+
+    async def cameras(connection) -> list[CameraInfo]:
+        assert not hasattr(connection, "speed")
+        assert connection.request_timeout_seconds == 37
+        assert connection.max_download_mib == 321
+        assert connection.verify_ssl is False
+        return [camera]
+
+    async def export(config, _camera, output) -> None:
+        assert config.speed == "120x"
+        assert "120x" in output.name
+        output.write_bytes(b"\0\0\0\x18ftypisom")
+        exports.append(output)
+
+    monkeypatch.setattr(gui_module, "list_available_cameras", cameras)
+    monkeypatch.setattr(gui_module, "export_timelapse", export)
+    runtime = gui_module._QtAutomationRuntime(tmp_path / "automations.json", (profile,))
+    try:
+        runtime.add(
+            name="Home",
+            cameras=(camera,),
+            profile_id=profile.profile_id,
+            speed="120x",
+            output_directory=tmp_path,
+            timezone="UTC",
+        )
+        qtbot.waitUntil(lambda: bool(exports))
+    finally:
+        runtime.close()

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from aiohttp import ClientResponse
     from uiprotect.data import PublicCamera
 
-    from timelapse.config import Config
+    from timelapse.config import Config, ConnectionSettings
 
 CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
 PRIVATE_OPERATION_SLOTS = 2
@@ -209,7 +209,7 @@ def _build_export_path(parsed: ParseResult) -> str:
     return "/proxy/protect/api/video/export"
 
 
-def create_client(config: Config, connection: ProtectConnection) -> ProtectApiClient:
+def create_client(config: Config | ConnectionSettings, connection: ProtectConnection) -> ProtectApiClient:
     """Create a client supporting public API keys and private video export."""
     _prepare_session_directory()
     return _RetryingProtectApiClient(
@@ -248,7 +248,9 @@ async def protect_session_scope() -> AsyncIterator[None]:
 
 
 @asynccontextmanager
-async def protect_client(config: Config, connection: ProtectConnection) -> AsyncIterator[ProtectApiClient]:
+async def protect_client(
+    config: Config | ConnectionSettings, connection: ProtectConnection
+) -> AsyncIterator[ProtectApiClient]:
     """Return a pooled client, or an operation-owned client outside a scope."""
     pool = _CLIENT_POOL.get()
     if pool is None:
@@ -323,7 +325,7 @@ def camera_id(camera: CameraInfo | PublicCamera) -> str:
     return value
 
 
-def _client_key(config: Config) -> _ClientKey:
+def _client_key(config: Config | ConnectionSettings) -> _ClientKey:
     return _ClientKey(
         instance_url=config.instance_url.rstrip("/"),
         username=config.username,

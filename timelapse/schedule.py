@@ -21,7 +21,7 @@ from timelapse.automation_registry import (
     canonical_output_directory,
     validate_mp4,
 )
-from timelapse.config import Config
+from timelapse.config import Config, ConnectionSettings
 from timelapse.download import default_output_path
 from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo
@@ -35,7 +35,7 @@ BATCH_JITTER_RATIO = 0.2
 class ResolvedAutomation:
     """Credentials and current cameras resolved immediately before a batch."""
 
-    config: Config
+    connection: ConnectionSettings
     cameras: tuple[CameraInfo, ...]
 
 
@@ -175,7 +175,7 @@ class DailyAutomationEngine:
         if resolved is None:
             return None
         by_id = {camera.id: camera for camera in resolved.cameras}
-        config = config_for_local_day(resolved.config, day, automation.timezone)
+        config = self._batch_config(resolved.connection, automation, day)
         needs_work = False
         for selected in automation.cameras:
             camera = by_id.get(selected.id)
@@ -275,7 +275,7 @@ class DailyAutomationEngine:
             if resolved is None:
                 return None
             by_id = {camera.id: camera for camera in resolved.cameras}
-            config = config_for_local_day(resolved.config, day, current.timezone)
+            config = self._batch_config(resolved.connection, current, day)
             now = self._now()
             records: list[ExportJobRecord] = []
             specs: list[ExportJobSpec] = []
@@ -404,6 +404,27 @@ class DailyAutomationEngine:
             await self._sleep(max((retry_at - self._now().astimezone(UTC)).total_seconds(), 0.0))
         message = "unreachable batch retry state"
         raise AssertionError(message)
+
+    @staticmethod
+    def _batch_config(connection: ConnectionSettings, automation: DailyAutomation, day: date) -> Config:
+        start, end = local_day_bounds(day, automation.timezone)
+        return Config(
+            instance_url=connection.instance_url,
+            token=connection.token,
+            username=connection.username,
+            password=connection.password,
+            verify_ssl=connection.verify_ssl,
+            request_timeout_seconds=connection.request_timeout_seconds,
+            max_download_mib=connection.max_download_mib,
+            connection_kind=connection.connection_kind,
+            connection_value=connection.connection_value,
+            speed=automation.speed,
+            start=start,
+            end=end,
+            output=None,
+            daily=True,
+            full_day=True,
+        )
 
     async def _resolve_or_pause(self, automation: DailyAutomation) -> ResolvedAutomation | None:
         try:

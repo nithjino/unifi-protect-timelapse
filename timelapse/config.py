@@ -25,6 +25,21 @@ DEFAULT_MAX_DOWNLOAD_MIB = 10 * 1024
 
 
 @dataclass(frozen=True)
+class ConnectionSettings:
+    """Connection-owned facts, independent of export or automation policy."""
+
+    instance_url: str
+    token: str
+    username: str
+    password: str
+    verify_ssl: bool
+    request_timeout_seconds: int
+    max_download_mib: int
+    connection_kind: str | None = None
+    connection_value: str | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     """Validated runtime configuration."""
 

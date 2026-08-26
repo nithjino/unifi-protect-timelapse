@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from uiprotect import ProtectApiClient
 
-    from timelapse.config import Config
+    from timelapse.config import Config, ConnectionSettings
     from timelapse.download import ProgressCallback
     from timelapse.protect import CameraInfo, ProtectConnection
 
@@ -35,7 +35,7 @@ class CameraThumbnail:
     source: str
 
 
-async def list_available_cameras(config: Config) -> list[CameraInfo]:
+async def list_available_cameras(config: Config | ConnectionSettings) -> list[CameraInfo]:
     """Load cameras with a client owned by the current event loop."""
     started_at = perf_counter()
     connection = parse_connection(config.instance_url)

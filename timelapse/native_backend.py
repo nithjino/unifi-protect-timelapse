@@ -9,6 +9,7 @@ import logging
 import signal
 import sys
 from contextlib import suppress
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
@@ -25,7 +26,13 @@ from timelapse.automation_registry import (
     RegistryError,
     new_automation_id,
 )
-from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
+from timelapse.config import (
+    DEFAULT_MAX_DOWNLOAD_MIB,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    SPEED_TO_FPS,
+    Config,
+    ConnectionSettings,
+)
 from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo, protect_session_scope
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
@@ -147,19 +154,23 @@ def _config(
         message = f"speed must be one of: {', '.join(SPEED_TO_FPS)}"
         raise _ProtocolError(message)
     return Config(
+        **asdict(_connection_settings(settings)),
+        speed=speed,
+        start=start,
+        end=end,
+        output=output,
+    )
+
+
+def _connection_settings(settings: Mapping[str, object]) -> ConnectionSettings:
+    return ConnectionSettings(
         instance_url=_required_string(settings, "instance_url").strip().rstrip("/"),
         token=_required_string(settings, "token"),
         username=_required_string(settings, "username"),
         password=_required_string(settings, "password"),
         verify_ssl=_boolean(settings, "verify_ssl", default=True),
-        speed=speed,
-        start=start,
-        end=end,
-        output=output,
         request_timeout_seconds=_nonnegative_integer(
-            settings,
-            "request_timeout_seconds",
-            DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            settings, "request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS
         ),
         max_download_mib=_nonnegative_integer(settings, "max_download_mib", DEFAULT_MAX_DOWNLOAD_MIB),
     )
@@ -536,10 +547,12 @@ class NativeSessionSupervisor:
         if settings is None:
             message = f"native profile {automation.connection.value!r} has not been hydrated"
             raise RegistryError(message)
-        now = datetime.now().astimezone()
-        request: dict[str, object] = {"settings": settings}
-        config = _config(request, start=now, end=now + timedelta(seconds=1), speed=automation.speed, output=None)
-        return ResolvedAutomation(config, tuple(await list_available_cameras(config)))
+        connection = replace(
+            _connection_settings(settings),
+            connection_kind=automation.connection.kind,
+            connection_value=automation.connection.value,
+        )
+        return ResolvedAutomation(connection, tuple(await list_available_cameras(connection)))
 
     async def _cancel_command(self, request_id: str, request: Mapping[str, object]) -> None:
         target_id = _required_string(request, "target_id")

@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     import uvicorn
     from fastapi import FastAPI
 
-    from timelapse.config import Config
+    from timelapse.config import Config, ConnectionSettings
 
 
 def _settings(tmp_path: Path, *, web_password: str | None = None, configured: bool = True) -> WebSettings:
@@ -47,7 +47,7 @@ def _settings(tmp_path: Path, *, web_password: str | None = None, configured: bo
     )
 
 
-async def _cameras(_config: Config) -> list[CameraInfo]:
+async def _cameras(_config: Config | ConnectionSettings) -> list[CameraInfo]:
     return [
         CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
         CameraInfo(id="camera-2", name="Back Yard", state="CONNECTED", model="G4 Bullet"),
@@ -569,7 +569,7 @@ def test_camera_service_failures_return_non_success_status(
     error: TimelapseError,
     status_code: int,
 ) -> None:
-    async def failed_cameras(_config: Config) -> list[CameraInfo]:
+    async def failed_cameras(_config: Config | ConnectionSettings) -> list[CameraInfo]:
         raise error
 
     settings = _settings(tmp_path)
@@ -584,7 +584,7 @@ def test_camera_service_failures_return_non_success_status(
 
 
 def test_unexpected_camera_failure_returns_correlated_server_error(tmp_path: Path) -> None:
-    async def failed_cameras(_config: Config) -> list[CameraInfo]:
+    async def failed_cameras(_config: Config | ConnectionSettings) -> list[CameraInfo]:
         message = "database failure"
         raise OSError(message)
 
@@ -1070,13 +1070,15 @@ def test_daily_artifact_is_projected_and_deleted_through_the_registry(tmp_path: 
     settings = _settings(tmp_path)
 
     async def export_daily(_config: Config, _camera: CameraInfo, output: Path, _progress: object) -> None:
+        assert _config.speed == "120x"
+        assert "120x" in output.name
         output.write_bytes(b"\0\0\0\x18ftypisom")  # noqa: ASYNC240 - synchronous test double
 
     state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export_daily)
 
     async def exercise() -> None:
         await state.start()
-        automation = await state.create_automation("Front Door", ["camera-1"], "600x")
+        automation = await state.create_automation("Front Door", ["camera-1"], "120x")
         for _ in range(100):
             daily_jobs = [job for job in state.jobs.values() if job.daily and job.terminal]
             if daily_jobs:
