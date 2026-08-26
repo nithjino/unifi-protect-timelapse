@@ -147,6 +147,12 @@ struct DownloadRequest: Encodable, Sendable {
     let end: String
     let speed: String
     let output: String
+    let collisionPolicy = "suffix"
+
+    enum CodingKeys: String, CodingKey {
+        case id, command, settings, camera, start, end, speed, output
+        case collisionPolicy = "collision_policy"
+    }
 }
 
 enum ThumbnailBoundary: String, Hashable, Sendable {
@@ -334,7 +340,7 @@ final class DownloadJob: ObservableObject, Identifiable {
     let id: UUID
     let groupNumber: Int
     var camera: CameraInfo
-    let outputURL: URL
+    @Published var outputURL: URL
     let requestSettings: BackendSettings
     let requestStart: String
     let requestEnd: String

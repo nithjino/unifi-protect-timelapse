@@ -51,6 +51,28 @@ final class BackendProtocolTests: XCTestCase {
         XCTAssertEqual(event.elapsedSeconds, 2.0)
     }
 
+    @MainActor
+    func testClaimedPathUpdatesTheJobAndRequestUsesSuffixPolicy() throws {
+        let settings = BackendSettings(ConnectionSettings())
+        let camera = CameraInfo(id: "camera-1", name: "Front", state: nil, model: nil)
+        let request = DownloadRequest(
+            id: "download-1", settings: settings, camera: camera,
+            start: "2026-07-11T08:00:00Z", end: "2026-07-11T09:00:00Z", speed: "120x", output: "/tmp/front.mp4"
+        )
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(request)) as? [String: Any]
+        XCTAssertEqual(encoded?["collision_policy"] as? String, "suffix")
+        let event = try JSONDecoder().decode(BackendEvent.self, from: Data(
+            #"{"id":"download-1","event":"accepted","output":"/tmp/front_2.mp4"}"#.utf8
+        ))
+        XCTAssertEqual(event.event, "accepted")
+        let job = DownloadJob(
+            groupNumber: 1, camera: camera, outputURL: URL(fileURLWithPath: request.output),
+            requestSettings: settings, requestStart: request.start, requestEnd: request.end, requestSpeed: request.speed
+        )
+        job.outputURL = URL(fileURLWithPath: try XCTUnwrap(event.output))
+        XCTAssertEqual(job.outputURL.lastPathComponent, "front_2.mp4")
+    }
+
     func testCameraEventDecodesOptionalCameraMetadata() throws {
         let data = Data(
             #"{"id":"list-1","event":"cameras","cameras":[{"id":"camera-1","name":"Front Door","state":null,"model":"G5"}]}"#.utf8

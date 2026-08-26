@@ -13,7 +13,7 @@ from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from platformdirs import user_config_path
 
@@ -33,7 +33,7 @@ from timelapse.config import (
     Config,
     ConnectionSettings,
 )
-from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
+from timelapse.jobs import CollisionPolicy, CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo, protect_session_scope
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
 from timelapse.service import export_timelapse, fetch_camera_thumbnail, list_available_cameras
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from timelapse.download import DownloadProgress
 
 MAX_REQUEST_BYTES = 1024 * 1024
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 # This module is also executed with ``python -m`` and bundled as a standalone
 # executable, where ``__name__`` is ``__main__`` rather than a package child.
 _LOGGER = logging.getLogger("timelapse.native_backend")
@@ -206,7 +206,7 @@ async def _list_cameras(request_id: str, request: Mapping[str, object]) -> None:
     _write_event({"id": request_id, "event": "cameras", "cameras": serialized_cameras})
 
 
-async def _download(request_id: str, request: Mapping[str, object]) -> None:
+async def _download(request_id: str, request: Mapping[str, object], *, emit_complete: bool = True) -> None:
     start = _aware_datetime(_required_string(request, "start"), "start")
     end = _aware_datetime(_required_string(request, "end"), "end")
     speed = _required_string(request, "speed")
@@ -227,7 +227,8 @@ async def _download(request_id: str, request: Mapping[str, object]) -> None:
         )
 
     await export_timelapse(config, camera, output, report_progress)
-    _write_event({"id": request_id, "event": "complete", "output": str(output)})
+    if emit_complete:
+        _write_event({"id": request_id, "event": "complete", "output": str(output)})
 
 
 async def _thumbnail(request_id: str, request: Mapping[str, object]) -> None:
@@ -308,7 +309,7 @@ def _read_optional_request() -> dict[str, object] | None:
 
 
 class NativeSessionSupervisor:
-    """Own a version-2 native app session and multiplex commands by request ID."""
+    """Own a version-3 native app session and multiplex commands by request ID."""
 
     def __init__(self, registry_path: Path) -> None:
         """Configure one native session with its private durable registry."""
@@ -481,14 +482,27 @@ class NativeSessionSupervisor:
 
     async def _coordinated_download(self, request_id: str, request: Mapping[str, object]) -> None:
         output = _output_path(_required_string(request, "output"))
+        policy = request.get("collision_policy", "suffix")
+        if not isinstance(policy, str) or policy not in {"reject", "suffix"}:
+            message = "manual collision_policy must be reject or suffix"
+            raise _ProtocolError(message)
+
+        async def confirm_path(jobs: tuple[CoordinatorJob, ...]) -> None:
+            _write_event({"id": request_id, "event": "accepted", "output": str(jobs[0].output)})
+
+        async def operation(claimed: Path) -> None:
+            await _download(request_id, dict(request, output=str(claimed)), emit_complete=False)
+
         jobs = await self.coordinator.submit(
             [
                 ExportJobSpec.create(
                     output=output,
-                    operation=lambda: _download(request_id, request),
+                    operation=operation,
+                    collision_policy=cast("CollisionPolicy", policy),
                     job_id=f"manual:{request_id}",
                 )
-            ]
+            ],
+            before_admission=confirm_path,
         )
         try:
             await self.coordinator.wait(jobs)
@@ -500,6 +514,8 @@ class NativeSessionSupervisor:
             raise asyncio.CancelledError
         if job.status == "failed":
             raise TimelapseError(job.error or "manual export failed")
+
+        _write_event({"id": request_id, "event": "complete", "output": str(job.output)})
 
     async def _automation_add(self, request_id: str, request: Mapping[str, object]) -> None:
         cameras_value = request.get("cameras")
@@ -588,7 +604,7 @@ class NativeSessionSupervisor:
                 {
                     "id": item.id,
                     "status": item.status,
-                    "output": str(item.spec.output),
+                    "output": str(item.output),
                     "automation_id": item.spec.automation_id,
                     "error": item.error,
                 }
@@ -724,7 +740,7 @@ async def _run(request: Mapping[str, object]) -> int:
 
 
 def main() -> int:
-    """Run one-shot compatibility mode or a version-2 native session."""
+    """Run one-shot compatibility mode or a version-3 native session."""
     request: dict[str, object] | None = None
     log_handler: _NativeLogHandler | None = None
     package_logger = logging.getLogger("timelapse")

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using TimeLapseNative;
 using Xunit;
 
@@ -5,6 +6,30 @@ namespace TimeLapseNative.Tests;
 
 public sealed class BackendProtocolTests
 {
+    [Fact]
+    public void AcceptedEventCarriesTheClaimedPathAndNotifiesTheJobView()
+    {
+        var backendEvent = JsonSerializer.Deserialize<BackendEvent>(
+            """{"id":"download-1","event":"accepted","output":"C:\\exports\\front_2.mp4"}""");
+        Assert.NotNull(backendEvent);
+        Assert.Equal("accepted", backendEvent.Event);
+        var job = new DownloadJob
+        {
+            GroupNumber = 1,
+            Camera = new CameraInfo("camera-1", "Front", null, null),
+            OutputPath = @"C:\exports\front.mp4",
+            RequestSettings = new ConnectionSettings(),
+            RequestStart = "2026-07-11T08:00:00Z",
+            RequestEnd = "2026-07-11T09:00:00Z",
+            RequestSpeed = "120x",
+        };
+        var notified = false;
+        job.PropertyChanged += (_, _) => notified = true;
+        job.OutputPath = backendEvent.Output!;
+        Assert.Equal("front_2.mp4", job.OutputName);
+        Assert.True(notified);
+    }
+
     [Fact]
     public async Task SessionMultiplexesInterleavedRequestsThroughOneBackend()
     {

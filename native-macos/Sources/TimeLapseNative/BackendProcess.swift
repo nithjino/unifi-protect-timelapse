@@ -228,7 +228,7 @@ private final class BackendSession: @unchecked Sendable {
         var handshake: [String: Any] = [
             "id": handshakeID,
             "command": "handshake",
-            "protocol_version": 2,
+            "protocol_version": 3,
         ]
         if stateLock.withLock({ recentCrashCount >= 2 }) {
             handshake["recovery_mode"] = "quiescent"

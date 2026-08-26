@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING
@@ -10,7 +11,7 @@ from PySide6.QtCore import Qt
 import timelapse.gui as gui_module
 from timelapse import __version__
 from timelapse.automation_registry import AutomationCamera, ConnectionReference, DailyAutomation
-from timelapse.download import DownloadProgress, default_output_path
+from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
 
@@ -97,7 +98,8 @@ class _FakeAutomationRuntime:
     def close(self) -> None:
         return
 
-    async def export_manual(self, config, camera, output, progress_callback) -> None:
+    async def export_manual(self, config, camera, output, progress_callback, path_claimed) -> None:
+        path_claimed(output)
         await gui_module.export_timelapse(config, camera, output, progress_callback)
 
     def _status(self, automation_id: str, status: str) -> None:
@@ -510,23 +512,6 @@ def test_camera_dialog_returns_multiple_checked_cameras(qtbot: QtBot) -> None:
     assert dialog.selected_cameras() == [cameras[0], cameras[2]]
 
 
-def test_output_reservation_uses_camera_name_and_unique_suffixes(
-    main_window: gui_module._MainWindow,
-    tmp_path: Path,
-) -> None:
-    config = _export_config()
-    camera = CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5")
-    preferred = tmp_path / default_output_path(config, camera).name
-    preferred.write_bytes(b"existing")
-
-    first = main_window._reserve_output_path(preferred)
-    second = main_window._reserve_output_path(preferred)
-
-    assert "Front_Door" in preferred.name
-    assert first == preferred.with_name(f"{preferred.stem}_2{preferred.suffix}").resolve()
-    assert second == preferred.with_name(f"{preferred.stem}_3{preferred.suffix}").resolve()
-
-
 def test_progress_row_shows_known_and_unknown_totals(
     main_window: gui_module._MainWindow,
     tmp_path: Path,
@@ -826,3 +811,36 @@ def test_qt_automation_resolves_connection_without_export_policy(
         qtbot.waitUntil(lambda: bool(exports))
     finally:
         runtime.close()
+
+
+def test_qt_manual_export_reports_coordinator_suffix_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    preferred = tmp_path / "artifact.mp4"
+    preferred.write_bytes(b"existing")
+    claimed = []
+    camera = CameraInfo("camera-1", "Front", None, None)
+
+    async def export(_config, _camera, output, _progress) -> None:
+        assert claimed == [tmp_path / "artifact_2.mp4"]
+        assert output == claimed[0]
+        output.write_bytes(b"video")
+
+    monkeypatch.setattr(gui_module, "export_timelapse", export)
+    runtime = gui_module._QtAutomationRuntime(tmp_path / "automations.json", ())
+    try:
+        asyncio.run(runtime.export_manual(_export_config(), camera, preferred, lambda _progress: None, claimed.append))
+    finally:
+        runtime.close()
+    assert claimed[0].read_bytes() == b"video"
+
+
+def test_qt_claim_confirmation_updates_visible_output(main_window: gui_module._MainWindow, tmp_path: Path) -> None:
+    camera = CameraInfo("camera-1", "Front", None, None)
+    preferred = tmp_path / "artifact.mp4"
+    worker = gui_module._DownloadWorker(_export_config(), camera, preferred, main_window)
+    entry = main_window._add_download_row(1, camera, preferred, worker)
+    claimed = tmp_path / "artifact_2.mp4"
+    main_window._download_output_claimed(entry, str(claimed))
+    assert entry.output == claimed
+    assert _entry_text(main_window, entry, gui_module._COLUMN_OUTPUT) == claimed.name

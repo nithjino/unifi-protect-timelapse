@@ -159,7 +159,12 @@ public sealed class DownloadJob : INotifyPropertyChanged
     public Guid Id { get; init; } = Guid.NewGuid();
     public required int GroupNumber { get; init; }
     public required CameraInfo Camera { get; set; }
-    public required string OutputPath { get; init; }
+    private string _outputPath = "";
+    public required string OutputPath
+    {
+        get => _outputPath;
+        set { _outputPath = value; NotifyAll(); }
+    }
     public required ConnectionSettings RequestSettings { get; init; }
     public required string RequestStart { get; init; }
     public required string RequestEnd { get; init; }
