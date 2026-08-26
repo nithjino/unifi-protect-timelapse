@@ -143,8 +143,17 @@ class ExportJobRecord:
     deletion_requested: bool = False
 
 
+@dataclass(frozen=True)
+class ExportJobContext:
+    """An Export Job joined with its batch and retained automation, if present."""
+
+    job: ExportJobRecord
+    batch: ExportBatchRecord
+    automation: DailyAutomation | None
+
+
 @dataclass
-class RegistryState:
+class _RegistryState:
     """Complete state written by one atomic registry replacement."""
 
     automations: dict[str, DailyAutomation] = field(default_factory=dict)
@@ -292,23 +301,18 @@ class AutomationRegistry:
 
     def __init__(self, path: Path) -> None:
         self.path = path.expanduser().resolve(strict=False)
-        self._state = RegistryState()
-
-    @property
-    def state(self) -> RegistryState:
-        """Return the live registry state."""
-        return self._state
+        self._state = _RegistryState()
 
     def owner(self, *, endpoint: str | None = None) -> RegistryOwner:
         """Create a lifetime owner lock for this registry."""
         return RegistryOwner(self.path, endpoint=endpoint)
 
-    def load(self) -> RegistryState:
+    def load(self) -> None:
         """Load and validate the registry, recovering a complete temporary write."""
         self._recover_atomic_write()
         if not self.path.exists():
-            self._state = RegistryState()
-            return self._state
+            self._state = _RegistryState()
+            return
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
             self._state = self._decode_state(payload)
@@ -317,7 +321,6 @@ class AutomationRegistry:
             message = f"automation registry was invalid and moved to {quarantined}: {exc}"
             raise RegistryError(message) from exc
         self.reconcile()
-        return self._state
 
     def persist(self) -> None:
         """Replace the registry atomically after validating all records."""
@@ -339,9 +342,45 @@ class AutomationRegistry:
             with suppress(FileNotFoundError):
                 temporary.unlink()
 
-    def list(self) -> list[DailyAutomation]:
+    def list(self) -> tuple[DailyAutomation, ...]:
         """Return automations ordered by display name and ID."""
-        return sorted(self._state.automations.values(), key=lambda item: (item.name.casefold(), item.id))
+        return tuple(sorted(self._state.automations.values(), key=lambda item: (item.name.casefold(), item.id)))
+
+    def contains(self, automation_id: str) -> bool:
+        """Return whether a Daily Automation definition is still retained."""
+        return automation_id in self._state.automations
+
+    def job(self, job_id: str) -> ExportJobRecord | None:
+        """Read one immutable Export Job for retry or artifact deletion."""
+        return self._state.jobs.get(job_id)
+
+    def batch(self, batch_id: str) -> ExportBatchRecord | None:
+        """Read one immutable Export Batch, including its retry history."""
+        return self._state.batches.get(batch_id)
+
+    def jobs_for_batch(self, batch_id: str) -> tuple[ExportJobRecord, ...]:
+        """Return an immutable snapshot of an Export Batch's jobs."""
+        return tuple(job for job in self._state.jobs.values() if job.batch_id == batch_id)
+
+    def jobs_for_automation(self, automation_id: str) -> tuple[ExportJobRecord, ...]:
+        """Return retained Export Jobs belonging to a Daily Automation."""
+        return tuple(job for job in self._state.jobs.values() if job.automation_id == automation_id)
+
+    def job_context(self, job_id: str) -> ExportJobContext | None:
+        """Resolve an Export Job and its domain relationships in one query."""
+        job = self.job(job_id)
+        if job is None:
+            return None
+        batch = self._state.batches[job.batch_id]
+        return ExportJobContext(job, batch, self._state.automations.get(batch.automation_id))
+
+    def batch_needs_recovery(self, batch_id: str) -> bool:
+        """Determine whether submitted work or an unrecorded Processed Day remains."""
+        jobs = self.jobs_for_batch(batch_id)
+        return bool(jobs) and (
+            all(job.status == "completed" for job in jobs)
+            or any(job.status in {"pending", "queued", "running"} for job in jobs)
+        )
 
     def resolve(self, selector: str) -> DailyAutomation:
         """Resolve an immutable ID before a normalized display name."""
@@ -491,19 +530,100 @@ class AutomationRegistry:
         self._replace_automation(updated)
         return updated
 
-    def replace_automation(self, automation: DailyAutomation) -> None:
-        """Persist a complete engine-owned automation transition."""
-        if automation.id not in self._state.automations:
-            message = f"automation does not exist: {automation.id}"
-            raise RegistryError(message)
-        self._replace_automation(automation)
+    def record_batch_failure(
+        self,
+        batch_id: str,
+        *,
+        error: str,
+        retry_at: datetime | None,
+    ) -> DailyAutomation:
+        """Atomically record the engine's batch failure and chosen retry time."""
+        batch = self.batch(batch_id)
+        if batch is None:
+            raise RegistryError("export batch does not exist")
+        automation = self.resolve(batch.automation_id)
+        jobs = self.jobs_for_batch(batch_id)
+        if not jobs or any(job.status not in {"completed", "failed", "cancelled"} for job in jobs):
+            raise RegistryError("only a terminal Export Batch can record a failure")
+        if all(job.status == "completed" for job in jobs):
+            raise RegistryError("a successful Export Batch cannot record a failure")
+        if automation.status == "paused" or (retry_at is not None and automation.status != "active"):
+            raise RegistryError("automation status does not allow this batch retry")
+        if retry_at is not None and retry_at.utcoffset() is None:
+            raise RegistryError("batch retry time must include a timezone")
+        updated = replace(automation, consecutive_failures=batch.attempt, last_error=error, next_retry_at=retry_at)
+        self._state.batches[batch_id] = replace(batch, retry_not_before=retry_at)
+        try:
+            self._replace_automation(updated)
+        except Exception:
+            self._state.batches[batch_id] = batch
+            raise
+        return updated
+
+    def record_batch_success(self, batch_id: str, *, advance_day: bool) -> DailyAutomation:
+        """Record successful batch completion and the engine's Processed Day decision."""
+        batch = self.batch(batch_id)
+        if batch is None:
+            raise RegistryError("export batch does not exist")
+        automation = self.resolve(batch.automation_id)
+        jobs = self.jobs_for_batch(batch_id)
+        if not jobs or any(job.status != "completed" for job in jobs):
+            raise RegistryError("every Export Job must complete before recording batch success")
+        if advance_day and (batch.generation != 0 or automation.next_day != batch.day):
+            raise RegistryError("Processed Day must advance the oldest pending day exactly once")
+        updated = replace(
+            automation,
+            next_day=batch.day + timedelta(days=1) if advance_day else automation.next_day,
+            consecutive_failures=0,
+            next_retry_at=None,
+            last_error=None,
+        )
+        self._state.batches[batch_id] = replace(batch, retry_not_before=None)
+        try:
+            self._replace_automation(updated)
+        except Exception:
+            self._state.batches[batch_id] = batch
+            raise
+        return updated
+
+    def import_checkpoint(
+        self,
+        selector: str,
+        *,
+        next_day: date,
+        source_fingerprint: str,
+        imported_at: datetime,
+    ) -> DailyAutomation:
+        """Atomically import legacy Processed Day state without exposing record mutation."""
+        automation = self.resolve(selector)
+        if automation.source_fingerprint == source_fingerprint:
+            return automation
+        if automation.status == "removing" or any(
+            job.status not in {"completed", "failed", "cancelled"} for job in self.jobs_for_automation(automation.id)
+        ):
+            raise RegistryError("cannot import a checkpoint while submitted work or removal is pending")
+        if not source_fingerprint or imported_at.utcoffset() is None:
+            raise RegistryError("checkpoint import requires a fingerprint and timezone-aware import time")
+        updated = replace(automation, next_day=next_day, source_fingerprint=source_fingerprint, imported_at=imported_at)
+        self._replace_automation(updated)
+        return updated
 
     def begin_remove(self, selector: str) -> DailyAutomation | None:
         """Mark an automation for removal, deleting it when no work remains."""
         automation = self.resolve(selector)
         updated = replace(automation, status="removing", next_retry_at=None)
-        self._replace_automation(updated)
-        return self.finish_remove(updated.id)
+        if any(
+            job.status not in {"completed", "failed", "cancelled"} for job in self.jobs_for_automation(automation.id)
+        ):
+            self._replace_automation(updated)
+            return updated
+        self._state.automations.pop(automation.id)
+        try:
+            self.persist()
+        except Exception:
+            self._state.automations[automation.id] = automation
+            raise
+        return None
 
     def finish_remove(self, automation_id: str) -> DailyAutomation | None:
         """Delete a removing definition after its nonterminal jobs finish."""
@@ -516,12 +636,34 @@ class AutomationRegistry:
         ):
             return automation
         self._state.automations.pop(automation_id)
-        self.persist()
+        try:
+            self.persist()
+        except Exception:
+            self._state.automations[automation_id] = automation
+            raise
         return None
 
     def put_batch(self, batch: ExportBatchRecord, jobs: tuple[ExportJobRecord, ...]) -> None:
         """Persist a batch and every job before any work is admitted."""
-        old_batch = self._state.batches.get(batch.id)
+        automation = self.resolve(batch.automation_id)
+        old_batch = self.batch(batch.id)
+        if automation.status == "paused" or (automation.status != "active" and old_batch is None):
+            raise RegistryError("automation status does not allow a new Export Batch")
+        if not jobs or len({job.id for job in jobs}) != len(jobs):
+            raise RegistryError("an Export Batch requires distinct Export Jobs")
+        if old_batch is not None and (
+            old_batch.automation_id != batch.automation_id
+            or old_batch.day != batch.day
+            or old_batch.generation != batch.generation
+            or old_batch.created_at != batch.created_at
+        ):
+            raise RegistryError("Export Batch identity cannot change")
+        for job in jobs:
+            previous = self.job(job.id)
+            if job.batch_id != batch.id or job.automation_id != batch.automation_id:
+                raise RegistryError("Export Job must belong to its Export Batch and Daily Automation")
+            if previous is not None and (previous.batch_id != batch.id or previous.camera.id != job.camera.id):
+                raise RegistryError("Export Job identity cannot change")
         old_jobs = {job.id: self._state.jobs.get(job.id) for job in jobs}
         self._state.batches[batch.id] = batch
         self._state.jobs.update((job.id, job) for job in jobs)
@@ -541,15 +683,24 @@ class AutomationRegistry:
 
     def update_job(self, job: ExportJobRecord) -> None:
         """Persist one job transition."""
-        previous = self._state.jobs.get(job.id)
+        previous = self.job(job.id)
+        if previous is None:
+            raise RegistryError("export job does not exist")
+        if (job.batch_id, job.automation_id, job.camera, job.output, job.created_at) != (
+            previous.batch_id,
+            previous.automation_id,
+            previous.camera,
+            previous.output,
+            previous.created_at,
+        ):
+            raise RegistryError("Export Job identity cannot change during a transition")
+        if previous.status == "deleting" and job.status != "deleting":
+            raise RegistryError("an artifact with deletion intent cannot resume exporting")
         self._state.jobs[job.id] = job
         try:
             self.persist()
         except Exception:
-            if previous is None:
-                self._state.jobs.pop(job.id, None)
-            else:
-                self._state.jobs[job.id] = previous
+            self._state.jobs[job.id] = previous
             raise
 
     def delete_artifact(self, job_id: str) -> None:
@@ -570,6 +721,8 @@ class AutomationRegistry:
         if canonical_parent != automation.output_path or output.is_symlink():
             message = "refusing to delete an artifact outside its automation output directory"
             raise RegistryError(message)
+        if job.status not in {"completed", "failed", "cancelled", "deleting"}:
+            raise RegistryError("only a terminal Export Job's artifact can be deleted")
         deleting = replace(job, status="deleting", deletion_requested=True, updated_at=datetime.now(UTC))
         self.update_job(deleting)
         try:
@@ -589,18 +742,33 @@ class AutomationRegistry:
                 message = f"could not delete tracked artifact {output}: {exc}"
                 raise RegistryError(message) from exc
         self._state.jobs.pop(job_id, None)
-        self.persist()
+        try:
+            self.persist()
+        except Exception:
+            self._state.jobs[job_id] = deleting
+            raise
 
     def next_reexport_generation(self, automation_id: str, day: date) -> int:
         """Increment and persist the generation for explicit re-export work."""
+        self.resolve(automation_id)
         key = f"{automation_id}:{day.isoformat()}"
-        generation = self._state.reexport_generations.get(key, 0) + 1
+        previous = self._state.reexport_generations.get(key)
+        generation = (previous or 0) + 1
         self._state.reexport_generations[key] = generation
-        self.persist()
+        try:
+            self.persist()
+        except Exception:
+            if previous is None:
+                self._state.reexport_generations.pop(key)
+            else:
+                self._state.reexport_generations[key] = previous
+            raise
         return generation
 
     def reconcile(self) -> None:
         """Converge interrupted job transitions against on-disk artifacts."""
+        previous_jobs = self._state.jobs.copy()
+        previous_automations = self._state.automations.copy()
         changed = False
         now = datetime.now(UTC)
         for job_id, job in tuple(self._state.jobs.items()):
@@ -623,12 +791,19 @@ class AutomationRegistry:
                 )
                 changed = True
         for automation in tuple(self._state.automations.values()):
-            if automation.status == "removing":
-                before = automation.id in self._state.automations
-                self.finish_remove(automation.id)
-                changed = changed or (before and automation.id not in self._state.automations)
+            if automation.status == "removing" and not any(
+                job.status not in {"completed", "failed", "cancelled"}
+                for job in self.jobs_for_automation(automation.id)
+            ):
+                self._state.automations.pop(automation.id)
+                changed = True
         if changed:
-            self.persist()
+            try:
+                self.persist()
+            except Exception:
+                self._state.jobs = previous_jobs
+                self._state.automations = previous_automations
+                raise
 
     def migrate_web_v1(self, legacy_path: Path, *, output_directory: Path, timezone: str) -> list[DailyAutomation]:
         """Import Web schedule schema version 1 into this registry."""
@@ -703,12 +878,9 @@ class AutomationRegistry:
                 ),
                 None,
             )
-            if existing_import is not None:
-                imported.append(existing_import)
-                continue
             created_value = item.get("created_at")
             created_at = _aware_datetime(created_value, "created_at") if created_value else now
-            automation = self.add(
+            automation = existing_import or self.add(
                 name=name,
                 cameras=cameras,
                 connection=ConnectionReference("web-environment", "default"),
@@ -729,7 +901,7 @@ class AutomationRegistry:
                     next_retry_at=None if retry_value is None else _aware_datetime(retry_value, "next_retry_at"),
                     last_error=_optional_text(item.get("last_error"), "last_error"),
                 )
-                self.replace_automation(automation)
+                self._replace_automation(automation)
             imported.append(automation)
         legacy_path.unlink()
         return imported
@@ -802,13 +974,13 @@ class AutomationRegistry:
         return backup
 
     @classmethod
-    def _decode_state(cls, payload: object) -> RegistryState:
+    def _decode_state(cls, payload: object) -> _RegistryState:
         if not isinstance(payload, dict) or payload.get("version") != REGISTRY_VERSION:
             raise RegistryError("unsupported automation registry version")
         automation_items = _record_list(payload, "automations")
         batch_items = _record_list(payload, "batches")
         job_items = _record_list(payload, "jobs")
-        state = RegistryState()
+        state = _RegistryState()
         for item in automation_items:
             automation = cls._decode_automation(item)
             if automation.id in state.automations:
@@ -818,13 +990,18 @@ class AutomationRegistry:
             state.automations[automation.id] = automation
         for item in batch_items:
             batch = cls._decode_batch(item)
-            if batch.id in state.batches or batch.automation_id not in state.automations:
+            if batch.id in state.batches:
                 raise RegistryError(f"invalid or duplicate batch: {batch.id}")
             state.batches[batch.id] = batch
         for item in job_items:
             job = cls._decode_job(item)
             if job.id in state.jobs or job.batch_id not in state.batches:
                 raise RegistryError(f"invalid or duplicate job: {job.id}")
+            batch = state.batches[job.batch_id]
+            if job.automation_id != batch.automation_id:
+                raise RegistryError("Export Job owner does not match its batch")
+            if batch.automation_id not in state.automations and job.status not in {"completed", "failed", "cancelled"}:
+                raise RegistryError("nonterminal Export Job has no retained automation")
             state.jobs[job.id] = job
         generations = payload.get("reexport_generations", {})
         if not isinstance(generations, dict) or not all(
@@ -922,7 +1099,7 @@ class AutomationRegistry:
         )
 
     @staticmethod
-    def _encode_state(state: RegistryState) -> dict[str, object]:
+    def _encode_state(state: _RegistryState) -> dict[str, object]:
         for automation in state.automations.values():
             AutomationRegistry._decode_automation(_automation_payload(automation))
         for batch in state.batches.values():
