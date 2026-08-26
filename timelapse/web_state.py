@@ -409,7 +409,7 @@ class WebState:
                 else:
                     _LOGGER.warning("Moved invalid legacy Web schedule state to %s: %s", quarantined, exc)
         self.automations.clear()
-        self.automations.update(self._automation_registry.state.automations)
+        self.automations.update((item.id, item) for item in self._automation_registry.list())
         for automation in self.automations.values():
             if automation.status == "active":
                 self._start_automation_task(automation.id)
@@ -563,8 +563,8 @@ class WebState:
                 message = "That export is no longer in the job list."
                 raise ValueError(message)
             if job.terminal:
-                if job.daily and job.id in self._automation_registry.state.jobs:
-                    record = self._automation_registry.state.jobs[job.id]
+                record = self._automation_registry.job(job.id) if job.daily else None
+                if record is not None:
                     if record.status not in {"completed", "failed", "cancelled"}:
                         message = "That Daily Automation export is still being finalized. Try again shortly."
                         raise ValueError(message)
@@ -721,10 +721,9 @@ class WebState:
         """Project coordinator state into the retained Web job history."""
         job = self.jobs.get(runtime.id)
         if job is None and runtime.spec.automation_id is not None:
-            record = self._automation_registry.state.jobs.get(runtime.id)
-            batch = self._automation_registry.state.batches.get(runtime.spec.batch_id or "")
-            automation = self._automation_registry.state.automations.get(runtime.spec.automation_id)
-            if record is not None and batch is not None and automation is not None:
+            context = self._automation_registry.job_context(runtime.id)
+            if context is not None and context.automation is not None:
+                record, batch, automation = context.job, context.batch, context.automation
                 start, end = local_day_bounds(batch.day, automation.timezone)
                 job = ExportJob(
                     id=runtime.id,
@@ -759,7 +758,7 @@ class WebState:
                 result = await self._automation_engine.run_due_once(automation_id)
                 self._sync_automations()
                 self._changed()
-                if automation_id not in self._automation_registry.state.automations:
+                if not self._automation_registry.contains(automation_id):
                     return
                 if result is not None:
                     continue
@@ -792,7 +791,7 @@ class WebState:
 
     def _sync_automations(self) -> None:
         self.automations.clear()
-        self.automations.update(self._automation_registry.state.automations)
+        self.automations.update((item.id, item) for item in self._automation_registry.list())
 
     async def _ensure_export_capacity(self, requested_jobs: int) -> None:
         active_jobs = sum(not job.terminal for job in self.jobs.values())

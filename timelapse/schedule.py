@@ -126,7 +126,7 @@ class DailyAutomationEngine:
         """Process the oldest due day for one active automation."""
         automation = self.registry.resolve(selector)
         batch_id = f"batch:{automation.id}:{automation.next_day.isoformat()}:0"
-        recovering_submitted_batch = self._batch_needs_recovery(batch_id)
+        recovering_submitted_batch = self.registry.batch_needs_recovery(batch_id)
         if automation.status != "active" and not (
             automation.status in {"stopped", "removing"} and recovering_submitted_batch
         ):
@@ -191,7 +191,7 @@ class DailyAutomationEngine:
             tracked = next(
                 (
                     job
-                    for job in self.registry.state.jobs.values()
+                    for job in self.registry.jobs_for_automation(automation.id)
                     if job.automation_id == automation.id and Path(job.output) == output
                 ),
                 None,
@@ -243,7 +243,7 @@ class DailyAutomationEngine:
         advance_day: bool = True,
     ) -> BatchResult | None:
         batch_id = f"batch:{automation.id}:{day.isoformat()}:{generation}"
-        recovering_submitted_batch = self._batch_needs_recovery(batch_id)
+        recovering_submitted_batch = self.registry.batch_needs_recovery(batch_id)
         current_at_start = self.registry.resolve(automation.id)
         if current_at_start.status == "paused" or (
             current_at_start.status in {"stopped", "removing"} and not recovering_submitted_batch
@@ -286,7 +286,7 @@ class DailyAutomationEngine:
                     return None
                 output = daily_output_path(config, camera, current.output_path)
                 job_id = f"{batch_id}:{selected.id}"
-                existing = self.registry.state.jobs.get(job_id)
+                existing = self.registry.job(job_id)
                 if output.exists():
                     if validate_mp4(output):
                         records.append(
@@ -341,7 +341,7 @@ class DailyAutomationEngine:
                     )
                 )
 
-            previous_batch = self.registry.state.batches.get(batch_id)
+            previous_batch = self.registry.batch(batch_id)
             batch = ExportBatchRecord(
                 id=batch_id,
                 automation_id=current.id,
@@ -368,18 +368,12 @@ class DailyAutomationEngine:
             last_jobs = tuple(terminal_records)
             success = all(record.status == "completed" and validate_mp4(Path(record.output)) for record in last_jobs)
             if success:
-                await self._complete_batch(current.id, day, advance_day=advance_day)
+                await self._complete_batch(batch_id, advance_day=advance_day)
                 return BatchResult(current.id, day, generation, completed=True, jobs=last_jobs)
 
             current = self.registry.resolve(current.id)
             if current.status in {"stopped", "removing"}:
-                updated = replace(
-                    current,
-                    consecutive_failures=attempt,
-                    last_error=self._batch_error(last_jobs),
-                    next_retry_at=None,
-                )
-                self.registry.replace_automation(updated)
+                self.registry.record_batch_failure(batch_id, error=self._batch_error(last_jobs), retry_at=None)
                 if current.status == "removing":
                     self.registry.finish_remove(current.id)
                 return BatchResult(current.id, day, generation, completed=False, jobs=last_jobs)
@@ -394,13 +388,7 @@ class DailyAutomationEngine:
             retry_at = self._now().astimezone(UTC) + timedelta(seconds=delay)
             if retry_floor is not None and retry_floor.astimezone(UTC) > retry_at:
                 retry_at = retry_floor.astimezone(UTC)
-            updated = replace(
-                current,
-                consecutive_failures=attempt,
-                next_retry_at=retry_at,
-                last_error=self._batch_error(last_jobs),
-            )
-            self.registry.replace_automation(updated)
+            self.registry.record_batch_failure(batch_id, error=self._batch_error(last_jobs), retry_at=retry_at)
             await self._sleep(max((retry_at - self._now().astimezone(UTC)).total_seconds(), 0.0))
         message = "unreachable batch retry state"
         raise AssertionError(message)
@@ -446,19 +434,11 @@ class DailyAutomationEngine:
             f"Camera {camera.name!r} ({camera.id}) is unavailable. Edit the automation, then Resume it.",
         )
 
-    async def _complete_batch(self, automation_id: str, day: date, *, advance_day: bool) -> None:
+    async def _complete_batch(self, batch_id: str, *, advance_day: bool) -> None:
         async with self._transition_lock:
-            automation = self.registry.resolve(automation_id)
-            updated = replace(
-                automation,
-                next_day=day + timedelta(days=1) if advance_day else automation.next_day,
-                consecutive_failures=0,
-                next_retry_at=None,
-                last_error=None,
-            )
-            self.registry.replace_automation(updated)
+            automation = self.registry.record_batch_success(batch_id, advance_day=advance_day)
             if automation.status == "removing":
-                self.registry.finish_remove(automation_id)
+                self.registry.finish_remove(automation.id)
 
     @staticmethod
     def _terminal_record(record: ExportJobRecord, runtime: CoordinatorJob) -> ExportJobRecord:
@@ -481,12 +461,3 @@ class DailyAutomationEngine:
             return "Export Batch did not produce every expected artifact."
         details = "; ".join(f"{job.camera.name}: {job.error or job.status}" for job in failures)
         return f"{len(failures)} Export Job(s) failed: {details}"
-
-    def _batch_needs_recovery(self, batch_id: str) -> bool:
-        if batch_id not in self.registry.state.batches:
-            return False
-        jobs = [job for job in self.registry.state.jobs.values() if job.batch_id == batch_id]
-        return bool(jobs) and (
-            all(job.status == "completed" for job in jobs)
-            or any(job.status in {"pending", "queued", "running"} for job in jobs)
-        )

@@ -1093,7 +1093,7 @@ def test_daily_artifact_is_projected_and_deleted_through_the_registry(tmp_path: 
 
         assert await state.cancel_or_remove_job(job.id) == "removed"
         assert not job.output.exists()
-        assert job.id not in state._automation_registry.state.jobs
+        assert state._automation_registry.job(job.id) is None
         assert state.automations[automation.id].last_run_day == processed_day
         await state.close()
 

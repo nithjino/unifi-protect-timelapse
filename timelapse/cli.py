@@ -14,7 +14,6 @@ import shutil
 import sys
 import tempfile
 from contextlib import asynccontextmanager, suppress
-from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -176,14 +175,13 @@ async def _run_daily(config: Config, camera: CameraInfo) -> None:
                 backup = checkpoint.with_suffix(f"{checkpoint.suffix}.v1-backup")
                 if not backup.exists():
                     shutil.copy2(checkpoint, backup)
-                if automation.source_fingerprint != fingerprint:
-                    automation = replace(
-                        automation,
+                if next_day is not None and automation.source_fingerprint != fingerprint:
+                    automation = registry.import_checkpoint(
+                        automation.id,
                         next_day=next_day,
                         source_fingerprint=fingerprint,
                         imported_at=datetime.now(UTC),
                     )
-                    registry.replace_automation(automation)
                 checkpoint.unlink()
             if automation.status == "stopped":
                 automation = registry.resume(automation.id)

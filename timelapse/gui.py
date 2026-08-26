@@ -477,7 +477,7 @@ class _QtAutomationRuntime:
         self._submit(lambda: setattr(self, "_profiles", {profile.profile_id: profile for profile in profiles}))
 
     def list(self) -> list[DailyAutomation]:
-        return cast("list[DailyAutomation]", self._submit(lambda: self._required_registry().list()))
+        return cast("list[DailyAutomation]", self._submit(lambda: list(self._required_registry().list())))
 
     def add(
         self,
