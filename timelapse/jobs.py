@@ -10,10 +10,8 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
+from typing import Literal
 
 from timelapse import ProtectRateLimitError, TimelapseError
 
@@ -23,8 +21,13 @@ RATE_LIMIT_FALLBACK_SECONDS = 60.0
 
 CollisionPolicy = Literal["reject", "suffix", "daily"]
 CoordinatorJobStatus = Literal["pending", "queued", "running", "completed", "failed", "cancelled"]
-ExportOperation = Callable[[], Awaitable[None]]
+ExportOperation = Callable[[Path], Awaitable[None]]
+ClaimCallback = Callable[[tuple["CoordinatorJob", ...]], Awaitable[None]]
 TransitionCallback = Callable[["CoordinatorJob"], Awaitable[None] | None]
+
+
+class OutputCollisionError(TimelapseError, ValueError):
+    """An existing artifact or in-flight Export Job owns the requested path."""
 
 
 @dataclass(frozen=True)
@@ -36,6 +39,7 @@ class ExportJobSpec:
     operation: ExportOperation
     automation_id: str | None = None
     batch_id: str | None = None
+    collision_policy: CollisionPolicy = "reject"
 
     @classmethod
     def create(
@@ -46,9 +50,12 @@ class ExportJobSpec:
         automation_id: str | None = None,
         batch_id: str | None = None,
         job_id: str | None = None,
+        collision_policy: CollisionPolicy = "reject",
     ) -> ExportJobSpec:
         """Build a job spec with a stable caller-supplied or generated ID."""
-        return cls(job_id or f"job_{secrets.token_urlsafe(12)}", output, operation, automation_id, batch_id)
+        return cls(
+            job_id or f"job_{secrets.token_urlsafe(12)}", output, operation, automation_id, batch_id, collision_policy
+        )
 
 
 @dataclass
@@ -56,6 +63,7 @@ class CoordinatorJob:
     """Observable state for one coordinator-owned export."""
 
     spec: ExportJobSpec
+    output: Path
     status: CoordinatorJobStatus = "pending"
     attempt: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -100,6 +108,9 @@ class ExportJobCoordinator:
         self._rate_limit_fallback_seconds = rate_limit_fallback_seconds
         self._pending: deque[CoordinatorJob] = deque()
         self._jobs: dict[str, CoordinatorJob] = {}
+        self._claims: dict[str, str] = {}
+        self._active_jobs: set[str] = set()
+        self._admitted_jobs: set[str] = set()
         self._active = 0
         self._admitted = 0
         self._terminal_generation = 0
@@ -156,34 +167,88 @@ class ExportJobCoordinator:
         """Return durable oversized-batch jobs not yet admitted."""
         return len(self._pending)
 
-    async def submit(self, specs: Iterable[ExportJobSpec]) -> tuple[CoordinatorJob, ...]:
-        """Submit an oversized persisted batch for lazy admission."""
-        if self._closing:
-            message = "export coordinator is shutting down"
-            raise TimelapseError(message)
+    async def submit(
+        self,
+        specs: Iterable[ExportJobSpec],
+        *,
+        before_admission: ClaimCallback | None = None,
+    ) -> tuple[CoordinatorJob, ...]:
+        """Claim all paths atomically and persist final intent before any job is runnable.
+
+        Callbacks may persist and project the claimed paths, but must not re-enter
+        this coordinator. A callback failure rolls back the entire submission.
+        """
         loop = asyncio.get_running_loop()
         submitted: list[CoordinatorJob] = []
-        for spec in specs:
-            previous = self._jobs.get(spec.id)
-            if previous is not None and not previous.terminal:
-                message = f"duplicate export job ID: {spec.id}"
-                raise ValueError(message)
-            job = CoordinatorJob(spec=spec, created_at=self._now(), completion=loop.create_future())
-            self._jobs[job.id] = job
-            self._pending.append(job)
-            submitted.append(job)
-            await self._transition(job)
-        self._ensure_dispatcher()
+        previous_jobs: dict[str, CoordinatorJob | None] = {}
         async with self._condition:
+            if self._closing:
+                message = "export coordinator is shutting down"
+                raise TimelapseError(message)
+            try:
+                for spec in specs:
+                    previous = self._jobs.get(spec.id)
+                    output = self._claim_output(spec)
+                    job = CoordinatorJob(
+                        spec=spec, output=output, created_at=self._now(), completion=loop.create_future()
+                    )
+                    previous_jobs[job.id] = previous
+                    self._jobs[job.id] = job
+                    submitted.append(job)
+                result = tuple(submitted)
+                if before_admission is not None:
+                    await before_admission(result)
+                for job in submitted:
+                    await self._transition(job)
+            except BaseException:
+                for job in submitted:
+                    self._claims.pop(self._output_key(job.output), None)
+                    previous = previous_jobs[job.id]
+                    if previous is None:
+                        self._jobs.pop(job.id, None)
+                    else:
+                        self._jobs[job.id] = previous
+                raise
+            self._pending.extend(submitted)
             self._condition.notify_all()
-        return tuple(submitted)
+        self._ensure_dispatcher()
+        return result
+
+    @staticmethod
+    def _output_key(path: Path) -> str:
+        return str(path.expanduser().resolve(strict=False)).casefold()
+
+    def _claim_output(self, spec: ExportJobSpec) -> Path:
+        previous = self._jobs.get(spec.id)
+        if previous is not None and not previous.terminal:
+            message = f"duplicate export job ID: {spec.id}"
+            raise ValueError(message)
+        if spec.collision_policy not in {"reject", "suffix", "daily"}:
+            message = f"unknown output collision policy: {spec.collision_policy}"
+            raise ValueError(message)
+        preferred = spec.output.expanduser().resolve(strict=False)
+        candidate = preferred
+        for suffix in range(2, 10_001):
+            key = self._output_key(candidate)
+            exists = candidate.exists() or candidate.is_symlink()
+            if not exists and candidate.parent.exists():
+                exists = any(item.name.casefold() == candidate.name.casefold() for item in candidate.parent.iterdir())
+            if key not in self._claims and not exists:
+                self._claims[key] = spec.id
+                return candidate
+            if spec.collision_policy != "suffix":
+                message = f"An export artifact already exists or is claimed at {candidate}"
+                raise OutputCollisionError(message)
+            candidate = preferred.with_name(f"{preferred.stem}_{suffix}{preferred.suffix}")
+        message = f"could not claim a unique output path for {preferred.name}"
+        raise OutputCollisionError(message)
 
     async def wait(self, jobs: Iterable[CoordinatorJob]) -> tuple[CoordinatorJob, ...]:
         """Wait for the selected jobs without cancelling siblings."""
         selected = tuple(jobs)
         completions = [job.completion for job in selected if job.completion is not None]
         if completions:
-            await asyncio.gather(*completions)
+            await asyncio.gather(*(asyncio.shield(completion) for completion in completions))
         return selected
 
     async def cancel(self, job_id: str) -> bool:
@@ -204,7 +269,6 @@ class ExportJobCoordinator:
                     job,
                     "cancelled",
                     error="Export was cancelled.",
-                    release_active=job.status == "running",
                 )
             return True
         await self._finish(job, "cancelled", error="Cancelled before execution.")
@@ -243,9 +307,15 @@ class ExportJobCoordinator:
                         return
                     job = self._pending.popleft()
                     self._admitted += 1
-                job.status = "queued"
-                await self._transition(job)
-                job.task = asyncio.create_task(self._execute(job), name=f"export-{job.id}")
+                    self._admitted_jobs.add(job.id)
+                    job.status = "queued"
+                try:
+                    await self._transition(job)
+                except Exception as exc:
+                    await self._finish(job, "failed", error=str(exc))
+                    continue
+                if not job.terminal:
+                    job.task = asyncio.create_task(self._execute(job), name=f"export-{job.id}")
         except asyncio.CancelledError:
             return
 
@@ -253,19 +323,21 @@ class ExportJobCoordinator:
         try:
             async with self._condition:
                 await self._condition.wait_for(lambda: self._closing or self._active < self.max_active)
-                if self._closing:
-                    await self._finish(job, "cancelled", error="Coordinator is shutting down.")
-                    return
-                self._active += 1
+                if not self._closing:
+                    self._active += 1
+                    self._active_jobs.add(job.id)
+            if self._closing:
+                await self._finish(job, "cancelled", error="Coordinator is shutting down.")
+                return
             job.status = "running"
             job.attempt += 1
             job.started_at = self._now()
             job.error = None
             await self._transition(job)
             try:
-                await job.spec.operation()
+                await job.spec.operation(job.output)
             except ProtectRateLimitError as exc:
-                await self._release_active()
+                await self._release_active(job)
                 await self._wait_after_rate_limit(job, exc)
                 if self._closing:
                     await self._finish(job, "cancelled", error="Coordinator is shutting down.")
@@ -274,6 +346,7 @@ class ExportJobCoordinator:
                 job.status = "pending"
                 self._pending.appendleft(job)
                 self._admitted -= 1
+                self._admitted_jobs.discard(job.id)
                 await self._transition(job)
                 async with self._condition:
                     self._condition.notify_all()
@@ -281,11 +354,13 @@ class ExportJobCoordinator:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await self._finish(job, "failed", error=str(exc) or type(exc).__name__, release_active=True)
+                await self._finish(job, "failed", error=str(exc) or type(exc).__name__)
                 return
-            await self._finish(job, "completed", release_active=True)
+            await self._finish(job, "completed")
         except asyncio.CancelledError:
-            await self._finish(job, "cancelled", error="Export was cancelled.", release_active=job.status == "running")
+            await self._finish(job, "cancelled", error="Export was cancelled.")
+        except Exception as exc:
+            await self._finish(job, "failed", error=str(exc) or type(exc).__name__)
 
     async def _wait_after_rate_limit(self, job: CoordinatorJob, error: ProtectRateLimitError) -> None:
         baseline = self._terminal_generation
@@ -309,9 +384,11 @@ class ExportJobCoordinator:
         except TimeoutError:
             return
 
-    async def _release_active(self) -> None:
+    async def _release_active(self, job: CoordinatorJob) -> None:
         async with self._condition:
-            self._active = max(self._active - 1, 0)
+            if job.id in self._active_jobs:
+                self._active -= 1
+                self._active_jobs.discard(job.id)
             self._condition.notify_all()
 
     async def _finish(
@@ -320,25 +397,35 @@ class ExportJobCoordinator:
         status: Literal["completed", "failed", "cancelled"],
         *,
         error: str | None = None,
-        release_active: bool = False,
     ) -> None:
-        if job.terminal:
-            return
-        if release_active:
-            await self._release_active()
-        if job.status != "pending":
-            self._admitted = max(self._admitted - 1, 0)
-        job.status = status
-        job.error = error
-        job.finished_at = self._now()
-        job.retry_not_before = None
-        await self._transition(job)
-        if job.completion is not None and not job.completion.done():
-            job.completion.set_result(job)
         async with self._condition:
+            if job.terminal:
+                return
+            with suppress(ValueError):
+                self._pending.remove(job)
+            if job.id in self._active_jobs:
+                self._active -= 1
+                self._active_jobs.discard(job.id)
+            if job.id in self._admitted_jobs:
+                self._admitted -= 1
+                self._admitted_jobs.discard(job.id)
+            job.status = status
+            job.error = error
+            job.finished_at = self._now()
+            job.retry_not_before = None
+            self._claims.pop(self._output_key(job.output), None)
             self._terminal_generation += 1
-            self._condition.notify(1)
-        self._ensure_dispatcher()
+            self._condition.notify_all()
+        try:
+            await self._transition(job)
+        except BaseException as exc:
+            if job.completion is not None and not job.completion.done():
+                job.completion.set_exception(exc)
+        else:
+            if job.completion is not None and not job.completion.done():
+                job.completion.set_result(job)
+        if not self._closing:
+            self._ensure_dispatcher()
 
     async def _transition(self, job: CoordinatorJob) -> None:
         if self._on_transition is None:
@@ -346,26 +433,6 @@ class ExportJobCoordinator:
         result = self._on_transition(job)
         if result is not None:
             await result
-
-
-def reserve_output_path(path: Path, policy: CollisionPolicy, reserved: set[str] | None = None) -> Path:
-    """Apply the entry point's explicit manual-export collision policy."""
-    reservations = reserved or set()
-
-    def unavailable(candidate: Path) -> bool:
-        return candidate.exists() or str(candidate.resolve(strict=False)).casefold() in reservations
-
-    if not unavailable(path):
-        return path
-    if policy in {"reject", "daily"}:
-        message = f"an export artifact already exists at {path}"
-        raise TimelapseError(message)
-    for suffix in range(2, 10_000):
-        candidate = path.with_name(f"{path.stem}-{suffix}{path.suffix}")
-        if not unavailable(candidate):
-            return candidate
-    message = f"could not reserve a unique output path for {path.name}"
-    raise TimelapseError(message)
 
 
 def retry_not_before_from_delay(delay_seconds: float | None, *, now: datetime | None = None) -> datetime | None:

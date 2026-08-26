@@ -11,7 +11,7 @@ from timelapse.automation_registry import (
     ExportJobRecord,
 )
 from timelapse.config import Config, ConnectionSettings
-from timelapse.jobs import ExportJobCoordinator
+from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation, config_for_local_day, daily_output_path
 
@@ -307,5 +307,51 @@ def test_stored_policy_controls_speed_dst_and_reexport(tmp_path) -> None:
         assert result is not None and result.completed
         assert len(exports) == 2
         assert registry.resolve(automation.id).next_day == date(2026, 3, 9)
+
+    asyncio.run(exercise())
+
+
+def test_manual_claim_safety_pauses_daily_batch_without_running_it(tmp_path) -> None:
+    async def exercise() -> None:
+        now = datetime(2026, 8, 23, 12, tzinfo=UTC)
+        camera = CameraInfo("camera-1", "Front", None, None)
+        registry = AutomationRegistry(tmp_path / "automations.json")
+        registry.load()
+        automation = registry.add(
+            name="Home",
+            cameras=(AutomationCamera(camera.id, camera.name),),
+            connection=ConnectionReference("python-profile", "home"),
+            speed="600x",
+            output_directory=tmp_path,
+            timezone="UTC",
+            now=now,
+        )
+        path = daily_output_path(config_for_local_day(_config(now), automation.next_day, "UTC"), camera, tmp_path)
+        coordinator = ExportJobCoordinator()
+
+        async def manual(_output) -> None:
+            await asyncio.Event().wait()
+
+        async def resolve(_automation):
+            return ResolvedAutomation(_connection(), (camera,))
+
+        async def export(_config, _camera, _output) -> None:
+            raise AssertionError("a collided Daily Automation must not launch")
+
+        manual_jobs = await coordinator.submit([ExportJobSpec.create(output=path, operation=manual)])
+        engine = DailyAutomationEngine(
+            registry, coordinator, resolve_connection=resolve, exporter=export, now=lambda: now
+        )
+        assert await engine.run_due_once(automation.id) is None
+        paused = registry.resolve(automation.id)
+        assert paused.status == "paused"
+        assert paused.next_day == automation.next_day
+        records = registry.jobs_for_automation(automation.id)
+        assert len(records) == 1
+        assert records[0].output == str(path)
+        assert records[0].status == "failed"
+        assert len(coordinator.jobs) == 1
+        assert not manual_jobs[0].terminal
+        await coordinator.close()
 
     asyncio.run(exercise())

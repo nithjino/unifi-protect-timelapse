@@ -36,7 +36,6 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, CameraThumbnail> _thumbnailCache = [];
     private readonly Dictionary<string, string> _thumbnailFailures = [];
     private readonly Dictionary<string, BackendProcess> _thumbnailRequests = [];
-    private readonly HashSet<string> _reservedOutputPaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly DispatcherTimer _startThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
     private readonly DispatcherTimer _endThumbnailTimer = new() { Interval = TimeSpan.FromMilliseconds(400) };
     private ConnectionProfile? _selectedProfile;
@@ -861,7 +860,7 @@ public partial class MainWindow : Window
         {
             GroupNumber = group,
             Camera = camera,
-            OutputPath = ReserveOutputPath(camera, start, end, speed, outputDirectory, daily, fullDay),
+            OutputPath = ExpectedOutputPath(camera, start, end, speed, outputDirectory, daily, fullDay),
             RequestSettings = requestSettings,
             RequestStart = new DateTimeOffset(DateTime.SpecifyKind(start, DateTimeKind.Local)).ToString("O"),
             RequestEnd = new DateTimeOffset(DateTime.SpecifyKind(end, DateTimeKind.Local)).ToString("O"),
@@ -895,6 +894,7 @@ public partial class MainWindow : Window
                 ["end"] = job.RequestEnd,
                 ["speed"] = job.RequestSpeed,
                 ["output"] = job.OutputPath,
+                ["collision_policy"] = "suffix",
                 ["cancel_path"] = cancellationPath,
             };
             var completion = await process.RunAsync(request, backendEvent => Dispatcher.Invoke(() =>
@@ -902,6 +902,9 @@ public partial class MainWindow : Window
                 if (backendEvent.Id is not null && backendEvent.Id != job.Id.ToString()) return;
                 switch (backendEvent.Event)
                 {
+                    case "accepted":
+                        if (backendEvent.Output is not null) job.OutputPath = backendEvent.Output;
+                        break;
                     case "progress":
                         if (job.State != DownloadState.Cancelling) job.State = DownloadState.Downloading;
                         if (backendEvent.DownloadedBytes.HasValue) job.DownloadedBytes = backendEvent.DownloadedBytes.Value;
@@ -962,8 +965,6 @@ public partial class MainWindow : Window
             job.BytesPerSecond = 0;
             _downloadProcesses.Remove(job.Id);
             var queuedCancellationWasHandled = _handledQueuedCancellations.Remove(job.Id);
-            if (job.State != DownloadState.Queued) _reservedOutputPaths.Remove(job.OutputPath);
-            CleanupPartialFilesForOutput(job.OutputPath);
             process.Dispose();
             StatusText.Text = _downloadProcesses.Count > 0
                 ? $"{_downloadProcesses.Count} downloads active"
@@ -1011,7 +1012,6 @@ public partial class MainWindow : Window
     {
         if (job.IsDailySchedule) return;
         if (File.Exists(job.OutputPath)) { ShowMessage("Output Already Exists", $"Move or remove {job.OutputName} before restarting this job."); return; }
-        _reservedOutputPaths.Add(job.OutputPath);
         job.Error = ""; job.DownloadedBytes = 0; job.TotalBytes = null; job.BytesPerSecond = 0; job.State = DownloadState.Preparing;
         _ = LaunchDownloadAsync(job);
         StatusText.Text = $"Restarted download for {job.Camera.Name}";
@@ -1103,8 +1103,6 @@ public partial class MainWindow : Window
         RemoveFromRateLimitedQueue(job);
         job.State = DownloadState.Cancelled;
         job.BytesPerSecond = 0;
-        _reservedOutputPaths.Remove(job.OutputPath);
-        CleanupPartialFilesForOutput(job.OutputPath);
         AppendLog("INFO", $"Cancelled queued camera download: {job.Camera.Name}");
         NotifyDownloadFinished(job);
         UpdateDownloadsDisplay();
@@ -1206,31 +1204,6 @@ public partial class MainWindow : Window
         _notificationIcon.ShowBalloonTip(10_000, title, message, icon);
     }
 
-    private string ReserveOutputPath(
-        CameraInfo camera,
-        DateTime start,
-        DateTime end,
-        string speed,
-        string outputDirectory,
-        bool daily,
-        bool fullDay)
-    {
-        CleanupStalePartialExports(outputDirectory);
-        var expected = ExpectedOutputPath(camera, start, end, speed, outputDirectory, daily, fullDay);
-        if (daily)
-        {
-            if (_reservedOutputPaths.Add(expected)) return expected;
-            throw new InvalidOperationException($"An export is already writing {Path.GetFileName(expected)}.");
-        }
-        var baseName = Path.GetFileNameWithoutExtension(expected);
-        for (var counter = 1; ; counter++)
-        {
-            var suffix = counter == 1 ? "" : $"_{counter}";
-            var candidate = Path.Combine(outputDirectory, baseName + suffix + ".mp4");
-            if (!File.Exists(candidate) && _reservedOutputPaths.Add(candidate)) return candidate;
-        }
-    }
-
     private static string ExpectedOutputPath(
         CameraInfo camera,
         DateTime start,
@@ -1274,21 +1247,6 @@ public partial class MainWindow : Window
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             AppendLog("WARNING", $"Could not clean stale partial exports in {directory}: {exception.Message}");
-        }
-    }
-
-    private void CleanupPartialFilesForOutput(string outputPath)
-    {
-        try
-        {
-            var directory = Path.GetDirectoryName(outputPath);
-            if (directory is null || !Directory.Exists(directory)) return;
-            foreach (var path in Directory.EnumerateFiles(directory, $".{Path.GetFileName(outputPath)}.*.part"))
-                File.Delete(path);
-        }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
-        {
-            AppendLog("WARNING", $"Could not remove partial export for {outputPath}: {exception.Message}");
         }
     }
 

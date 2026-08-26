@@ -188,7 +188,7 @@ def test_invalid_requests_raise_protocol_errors(payload: dict[str, object], mess
         asyncio.run(backend._dispatch(payload))
 
 
-def test_session_requires_version_two_before_accepting_work(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_session_requires_version_three_before_accepting_work(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events: list[dict[str, object]] = []
     monkeypatch.setattr(backend, "_write_event", events.append)
     supervisor = backend.NativeSessionSupervisor(tmp_path / "automations.json")
@@ -201,7 +201,7 @@ def test_session_requires_version_two_before_accepting_work(monkeypatch: pytest.
             "id": "hello-1",
             "event": "error",
             "code": "protocol_version_mismatch",
-            "message": "protocol version mismatch: backend requires 2, client sent 1",
+            "message": "protocol version mismatch: backend requires 3, client sent 1",
         }
     ]
 
@@ -216,7 +216,7 @@ def test_session_rejects_duplicate_ids_and_acks_each_accepted_command(
     async def exercise() -> None:
         supervisor = backend.NativeSessionSupervisor(tmp_path / "automations.json")
         supervisor.registry.load()
-        await supervisor.handshake({"id": "hello", "command": "handshake", "protocol_version": 2})
+        await supervisor.handshake({"id": "hello", "command": "handshake", "protocol_version": 3})
         request = {
             "id": "credentials",
             "command": "hydrate_credentials",
@@ -295,3 +295,46 @@ def test_native_automation_registry_never_persists_hydrated_secrets(
     assert "test-token" not in persisted
     assert "test-password" not in persisted
     assert '"kind": "native-profile"' in persisted
+
+
+def test_native_supervisor_confirms_claim_before_progress_and_completion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[dict[str, object]] = []
+    monkeypatch.setattr(backend, "_write_event", events.append)
+    preferred = tmp_path / "artifact.mp4"
+    preferred.write_bytes(b"existing")
+    expected = tmp_path / "artifact_2.mp4"
+
+    async def export(config: Config, _camera: CameraInfo, output: Path, progress_callback: object) -> None:
+        assert output == expected
+        assert config.output == expected
+        assert events == [{"id": "download", "event": "accepted", "output": str(expected)}]
+        assert callable(progress_callback)
+        progress_callback(DownloadProgress(4, 4, 4.0, 1.0))
+        output.write_bytes(b"video")  # noqa: ASYNC240 - test exporter
+
+    monkeypatch.setattr(backend, "export_timelapse", export)
+    request = {
+        "id": "download",
+        "command": "download",
+        "settings": _settings(),
+        "camera": {"id": "camera-1", "name": "Front"},
+        "speed": "120x",
+        "start": "2026-07-11T08:00:00+00:00",
+        "end": "2026-07-11T09:00:00+00:00",
+        "output": str(preferred),
+        "collision_policy": "suffix",
+    }
+
+    async def exercise() -> None:
+        supervisor = backend.NativeSessionSupervisor(tmp_path / "automations.json")
+        await supervisor.accept(request)
+        await asyncio.gather(*supervisor._tasks.values())
+        assert supervisor.coordinator.jobs[0].output == expected
+        await supervisor.close()
+
+    asyncio.run(exercise())
+    assert [event["event"] for event in events] == ["accepted", "progress", "complete"]
+    assert events[-1]["output"] == str(expected)

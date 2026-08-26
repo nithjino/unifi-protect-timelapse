@@ -23,7 +23,7 @@ from timelapse.automation_registry import (
 )
 from timelapse.config import Config, ConnectionSettings
 from timelapse.download import default_output_path
-from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
+from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec, OutputCollisionError
 from timelapse.protect import CameraInfo
 
 BATCH_MAX_ATTEMPTS = 5
@@ -321,10 +321,10 @@ class DailyAutomationEngine:
                 records.append(record)
 
                 async def operation(
+                    batch_output: Path,
                     *,
                     batch_config: Config = config,
                     batch_camera: CameraInfo = camera,
-                    batch_output: Path = output,
                 ) -> None:
                     await self._exporter(batch_config, batch_camera, batch_output)
                     if not validate_mp4(batch_output):
@@ -334,6 +334,7 @@ class DailyAutomationEngine:
                 specs.append(
                     ExportJobSpec.create(
                         output=output,
+                        collision_policy="daily",
                         operation=operation,
                         automation_id=current.id,
                         batch_id=batch_id,
@@ -351,7 +352,11 @@ class DailyAutomationEngine:
                 created_at=previous_batch.created_at if previous_batch is not None else now,
             )
             self.registry.put_batch(batch, tuple(records))
-            coordinator_jobs = await self.coordinator.submit(specs)
+            try:
+                coordinator_jobs = await self.coordinator.submit(specs)
+            except OutputCollisionError as exc:
+                self._pause_collision(current, records, exc)
+                return None
             await self.coordinator.wait(coordinator_jobs)
             runtime_by_id = {job.id: job for job in coordinator_jobs}
             terminal_records: list[ExportJobRecord] = []
@@ -392,6 +397,17 @@ class DailyAutomationEngine:
             await self._sleep(max((retry_at - self._now().astimezone(UTC)).total_seconds(), 0.0))
         message = "unreachable batch retry state"
         raise AssertionError(message)
+
+    def _pause_collision(
+        self,
+        automation: DailyAutomation,
+        records: list[ExportJobRecord],
+        error: OutputCollisionError,
+    ) -> None:
+        for record in records:
+            if record.status == "pending":
+                self.registry.update_job(replace(record, status="failed", error=str(error), updated_at=self._now()))
+        self.registry.pause(automation.id, f"Export Artifact collision requires review: {error}")
 
     @staticmethod
     def _batch_config(connection: ConnectionSettings, automation: DailyAutomation, day: date) -> Config:
