@@ -363,7 +363,6 @@ class WebState:
         self._download_terminal_generation = 0
         self._job_mutation_lock = asyncio.Lock()
         self._schedule_mutation_lock = asyncio.Lock()
-        self._reserved_output_paths: set[str] = set()
         self._schedule_persist_lock = asyncio.Lock()
         self._job_persist_lock = asyncio.Lock()
         self._schedule_state_file = settings.data_dir / "web-schedules.json"
@@ -478,7 +477,7 @@ class WebState:
             raise ValueError(message)
         async with self._job_mutation_lock:
             await self._ensure_export_capacity(len(selected))
-            jobs, planned_keys = self._plan_export_jobs(
+            jobs = self._plan_export_jobs(
                 selected,
                 start,
                 end,
@@ -487,31 +486,24 @@ class WebState:
                 full_day=full_day,
             )
             previous_jobs = dict(self.jobs)
-            previous_reservations = set(self._reserved_output_paths)
-            self._reserved_output_paths.update(planned_keys)
-            self.jobs.update((job.id, job) for job in jobs)
-            self._trim_jobs()
-            try:
-                await self._persist_jobs()
-            except Exception:
-                self.jobs = previous_jobs
-                self._reserved_output_paths = previous_reservations
-                raise
 
-            started_tasks: list[asyncio.Task[None]] = []
-            try:
-                for job in jobs:
-                    job.task = asyncio.create_task(self._run_job(job), name=f"export-{job.id}")
-                    started_tasks.append(job.task)
-            except Exception:
-                for task in started_tasks:
-                    task.cancel()
-                if started_tasks:
-                    await asyncio.gather(*started_tasks, return_exceptions=True)
-                self.jobs = previous_jobs
-                self._reserved_output_paths = previous_reservations
+            async def persist_intent(claimed: tuple[CoordinatorJob, ...]) -> None:
+                for job, runtime in zip(jobs, claimed, strict=True):
+                    job.output = runtime.output
+                    self.jobs[job.id] = job
+                self._trim_jobs()
                 await self._persist_jobs()
+
+            try:
+                runtimes = await self._coordinator.submit(
+                    (self._job_spec(job) for job in jobs),
+                    before_admission=persist_intent,
+                )
+            except BaseException:
+                self.jobs = previous_jobs
                 raise
+            for job, runtime in zip(jobs, runtimes, strict=True):
+                job.task = asyncio.create_task(self._run_job(job, runtime), name=f"export-{job.id}")
             self._changed()
             return jobs
 
@@ -524,22 +516,13 @@ class WebState:
         *,
         daily: bool,
         full_day: bool,
-    ) -> tuple[list[ExportJob], set[str]]:
+    ) -> list[ExportJob]:
         base_config = self.settings.config(start, end, speed, daily=daily, full_day=full_day)
         jobs: list[ExportJob] = []
-        planned_keys: set[str] = set()
         for camera in cameras:
             output = self.settings.output_dir / default_output_path(base_config, camera).name
             if daily:
                 output = daily_output_path(base_config, camera, self.settings.output_dir)
-            key = self._output_key(output)
-            if key in planned_keys:
-                message = "Selected cameras resolve to the same output path. No exports were started."
-                raise ValueError(message)
-            if key in self._reserved_output_paths:
-                message = f"An export is already writing {output.name}."
-                raise ValueError(message)
-            planned_keys.add(key)
             jobs.append(
                 ExportJob(
                     id=secrets.token_urlsafe(9),
@@ -553,7 +536,7 @@ class WebState:
                     created_at=self.settings.now(),
                 )
             )
-        return jobs, planned_keys
+        return jobs
 
     async def cancel_or_remove_job(self, job_id: str) -> str:
         """Cancel an active job or delete a terminal job and its output file."""
@@ -579,10 +562,7 @@ class WebState:
                     raise
                 self._changed()
                 return "removed"
-        if job.daily:
-            await self._coordinator.cancel(job.id)
-        elif job.task is not None:
-            job.task.cancel()
+        await self._coordinator.cancel(job.id)
         return "cancelled"
 
     async def retry_job(self, job_id: str) -> ExportJob:
@@ -676,8 +656,8 @@ class WebState:
         """Compatibility wrapper for the version-2 Resume action."""
         return await self.resume_automation(schedule_id)
 
-    async def _run_job(self, job: ExportJob) -> None:
-        """Submit one persisted manual export to the runtime-wide coordinator."""
+    def _job_spec(self, job: ExportJob) -> ExportJobSpec:
+        """Describe a manual export using the coordinator-provided output."""
         config = self.settings.config(
             job.start,
             job.end,
@@ -693,29 +673,23 @@ class WebState:
             job.elapsed_seconds = progress.elapsed_seconds
             self._changed()
 
-        async def operation() -> None:
-            if job.output.exists():
-                message = "A file already exists for this camera and time range."
-                raise ValueError(message)
-            await self._exporter(config, job.camera, job.output, report_progress)
+        async def operation(output: Path) -> None:
+            await self._exporter(config, job.camera, output, report_progress)
 
-        runtime_jobs = await self._coordinator.submit(
-            [
-                ExportJobSpec.create(
-                    output=job.output,
-                    operation=operation,
-                    job_id=job.id,
-                )
-            ]
+        return ExportJobSpec.create(
+            output=job.output,
+            operation=operation,
+            job_id=job.id,
+            collision_policy="reject",
         )
-        runtime = runtime_jobs[0]
+
+    async def _run_job(self, job: ExportJob, runtime: CoordinatorJob) -> None:
+        """Wait for a submitted export and forward cancellation to its owner."""
         try:
-            await self._coordinator.wait(runtime_jobs)
+            await self._coordinator.wait((runtime,))
         except asyncio.CancelledError:
-            await self._coordinator.cancel(runtime.id)
+            await self._coordinator.cancel(job.id)
             raise
-        finally:
-            self._reserved_output_paths.discard(self._output_key(job.output))
 
     async def _coordinator_transition(self, runtime: CoordinatorJob) -> None:
         """Project coordinator state into the retained Web job history."""
@@ -740,6 +714,7 @@ class WebState:
         if job is None:
             return
         projected_status = "queued" if runtime.status == "pending" else runtime.status
+        job.output = runtime.output
         job.status = cast("JobStatus", projected_status)
         job.started_at = runtime.started_at.astimezone(self.settings.timezone) if runtime.started_at else None
         job.finished_at = runtime.finished_at.astimezone(self.settings.timezone) if runtime.finished_at else None
@@ -803,7 +778,7 @@ class WebState:
         quota_bytes = self.settings.web_storage_quota_mib * MEBIBYTE
         usage_bytes = await asyncio.to_thread(self._output_storage_bytes)
         per_job_bytes = self.settings.max_download_mib * MEBIBYTE or quota_bytes
-        reserved_bytes = len(self._reserved_output_paths) * per_job_bytes
+        reserved_bytes = sum(not job.terminal for job in self._coordinator.jobs) * per_job_bytes
         if usage_bytes + reserved_bytes + requested_jobs * per_job_bytes > quota_bytes:
             message = "The configured export storage quota cannot reserve space for this request."
             raise WebCapacityError(message)
@@ -824,10 +799,6 @@ class WebState:
         )
         for job in terminal[: max(len(self.jobs) - MAX_VISIBLE_JOBS, 0)]:
             self.jobs.pop(job.id, None)
-
-    @staticmethod
-    def _output_key(path: Path) -> str:
-        return str(path.resolve()).casefold()
 
     def _changed(self) -> None:
         self.version += 1

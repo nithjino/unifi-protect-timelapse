@@ -211,12 +211,12 @@ internal sealed class BackendSession
             {
                 ["id"] = handshakeId,
                 ["command"] = "handshake",
-                ["protocol_version"] = 2,
+                ["protocol_version"] = 3,
             };
             if (_recentCrashes >= 2) handshake["recovery_mode"] = "quiescent";
             await WriteAsync(JsonSerializer.Serialize(handshake));
             var handshakeResult = await handshakeCompletion.Task.WaitAsync(TimeSpan.FromSeconds(10));
-            if (handshakeResult.ExitCode != 0) throw new InvalidOperationException("Backend protocol version 2 was rejected.");
+            if (handshakeResult.ExitCode != 0) throw new InvalidOperationException("Backend protocol version 3 was rejected.");
         }
         finally
         {

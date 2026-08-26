@@ -89,7 +89,7 @@ from timelapse.config import (
     ConnectionSettings,
 )
 from timelapse.download import DownloadProgress, default_output_path
-from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
+from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo, parse_connection
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
@@ -143,7 +143,9 @@ _COLUMN_EXPECTED = 6
 _COLUMN_SPEED = 7
 _COLUMN_OUTPUT = 8
 _COLUMN_ACTION = 9
-_ManualExporter = Callable[[Config, CameraInfo, Path, Callable[[DownloadProgress], None]], Awaitable[None]]
+_ManualExporter = Callable[
+    [Config, CameraInfo, Path, Callable[[DownloadProgress], None], Callable[[Path], None]], Awaitable[None]
+]
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
 
@@ -532,6 +534,7 @@ class _QtAutomationRuntime:
         camera: CameraInfo,
         output: Path,
         progress_callback: Callable[[DownloadProgress], None],
+        path_claimed: Callable[[Path], None],
     ) -> None:
         loop = self._loop
         coordinator = self._coordinator
@@ -541,20 +544,27 @@ class _QtAutomationRuntime:
         job_id = f"qt-manual:{uuid.uuid4()}"
 
         async def coordinate() -> None:
+            async def confirm_path(jobs: tuple[CoordinatorJob, ...]) -> None:
+                path_claimed(jobs[0].output)
+
             jobs = await coordinator.submit(
                 [
                     ExportJobSpec.create(
                         output=output,
-                        operation=lambda: export_timelapse(config, camera, output, progress_callback),
+                        operation=lambda claimed: export_timelapse(config, camera, claimed, progress_callback),
+                        collision_policy="suffix",
                         job_id=job_id,
                     )
-                ]
+                ],
+                before_admission=confirm_path,
             )
             try:
                 await coordinator.wait(jobs)
             except asyncio.CancelledError:
                 await coordinator.cancel(job_id)
                 raise
+            if jobs[0].status == "cancelled":
+                raise asyncio.CancelledError
             if jobs[0].status == "failed":
                 raise TimelapseError(jobs[0].error or "manual export failed")
 
@@ -1163,6 +1173,7 @@ class _ThumbnailPopup(QFrame):
 
 
 class _DownloadWorker(QThread):
+    output_claimed: ClassVar[Signal] = Signal(str)
     progress_changed: ClassVar[Signal] = Signal(object)
     download_succeeded: ClassVar[Signal] = Signal(str)
     download_failed: ClassVar[Signal] = Signal(str)
@@ -1176,7 +1187,7 @@ class _DownloadWorker(QThread):
         output: Path,
         parent: QWidget | None = None,
         *,
-        exporter: _ManualExporter = export_timelapse,
+        exporter: _ManualExporter | None = None,
     ) -> None:
         super().__init__(parent)
         self._config = config
@@ -1193,7 +1204,7 @@ class _DownloadWorker(QThread):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         task = asyncio.ensure_future(
-            self._exporter(self._config, self._camera, self._output, self._report_progress),
+            self._export(),
             loop=loop,
         )
         with self._lock:
@@ -1219,6 +1230,16 @@ class _DownloadWorker(QThread):
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
             asyncio.set_event_loop(None)
+
+    async def _export(self) -> None:
+        if self._exporter is None:
+            message = "the runtime export coordinator is unavailable"
+            raise TimelapseError(message)
+        await self._exporter(self._config, self._camera, self._output, self._report_progress, self._report_output)
+
+    def _report_output(self, output: Path) -> None:
+        self._output = output
+        self.output_claimed.emit(str(output))
 
     @property
     def config(self) -> Config:
@@ -1271,7 +1292,6 @@ class _MainWindow(QMainWindow):
         self._workers: dict[_DownloadWorker, _DownloadEntry] = {}
         self._rate_limited_queue: deque[_DownloadEntry] = deque()
         self._entries: list[_DownloadEntry] = []
-        self._reserved_paths: set[str] = set()
         self._next_job_number = 1
         self._automation_runtime: _QtAutomationRuntime | None = None
         self._adjusting_full_day = False
@@ -2176,7 +2196,7 @@ class _MainWindow(QMainWindow):
         self._next_job_number += 1
         for camera in self._selected_cameras:
             preferred = output_directory / default_output_path(config, camera).name
-            output = self._reserve_output_path(preferred)
+            output = preferred
             worker = self._new_download_worker(config, camera, output)
             entry = self._add_download_row(job_number, camera, output, worker, config=config)
             self._start_download_worker(entry, worker)
@@ -2185,22 +2205,9 @@ class _MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Started job {job_number} with {len(self._selected_cameras)} downloads")
         _LOGGER.info("Started job %d with %d downloads", job_number, len(self._selected_cameras))
 
-    def _reserve_output_path(self, preferred: Path) -> Path:
-        candidate = preferred.resolve()
-        counter = 2
-        while candidate.exists() or self._reservation_key(candidate) in self._reserved_paths:
-            candidate = preferred.with_name(f"{preferred.stem}_{counter}{preferred.suffix}").resolve()
-            counter += 1
-        self._reserved_paths.add(self._reservation_key(candidate))
-        return candidate
-
     def _new_download_worker(self, config: Config, camera: CameraInfo, output: Path) -> _DownloadWorker:
-        exporter = self._automation_runtime.export_manual if self._automation_runtime is not None else export_timelapse
+        exporter = self._automation_runtime.export_manual if self._automation_runtime is not None else None
         return _DownloadWorker(config, camera, output, self, exporter=exporter)
-
-    @staticmethod
-    def _reservation_key(path: Path) -> str:
-        return str(path).casefold()
 
     def _add_download_row(
         self,
@@ -2254,6 +2261,7 @@ class _MainWindow(QMainWindow):
     def _start_download_worker(self, entry: _DownloadEntry, worker: _DownloadWorker) -> None:
         entry.worker = worker
         self._workers[worker] = entry
+        worker.output_claimed.connect(partial(self._download_output_claimed, entry))
         worker.progress_changed.connect(partial(self._download_progress, entry))
         worker.download_succeeded.connect(partial(self._download_succeeded, entry))
         worker.download_failed.connect(partial(self._download_failed, entry))
@@ -2451,7 +2459,12 @@ class _MainWindow(QMainWindow):
                 continue
             self._set_entry_text(entry, _COLUMN_SPEED, "0 bytes/s")
 
-    def _download_succeeded(self, entry: _DownloadEntry, _output_text: str) -> None:
+    def _download_output_claimed(self, entry: _DownloadEntry, output_text: str) -> None:
+        entry.output = Path(output_text)
+        self._set_entry_text(entry, _COLUMN_OUTPUT, entry.output.name, tooltip=output_text)
+
+    def _download_succeeded(self, entry: _DownloadEntry, output_text: str) -> None:
+        self._download_output_claimed(entry, output_text)
         entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = True
@@ -2495,7 +2508,6 @@ class _MainWindow(QMainWindow):
         entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = False
-        self._reserved_paths.discard(self._reservation_key(entry.output))
         self._set_entry_text(entry, _COLUMN_STATUS, "Failed", tooltip=message)
         self._set_entry_text(entry, _COLUMN_SPEED, "—")
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
@@ -2511,7 +2523,6 @@ class _MainWindow(QMainWindow):
         entry.queued_for_rate_limit = False
         entry.terminal = True
         entry.completed = False
-        self._reserved_paths.discard(self._reservation_key(entry.output))
         self._set_entry_text(entry, _COLUMN_STATUS, "Cancelled")
         self._set_entry_text(entry, _COLUMN_SPEED, "—")
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry), enabled=False)
@@ -2533,7 +2544,6 @@ class _MainWindow(QMainWindow):
         entry.terminal = True
         entry.completed = False
         entry.cancelling = False
-        self._reserved_paths.discard(self._reservation_key(entry.output))
         self._set_entry_text(entry, _COLUMN_STATUS, "Cancelled")
         self._set_entry_text(entry, _COLUMN_SPEED, "—")
         self._set_action_button(entry, "Restart", partial(self._restart_download, entry))
@@ -2643,7 +2653,6 @@ class _MainWindow(QMainWindow):
                 f"Move or remove {entry.output.name} before restarting this job.",
             )
             return
-        self._reserved_paths.add(self._reservation_key(entry.output))
         entry.queued_for_rate_limit = False
         entry.terminal = False
         entry.cancelling = False

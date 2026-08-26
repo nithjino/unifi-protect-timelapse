@@ -144,6 +144,8 @@ def _prompt_verify_ssl() -> bool:
 
 
 async def _export(config: Config, camera: CameraInfo, output: Path) -> None:
+    # One-shot CLI exports have no co-resident automation runtime; the download
+    # layer rejects existing artifacts without a process-wide coordinator.
     _write_stdout(f"Requesting {config.speed} timelapse export for {camera_name(camera)}...\n")
     try:
         await export_timelapse(config, camera, output, _print_progress)

@@ -953,7 +953,7 @@ def test_job_persistence_failure_rolls_back_without_starting_export(
     asyncio.run(exercise())
 
     assert not state.jobs
-    assert not state._reserved_output_paths
+    assert not state._coordinator.jobs
     assert not list(state.settings.output_dir.glob("*.mp4"))
 
 
@@ -1122,3 +1122,49 @@ def test_paused_automation_is_visible_as_needing_attention(tmp_path: Path) -> No
     assert "Needs Attention" in response.text
     assert ">Resume</button>" in response.text
     assert "Paused after 5 failed attempts" in response.text
+
+
+def test_web_claimed_path_is_durable_before_export_and_rejects_existing_artifact(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    exported = []
+
+    async def export(_config: Config, _camera: CameraInfo, output: Path, _progress: object) -> None:
+        payload = json.loads((settings.data_dir / "web-jobs.json").read_text(encoding="utf-8"))
+        assert any(job["output_name"] == output.name for job in payload["jobs"])
+        output.write_bytes(b"video")  # noqa: ASYNC240 - test exporter
+        exported.append(output)
+
+    state = WebState(settings, camera_loader=_cameras, exporter=export)
+
+    async def exercise() -> None:
+        await state.start()
+        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+        jobs = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
+        assert jobs[0].task is not None
+        await jobs[0].task
+        assert exported == [jobs[0].output]
+        with pytest.raises(ValueError, match="already exists"):
+            await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
+        assert len(exported) == 1
+        await state.close()
+
+    asyncio.run(exercise())
+
+
+def test_web_cancellation_before_waiter_starts_prevents_execution(tmp_path: Path) -> None:
+    state = WebState(_settings(tmp_path), camera_loader=_cameras, exporter=_export)
+
+    async def exercise() -> None:
+        await state.start()
+        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+        jobs = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
+        await state.cancel_or_remove_job(jobs[0].id)
+        assert jobs[0].task is not None
+        await jobs[0].task
+        assert jobs[0].status == "cancelled"
+        assert not jobs[0].output.exists()
+        replacement = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
+        await state.cancel_or_remove_job(replacement[0].id)
+        await state.close()
+
+    asyncio.run(exercise())

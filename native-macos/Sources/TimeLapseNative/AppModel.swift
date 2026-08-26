@@ -42,7 +42,6 @@ final class AppModel: ObservableObject {
     private var downloadReceivedTerminal: Set<UUID> = []
     private var rateLimitedDownloadQueue: [UUID] = []
     private var handledQueuedCancellations: Set<UUID> = []
-    private var reservedOutputPaths: Set<String> = []
     private var nextGroupNumber = 1
     private var didStart = false
     private var isShuttingDown = false
@@ -850,7 +849,6 @@ final class AppModel: ObservableObject {
             )
             return
         }
-        reservedOutputPaths.insert(job.outputURL.path.lowercased())
         job.state = .preparing
         job.downloadedBytes = 0
         job.totalBytes = nil
@@ -902,7 +900,6 @@ final class AppModel: ObservableObject {
         for id in rateLimitedDownloadQueue {
             guard let job = jobs.first(where: { $0.id == id }), job.state == .queued else { continue }
             job.state = .cancelled
-            releaseOutputURL(job.outputURL)
         }
         rateLimitedDownloadQueue.removeAll()
         cameraProcess?.cancel()
@@ -1039,7 +1036,7 @@ final class AppModel: ObservableObject {
         daily: Bool = false,
         fullDay: Bool = false
     ) -> DownloadJob {
-        let outputURL = reserveOutputURL(
+        let outputURL = Self.expectedOutputURL(
             camera: camera,
             start: start,
             end: end,
@@ -1094,7 +1091,6 @@ final class AppModel: ObservableObject {
             job.state = .failed(error.localizedDescription)
             downloadReceivedTerminal.insert(job.id)
             downloadProcesses.removeValue(forKey: job.id)
-            releaseOutputURL(job.outputURL)
             appendLog(level: "ERROR", message: "Download failed for \(job.camera.name): \(error.localizedDescription)")
             sendDownloadNotification(
                 title: "Download Failed",
@@ -1106,6 +1102,8 @@ final class AppModel: ObservableObject {
     private func handleDownloadEvent(_ event: BackendEvent, job: DownloadJob) {
         guard event.id == nil || event.id == job.id.uuidString else { return }
         switch event.event {
+        case "accepted":
+            if let output = event.output { job.outputURL = URL(fileURLWithPath: output) }
         case "progress":
             if job.state != .cancelling { job.state = .downloading }
             job.downloadedBytes = event.downloadedBytes ?? job.downloadedBytes
@@ -1179,9 +1177,6 @@ final class AppModel: ObservableObject {
         downloadProcesses.removeValue(forKey: job.id)
         downloadReceivedTerminal.remove(job.id)
         let queuedCancellationWasHandled = handledQueuedCancellations.remove(job.id) != nil
-        if job.state != .queued {
-            releaseOutputURL(job.outputURL)
-        }
         let shouldAdvanceQueue = (job.state == .completed || job.state == .cancelled)
             && !queuedCancellationWasHandled
         if downloadProcesses.isEmpty {
@@ -1205,7 +1200,6 @@ final class AppModel: ObservableObject {
         rateLimitedDownloadQueue.removeAll { $0 == job.id }
         job.state = .cancelled
         job.bytesPerSecond = 0
-        releaseOutputURL(job.outputURL)
         appendLog(level: "INFO", message: "Cancelled queued camera download: \(job.camera.name)")
         sendDownloadNotification(
             title: "Download Interrupted",
@@ -1231,46 +1225,6 @@ final class AppModel: ObservableObject {
             appendLog(level: "INFO", message: statusMessage)
             return
         }
-    }
-
-    private func reserveOutputURL(
-        camera: CameraInfo,
-        start: Date,
-        end: Date,
-        speed: String,
-        outputDirectory: URL,
-        daily: Bool,
-        fullDay: Bool
-    ) -> URL {
-        let expected = Self.expectedOutputURL(
-            camera: camera,
-            start: start,
-            end: end,
-            speed: speed,
-            outputDirectory: outputDirectory,
-            daily: daily,
-            fullDay: fullDay
-        )
-        if daily {
-            reservedOutputPaths.insert(expected.path.lowercased())
-            return expected
-        }
-        let base = expected.deletingPathExtension().lastPathComponent
-        var counter = 1
-        while true {
-            let suffix = counter == 1 ? "" : "_\(counter)"
-            let candidate = outputDirectory.appendingPathComponent("\(base)\(suffix).mp4")
-            let key = candidate.path.lowercased()
-            if !FileManager.default.fileExists(atPath: candidate.path), !reservedOutputPaths.contains(key) {
-                reservedOutputPaths.insert(key)
-                return candidate
-            }
-            counter += 1
-        }
-    }
-
-    private func releaseOutputURL(_ url: URL) {
-        reservedOutputPaths.remove(url.path.lowercased())
     }
 
     private static func expectedOutputURL(
