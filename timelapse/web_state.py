@@ -22,7 +22,13 @@ from timelapse.automation_registry import (
     DailyAutomation,
     RegistryError,
 )
-from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
+from timelapse.config import (
+    DEFAULT_MAX_DOWNLOAD_MIB,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    SPEED_TO_FPS,
+    Config,
+    ConnectionSettings,
+)
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo
@@ -50,7 +56,7 @@ SCHEDULE_RETRY_MAX_SECONDS = 60.0 * 60
 SCHEDULE_RETRY_MAX_FAILURES = 5
 _LOGGER = logging.getLogger(__name__)
 
-CameraLoader = Callable[[Config], Awaitable[list[CameraInfo]]]
+CameraLoader = Callable[[Config | ConnectionSettings], Awaitable[list[CameraInfo]]]
 ThumbnailLoader = Callable[[Config, CameraInfo, datetime], Awaitable[CameraThumbnail]]
 Exporter = Callable[[Config, CameraInfo, Path, Callable[[DownloadProgress], None] | None], Awaitable[None]]
 
@@ -223,6 +229,24 @@ class WebSettings:
         start = self.localize(datetime.combine(day, datetime.min.time()))
         end = self.localize(datetime.combine(day + timedelta(days=1), datetime.min.time()))
         return start, end
+
+    def connection_settings(self) -> ConnectionSettings:
+        """Resolve server connection facts without choosing export policy."""
+        if self.missing_connection_values:
+            missing = ", ".join(self.missing_connection_values)
+            message = f"Server configuration is incomplete. Set {missing} and restart the web server."
+            raise ValueError(message)
+        return ConnectionSettings(
+            instance_url=self.instance_url,
+            token=self.token,
+            username=self.username,
+            password=self.password,
+            verify_ssl=self.verify_ssl,
+            request_timeout_seconds=self.request_timeout_seconds,
+            max_download_mib=self.max_download_mib,
+            connection_kind="web-environment",
+            connection_value="default",
+        )
 
     def config(
         self,
@@ -409,9 +433,7 @@ class WebState:
         async with self._camera_lock:
             if self._cameras and not refresh and loop.time() - self._cameras_loaded_at < CAMERA_CACHE_SECONDS:
                 return list(self._cameras)
-            now = self.settings.now()
-            config = self.settings.config(now, now + timedelta(seconds=1), "600x")
-            self._cameras = await self._camera_loader(config)
+            self._cameras = await self._camera_loader(self.settings.connection_settings())
             self._cameras_loaded_at = loop.time()
             return list(self._cameras)
 
@@ -755,9 +777,7 @@ class WebState:
             self._changed()
 
     async def _resolve_web_automation(self, _automation: DailyAutomation) -> ResolvedAutomation:
-        now = self.settings.now()
-        config = self.settings.config(now, now + timedelta(seconds=1), "600x", daily=True)
-        return ResolvedAutomation(config, tuple(await self.cameras(refresh=True)))
+        return ResolvedAutomation(self.settings.connection_settings(), tuple(await self.cameras(refresh=True)))
 
     async def _export_automation_job(self, config: Config, camera: CameraInfo, output: Path) -> None:
         await self._exporter(config, camera, output, None)

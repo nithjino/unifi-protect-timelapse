@@ -115,3 +115,6 @@ jobs:
 
       - name: Build native Windows client
         run: dotnet build native-windows/TimeLapseNative.csproj --configuration Release
+
+      - name: Test native Windows protocol
+        run: dotnet test native-windows-tests/TimeLapseNative.Tests.csproj --configuration Release

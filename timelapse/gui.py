@@ -81,7 +81,13 @@ from timelapse.automation_registry import (
     DailyAutomation,
     RegistryError,
 )
-from timelapse.config import DEFAULT_MAX_DOWNLOAD_MIB, DEFAULT_REQUEST_TIMEOUT_SECONDS, SPEED_TO_FPS, Config
+from timelapse.config import (
+    DEFAULT_MAX_DOWNLOAD_MIB,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+    SPEED_TO_FPS,
+    Config,
+    ConnectionSettings,
+)
 from timelapse.download import DownloadProgress, default_output_path
 from timelapse.jobs import ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo, parse_connection
@@ -431,9 +437,19 @@ class _QtAutomationRuntime:
         if profile is None:
             message = f"Qt connection profile {automation.connection.value!r} is unavailable"
             raise RegistryError(message)
-        now = datetime.now().astimezone()
-        config = profile.settings.make_config(now, now + timedelta(seconds=1), automation.speed)
-        return ResolvedAutomation(config, tuple(await list_available_cameras(config)))
+        settings = profile.settings
+        connection = ConnectionSettings(
+            instance_url=settings.instance_url.strip().rstrip("/"),
+            token=settings.token,
+            username=settings.username,
+            password=settings.password,
+            verify_ssl=settings.verify_ssl,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            max_download_mib=settings.max_download_mib,
+            connection_kind=automation.connection.kind,
+            connection_value=automation.connection.value,
+        )
+        return ResolvedAutomation(connection, tuple(await list_available_cameras(connection)))
 
     def _submit(self, operation: Callable[[], object]) -> object:
         loop = self._loop

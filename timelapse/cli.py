@@ -15,7 +15,7 @@ import sys
 import tempfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,7 +33,7 @@ from timelapse.automation_registry import (
     RegistryOwner,
     canonical_output_directory,
 )
-from timelapse.config import Config, CreateProfile, parse_args
+from timelapse.config import Config, ConnectionSettings, CreateProfile, parse_args
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.jobs import ExportJobCoordinator
 from timelapse.profiles import ConnectionProfile, ProfileError, load_profile, save_profile
@@ -345,12 +345,11 @@ async def _resolve_automation(automation: DailyAutomation) -> ResolvedAutomation
 
 
 async def _resolve_reference(reference: ConnectionReference) -> ResolvedAutomation:
-    now = datetime.now().astimezone()
     if reference.kind == "python-profile":
         profile = load_profile(reference.value)
-        config = _config_from_profile(profile, now)
+        config = _connection_from_profile(profile)
     elif reference.kind == "dotenv":
-        config = _config_from_dotenv(Path(reference.value), now)
+        config = _connection_from_dotenv(Path(reference.value))
     else:
         message = f"CLI cannot resolve {reference.kind} connection references"
         raise RegistryError(message)
@@ -358,17 +357,13 @@ async def _resolve_reference(reference: ConnectionReference) -> ResolvedAutomati
     return ResolvedAutomation(config, cameras)
 
 
-def _config_from_profile(profile: ConnectionProfile, now: datetime) -> Config:
-    return Config(
+def _connection_from_profile(profile: ConnectionProfile) -> ConnectionSettings:
+    return ConnectionSettings(
         instance_url=profile.instance_url,
         token=profile.token,
         username=profile.username,
         password=profile.password,
         verify_ssl=profile.verify_ssl,
-        speed="600x",
-        start=now,
-        end=now + timedelta(seconds=1),
-        output=None,
         request_timeout_seconds=0,
         max_download_mib=10 * 1024,
         connection_kind="python-profile",
@@ -376,7 +371,7 @@ def _config_from_profile(profile: ConnectionProfile, now: datetime) -> Config:
     )
 
 
-def _config_from_dotenv(path: Path, now: datetime) -> Config:
+def _connection_from_dotenv(path: Path) -> ConnectionSettings:
     absolute = path.expanduser()
     if not absolute.is_absolute():
         message = "dotenv connection references must use an absolute path"
@@ -391,16 +386,12 @@ def _config_from_dotenv(path: Path, now: datetime) -> Config:
         return value
 
     verify_ssl = str(values.get("UNIFI_PROTECT_VERIFY_SSL", "true")).strip().casefold() in {"1", "true", "yes", "on"}
-    return Config(
+    return ConnectionSettings(
         instance_url=required("UNIFI_PROTECT_URL").rstrip("/"),
         token=required("UNIFI_PROTECT_TOKEN"),
         username=required("UNIFI_PROTECT_USERNAME"),
         password=required("UNIFI_PROTECT_PASSWORD"),
         verify_ssl=verify_ssl,
-        speed="600x",
-        start=now,
-        end=now + timedelta(seconds=1),
-        output=None,
         request_timeout_seconds=int(values.get("TIMELAPSE_REQUEST_TIMEOUT_SECONDS", "0") or 0),
         max_download_mib=int(values.get("TIMELAPSE_MAX_DOWNLOAD_MIB", str(10 * 1024)) or 0),
         connection_kind="dotenv",

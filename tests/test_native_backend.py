@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import timelapse.native_backend as backend
+from timelapse.config import ConnectionSettings
 from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
@@ -243,6 +244,20 @@ def test_native_automation_registry_never_persists_hydrated_secrets(
     registry_path = tmp_path / "automations.json"
     monkeypatch.setattr(backend, "_write_event", events.append)
 
+    async def cameras(connection: object) -> list[CameraInfo]:
+        assert isinstance(connection, ConnectionSettings)
+        assert connection.connection_kind == "native-profile"
+        assert connection.max_download_mib == 10240
+        return [CameraInfo("camera-1", "Front Door", None, None)]
+
+    async def export(config: Config, _camera: CameraInfo, output: Path) -> None:
+        assert config.speed == "120x"
+        assert "120x" in output.name
+        output.write_bytes(b"\0\0\0\x18ftypisom")  # noqa: ASYNC240 - test exporter
+
+    monkeypatch.setattr(backend, "list_available_cameras", cameras)
+    monkeypatch.setattr(backend, "export_timelapse", export)
+
     async def exercise() -> None:
         supervisor = backend.NativeSessionSupervisor(registry_path)
         supervisor.registry.load()
@@ -261,7 +276,7 @@ def test_native_automation_registry_never_persists_hydrated_secrets(
                 "name": "Front Door",
                 "profile_id": "profile-1",
                 "cameras": [{"id": "camera-1", "name": "Front Door"}],
-                "speed": "600x",
+                "speed": "120x",
                 "output_directory": str(output),
                 "timezone": "America/New_York",
             },
@@ -269,6 +284,9 @@ def test_native_automation_registry_never_persists_hydrated_secrets(
         for request in requests:
             await supervisor.accept(request)
             await asyncio.gather(*supervisor._tasks.values())
+        result = await supervisor.engine.run_due_once(supervisor.registry.list()[0].id)
+        assert result is not None
+        assert result.completed
         await supervisor.close()
 
     asyncio.run(exercise())
