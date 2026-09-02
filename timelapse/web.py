@@ -57,8 +57,9 @@ SESSION_COOKIE = "timelapse_session"
 LOGIN_FAILURE_LIMIT = 5
 LOGIN_FAILURE_WINDOW_SECONDS = 60.0
 LOW_STORAGE_PERCENT = 20
-JOB_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
-SCHEDULE_ID = Annotated[str, ApiPath(min_length=8, max_length=32)]
+# Registry IDs include automation prefixes and composite batch/camera identifiers.
+JOB_ID = Annotated[str, ApiPath(min_length=8)]
+SCHEDULE_ID = Annotated[str, ApiPath(min_length=8)]
 TIMESTAMP_QUERY = Annotated[str, Query(min_length=10, max_length=40)]
 NEXT_QUERY = Annotated[str | None, Query(alias="next")]
 _LOGGER = logging.getLogger(__name__)

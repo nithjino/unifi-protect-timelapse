@@ -436,14 +436,18 @@ def test_cancelled_export_does_not_render_file_size(tmp_path: Path) -> None:
     assert "job-file-size" not in jobs_response.text
 
 
-def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "job_id",
+    ["skipped01", "batch:auto_81d31296ae0844fa8156c962c2111efd:2026-09-01:0:6a355ee703d1f803e400b0dd"],
+)
+def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path, job_id: str) -> None:
     app, state = _app(tmp_path)
     start = datetime(2026, 7, 20, tzinfo=UTC)
     output = tmp_path / "data" / "exports" / "existing.mp4"
     output.parent.mkdir(parents=True)
     output.write_bytes(b"video")
     job = ExportJob(
-        id="skipped01",
+        id=job_id,
         camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
         start=start,
         end=start + timedelta(days=1),
@@ -463,8 +467,13 @@ def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path) -> N
 
     assert f'href="/exports/{job.id}"' in jobs_response.text
     assert f'data-video-url="/exports/{job.id}/play"' in jobs_response.text
+    assert download.status_code == 200
     assert download.content == b"video"
+    assert download.headers["content-type"] == "video/mp4"
+    assert download.headers["content-disposition"].startswith("attachment;")
+    assert playback.status_code == 200
     assert playback.content == b"video"
+    assert playback.headers["content-type"] == "video/mp4"
 
 
 def test_full_day_web_export_uses_date_only_filename(tmp_path: Path) -> None:
@@ -601,13 +610,45 @@ def test_unexpected_camera_failure_returns_correlated_server_error(tmp_path: Pat
     assert "database failure" not in response.text
 
 
-def test_missing_job_action_returns_not_found(tmp_path: Path) -> None:
+@pytest.mark.parametrize("job_id", ["missing01", "batch:auto_81d31296ae0844fa8156c962c2111efd:2026-09-01:0:missing"])
+def test_missing_job_action_returns_not_found(tmp_path: Path, job_id: str) -> None:
     app, _state = _app(tmp_path)
 
     with _client(app) as client:
-        response = client.delete("/actions/jobs/missing01")
+        response = client.delete(f"/actions/jobs/{job_id}")
 
     assert response.status_code == 404
+
+
+def test_failed_daily_export_can_be_retried(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    start = datetime(2026, 9, 1, tzinfo=UTC)
+    job = ExportJob(
+        id="batch:auto_81d31296ae0844fa8156c962c2111efd:2026-09-01:0:camera-1",
+        camera=CameraInfo(id="camera-1", name="Front Door", state="CONNECTED", model="G5 Pro"),
+        start=start,
+        end=start + timedelta(days=1),
+        speed="600x",
+        output=state.settings.output_dir / "failed.mp4",
+        daily=True,
+        full_day=True,
+        status="failed",
+    )
+    state.jobs[job.id] = job
+
+    with _client(app) as client:
+        retried = client.post(f"/actions/jobs/{job.id}/retry")
+        assert retried.status_code == 200
+        assert "Export queued again." in retried.text
+        removed = client.delete(f"/actions/jobs/{job.id}")
+        assert removed.status_code == 200
+        _wait_for_completed_jobs(client, state)
+        replacement = next(iter(state.jobs.values()))
+        assert replacement.id != job.id
+        assert replacement.start == job.start
+        assert replacement.end == job.end
+        assert replacement.daily is True
+        assert replacement.output.read_bytes() == b"video"
 
 
 def test_delete_job_removes_export_file_and_activity(tmp_path: Path) -> None:
@@ -1046,27 +1087,39 @@ def test_legacy_schedule_state_is_migrated_to_common_registry(tmp_path: Path) ->
     assert json.loads((settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))["version"] == 2
 
 
-def test_web_automation_can_be_stopped_and_resumed(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+def test_web_automation_can_be_stopped_resumed_and_removed(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    state.settings.data_dir.mkdir(parents=True)
+    state.settings.output_dir.mkdir(parents=True)
+    state._automation_registry.load()
+    automation = state._automation_registry.add(
+        name="Front Door",
+        cameras=(AutomationCamera("camera-1", "Front Door"),),
+        connection=ConnectionReference("web-environment", "default"),
+        speed="600x",
+        output_directory=state.settings.output_dir,
+        timezone="UTC",
+        next_day=state.settings.now().date(),
+    )
 
-    async def exercise() -> None:
-        await state.start()
-        automation = await state.create_automation("Front Door", ["camera-1"], "600x")
-        stopped = await state.stop_automation(automation.id)
-        assert stopped.status == "stopped"
-        resumed = await state.resume_automation(automation.id)
-        assert resumed.status == "active"
-        assert resumed.consecutive_failures == 0
-        await state.close()
+    with _client(app) as client:
+        stopped = client.post(f"/actions/automations/{automation.id}/stop")
+        assert stopped.status_code == 200
+        assert state.automations[automation.id].status == "stopped"
+        resumed = client.post(f"/actions/automations/{automation.id}/resume")
+        assert resumed.status_code == 200
+        assert state.automations[automation.id].status == "active"
+        assert state.automations[automation.id].consecutive_failures == 0
 
-    asyncio.run(exercise())
+        stored = json.loads((state.settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))
+        assert stored["automations"][0]["status"] == "active"
 
-    stored = json.loads((settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))
-    assert stored["automations"][0]["status"] == "active"
+        removed = client.delete(f"/actions/automations/{automation.id}")
+        assert removed.status_code == 200
+        assert automation.id not in state.automations
 
 
-def test_daily_artifact_is_projected_and_deleted_through_the_registry(tmp_path: Path) -> None:
+def test_daily_artifact_can_be_downloaded_played_and_deleted_after_restart(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
 
     async def export_daily(_config: Config, _camera: CameraInfo, output: Path, _progress: object) -> None:
@@ -1075,29 +1128,45 @@ def test_daily_artifact_is_projected_and_deleted_through_the_registry(tmp_path: 
         output.write_bytes(b"\0\0\0\x18ftypisom")  # noqa: ASYNC240 - synchronous test double
 
     state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export_daily)
+    app = create_app(settings, state=state)
 
-    async def exercise() -> None:
-        await state.start()
-        automation = await state.create_automation("Front Door", ["camera-1"], "120x")
-        for _ in range(100):
-            daily_jobs = [job for job in state.jobs.values() if job.daily and job.terminal]
-            if daily_jobs:
-                break
-            await asyncio.sleep(0.01)
-        else:
-            pytest.fail("Daily Automation artifact did not reach terminal Web history")
-        job = daily_jobs[0]
+    with _client(app) as client:
+        created = client.post(
+            "/actions/automations",
+            data={"automation_name": "Front Door", "camera_ids": ["camera-1"], "speed": "120x"},
+        )
+        assert created.status_code == 200
+        _wait_for_completed_jobs(client, state)
+        automation = next(iter(state.automations.values()))
+        job = next(iter(state.jobs.values()))
+        assert job.id.startswith(f"batch:{automation.id}:")
         assert job.status == "completed"
         assert job.output.exists()
-        processed_day = state.automations[automation.id].last_run_day
 
-        assert await state.cancel_or_remove_job(job.id) == "removed"
+    restored_state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export_daily)
+    with _client(create_app(settings, state=restored_state)) as client:
+        processed_day = restored_state.automations[automation.id].last_run_day
+        jobs_html = client.get("/partials/jobs").text
+        assert f'href="/exports/{job.id}"' in jobs_html
+        assert f'data-video-url="/exports/{job.id}/play"' in jobs_html
+        download = client.get(f"/exports/{job.id}")
+        assert download.status_code == 200
+        assert download.content == job.output.read_bytes()
+        assert download.headers["content-type"] == "video/mp4"
+        assert download.headers["content-disposition"].startswith("attachment;")
+        playback = client.get(f"/exports/{job.id}/play", headers={"Range": "bytes=4-7"})
+        assert playback.status_code == 206
+        assert playback.content == b"ftyp"
+        assert playback.headers["content-type"] == "video/mp4"
+        assert playback.headers["accept-ranges"] == "bytes"
+        assert playback.headers["content-range"] == "bytes 4-7/12"
+        removed = client.delete(f"/actions/jobs/{job.id}")
+        assert removed.status_code == 200
         assert not job.output.exists()
-        assert state._automation_registry.job(job.id) is None
-        assert state.automations[automation.id].last_run_day == processed_day
-        await state.close()
-
-    asyncio.run(exercise())
+        assert restored_state._automation_registry.job(job.id) is None
+        assert restored_state.automations[automation.id].last_run_day == processed_day
+        assert client.get(f"/exports/{job.id}").status_code == 404
+        assert client.get(f"/exports/{job.id}/play").status_code == 404
 
 
 def test_paused_automation_is_visible_as_needing_attention(tmp_path: Path) -> None:
