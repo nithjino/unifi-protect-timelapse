@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
@@ -13,14 +15,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
+from uiprotect.exceptions import NvrError
 
-from timelapse import OperationTimeoutError, TimelapseError, __version__
+from timelapse import OperationTimeoutError, TimelapseError, __version__, protect, service
 from timelapse.automation_registry import AutomationCamera, ConnectionReference
 from timelapse.download import DownloadProgress
-from timelapse.protect import CameraInfo
+from timelapse.protect import CameraInfo, ProtectClients
 from timelapse.service import CameraThumbnail
 from timelapse.web import APP_CSS_VERSION, create_app, main
-from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
+from timelapse.web_state import ExportJob, JobStatus, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -74,6 +77,10 @@ def _app(tmp_path: Path, *, web_password: str | None = None, configured: bool = 
     settings = _settings(tmp_path, web_password=web_password, configured=configured)
     state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
     return create_app(settings, state=state), state
+
+
+async def state_finished(state: WebState) -> None:
+    await state._coordinator.wait(job for job in state._coordinator.jobs if not job.terminal)
 
 
 def _client(app: FastAPI, *, host: str = "127.0.0.1") -> TestClient:
@@ -438,7 +445,7 @@ def test_cancelled_export_does_not_render_file_size(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "job_id",
-    ["skipped01", "batch:auto_81d31296ae0844fa8156c962c2111efd:2026-09-01:0:6a355ee703d1f803e400b0dd"],
+    ["daily0001", "batch:auto_81d31296ae0844fa8156c962c2111efd:2026-09-01:0:6a355ee703d1f803e400b0dd"],
 )
 def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path, job_id: str) -> None:
     app, state = _app(tmp_path)
@@ -455,8 +462,7 @@ def test_existing_daily_export_can_be_downloaded_and_played(tmp_path: Path, job_
         output=output,
         daily=True,
         full_day=True,
-        status="skipped",
-        error="A file already exists for this camera and time range.",
+        status="completed",
     )
     state.jobs[job.id] = job
 
@@ -749,7 +755,7 @@ def test_server_status_reports_host_storage_and_low_capacity(
     assert status.status_code == 200
     assert "<strong>Host Storage</strong>" in status.text
     assert f'data-storage-low="{storage_low}"' in status.text
-    assert f"{free_bytes} B free of 1000 B ({expected_percent}% available)" in " ".join(status.text.split())
+    assert f"{free_bytes} bytes free of 1000 bytes ({expected_percent}% available)" in " ".join(status.text.split())
 
 
 def test_daily_automation_is_persisted_without_credentials(tmp_path: Path) -> None:
@@ -766,7 +772,7 @@ def test_daily_automation_is_persisted_without_credentials(tmp_path: Path) -> No
 
     registry_path = settings.data_dir / "web-automations.json"
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
-    assert payload["version"] == 2
+    assert payload["version"] == 3
     assert payload["automations"][0]["cameras"][0]["id"] == "camera-1"
     assert payload["automations"][0]["connection"] == {"kind": "web-environment", "value": "default"}
     assert settings.token not in registry_path.read_text(encoding="utf-8")
@@ -781,8 +787,7 @@ def test_export_list_is_restored_after_restart(tmp_path: Path) -> None:
         start = datetime(2026, 7, 20, 8, tzinfo=UTC)
         jobs = await first_state.create_jobs(["camera-1"], start, start + timedelta(hours=2), "120x")
         job = jobs[0]
-        assert job.task is not None
-        await job.task
+        await state_finished(first_state)
         assert job.status == "completed"
         await first_state.close()
         return job.id
@@ -801,7 +806,6 @@ def test_export_list_is_restored_after_restart(tmp_path: Path) -> None:
         assert restored.output.read_bytes() == b"video"
         assert restored.total_bytes is None
         assert restored.display_file_size == len(b"video")
-        assert restored.task is None
         await second_state.close()
 
     asyncio.run(restore_export())
@@ -932,7 +936,7 @@ def test_web_export_queue_bounds_concurrency_duration_and_capacity(tmp_path: Pat
         with pytest.raises(WebCapacityError, match="queue is full"):
             await state.create_jobs(["camera-1"], start + timedelta(days=1), start + timedelta(days=1, hours=1), "120x")
         release.set()
-        await asyncio.gather(*(job.task for job in jobs if job.task is not None))
+        await state_finished(state)
         await state.close()
 
     asyncio.run(exercise())
@@ -1032,61 +1036,6 @@ def test_automation_persistence_failure_rolls_back_without_starting_task(
     assert not state._automation_tasks
 
 
-@pytest.mark.parametrize("payload", [[], {"version": 1, "schedules": ["invalid"]}])
-def test_invalid_schedule_state_is_quarantined_without_blocking_startup(tmp_path: Path, payload: object) -> None:
-    settings = _settings(tmp_path)
-    settings.data_dir.mkdir(parents=True)
-    state_file = settings.data_dir / "web-schedules.json"
-    state_file.write_text(json.dumps(payload), encoding="utf-8")
-    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
-
-    async def exercise() -> None:
-        await state.start()
-        assert not state.schedules
-        await state.close()
-
-    asyncio.run(exercise())
-
-    assert not state_file.exists()
-    assert len(list(settings.data_dir.glob("web-schedules.invalid-*.json"))) == 1
-
-
-def test_legacy_schedule_state_is_migrated_to_common_registry(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    settings.data_dir.mkdir(parents=True)
-    state_file = settings.data_dir / "web-schedules.json"
-    state_file.write_text(
-        json.dumps(
-            {
-                "schedules": [
-                    {
-                        "id": "legacy-schedule",
-                        "cameras": [{"id": "camera-1", "name": "Front Door", "state": None, "model": None}],
-                        "speed": "600x",
-                        "created_at": datetime(2026, 7, 20, tzinfo=UTC).isoformat(),
-                        "last_run_day": None,
-                        "paused": True,
-                    }
-                ]
-            }
-        ),
-        encoding="utf-8",
-    )
-    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
-
-    async def exercise() -> None:
-        await state.start()
-        assert len(state.automations) == 1
-        assert next(iter(state.automations.values())).paused is True
-        await state.close()
-
-    asyncio.run(exercise())
-
-    assert not state_file.exists()
-    assert state_file.with_name(f"{state_file.name}.v1-backup").exists()
-    assert json.loads((settings.data_dir / "web-automations.json").read_text(encoding="utf-8"))["version"] == 2
-
-
 def test_web_automation_can_be_stopped_resumed_and_removed(tmp_path: Path) -> None:
     app, state = _app(tmp_path)
     state.settings.data_dir.mkdir(parents=True)
@@ -1145,7 +1094,8 @@ def test_daily_artifact_can_be_downloaded_played_and_deleted_after_restart(tmp_p
 
     restored_state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export_daily)
     with _client(create_app(settings, state=restored_state)) as client:
-        processed_day = restored_state.automations[automation.id].last_run_day
+        processed_day = restored_state.automations[automation.id].last_completed_day
+        assert processed_day is not None
         jobs_html = client.get("/partials/jobs").text
         assert f'href="/exports/{job.id}"' in jobs_html
         assert f'data-video-url="/exports/{job.id}/play"' in jobs_html
@@ -1163,8 +1113,7 @@ def test_daily_artifact_can_be_downloaded_played_and_deleted_after_restart(tmp_p
         removed = client.delete(f"/actions/jobs/{job.id}")
         assert removed.status_code == 200
         assert not job.output.exists()
-        assert restored_state._automation_registry.job(job.id) is None
-        assert restored_state.automations[automation.id].last_run_day == processed_day
+        assert restored_state.automations[automation.id].last_completed_day == processed_day
         assert client.get(f"/exports/{job.id}").status_code == 404
         assert client.get(f"/exports/{job.id}/play").status_code == 404
 
@@ -1209,8 +1158,7 @@ def test_web_claimed_path_is_durable_before_export_and_rejects_existing_artifact
         await state.start()
         start = datetime(2026, 7, 20, 8, tzinfo=UTC)
         jobs = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
-        assert jobs[0].task is not None
-        await jobs[0].task
+        await state_finished(state)
         assert exported == [jobs[0].output]
         with pytest.raises(ValueError, match="already exists"):
             await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
@@ -1228,8 +1176,6 @@ def test_web_cancellation_before_waiter_starts_prevents_execution(tmp_path: Path
         start = datetime(2026, 7, 20, 8, tzinfo=UTC)
         jobs = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
         await state.cancel_or_remove_job(jobs[0].id)
-        assert jobs[0].task is not None
-        await jobs[0].task
         assert jobs[0].status == "cancelled"
         assert not jobs[0].output.exists()
         replacement = await state.create_jobs(["camera-1"], start, start + timedelta(hours=1), "120x")
@@ -1237,3 +1183,213 @@ def test_web_cancellation_before_waiter_starts_prevents_execution(tmp_path: Path
         await state.close()
 
     asyncio.run(exercise())
+
+
+def test_daily_export_reports_progress_to_the_job_list(tmp_path: Path) -> None:
+    seen: list[int | None] = []
+
+    async def export(_config: Config, _camera: CameraInfo, output: Path, progress: object) -> None:
+        assert callable(progress)
+        progress(DownloadProgress(downloaded_bytes=6, total_bytes=12, bytes_per_second=1.0, elapsed_seconds=6.0))
+        seen.append(next(iter(state.jobs.values())).total_bytes)
+        output.write_bytes(b"\0\0\0\x18ftypisom")  # noqa: ASYNC240 - test exporter
+
+    state = WebState(_settings(tmp_path), camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=export)
+
+    async def exercise() -> None:
+        await state.start()
+        await state.create_automation("Front Door", ["camera-1"], "600x")
+        for _ in range(100):
+            if seen and not state._coordinator.active_count:
+                break
+            await asyncio.sleep(0.01)
+        await state.close()
+
+    asyncio.run(exercise())
+    assert seen == [12]
+
+
+def test_automation_that_never_ran_says_so(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    state.settings.output_dir.mkdir(parents=True)
+    state._automation_registry.load()
+    automation = state._automation_registry.add(
+        name="Front Door",
+        cameras=(AutomationCamera("camera-1", "Front Door"),),
+        connection=ConnectionReference("web-environment", "default"),
+        speed="600x",
+        output_directory=state.settings.output_dir,
+        timezone="UTC",
+    )
+    state._automation_registry.stop(automation.id)
+
+    with _client(app) as client:
+        assert "Last Completed Day: Not Run Yet" in client.get("/partials/automations").text
+
+
+def _write_export(settings: WebSettings, name: str, *, age_days: float = 0) -> Path:
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    path = settings.output_dir / name
+    path.write_bytes(b"video")
+    stamp = time.time() - age_days * 86400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_older_exports_can_be_listed_played_and_deleted(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    video = _write_export(state.settings, "timelapse_old_day.mp4")
+    metadata = _write_export(state.settings, "._timelapse_old_day.mp4")
+
+    with _client(app) as client:
+        listing = client.get("/partials/jobs").text
+        download = client.get("/files/timelapse_old_day.mp4")
+        playback = client.get("/files/timelapse_old_day.mp4/play")
+        hidden = client.get("/files/._timelapse_old_day.mp4")
+        outside = client.get("/files/..%2Fweb-jobs.json")
+        deleted = client.delete("/actions/files/timelapse_old_day.mp4")
+        repeated = client.delete("/actions/files/timelapse_old_day.mp4")
+        emptied = client.get("/partials/jobs").text
+
+    assert "Older Exports" in listing
+    assert "timelapse_old_day.mp4" in listing
+    assert "._timelapse" not in listing
+    assert download.status_code == 200
+    assert "attachment" in download.headers["content-disposition"]
+    assert playback.status_code == 200
+    assert "content-disposition" not in playback.headers
+    assert hidden.status_code == 404
+    assert outside.status_code == 404
+    assert deleted.status_code == 200
+    assert not video.exists()
+    assert metadata.exists()
+    assert repeated.status_code == 404
+    assert "No Exports Yet" in emptied
+
+
+def test_older_export_routes_require_a_web_session(tmp_path: Path) -> None:
+    app, state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
+    video = _write_export(state.settings, "timelapse_old_day.mp4")
+
+    with _client(app) as client:
+        download = client.get("/files/timelapse_old_day.mp4", follow_redirects=False)
+        deleted = client.delete("/actions/files/timelapse_old_day.mp4", follow_redirects=False)
+
+    assert download.status_code == 303
+    assert deleted.status_code != 200
+    assert video.exists()
+
+
+def test_exports_are_never_listed_twice(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+
+    with _client(app) as client:
+        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+        assert client.portal is not None
+        client.portal.call(state.create_jobs, ["camera-1"], start, start + timedelta(hours=1), "120x")
+        listing = _wait_for_completed_jobs(client, state)
+
+    assert "Older Exports" not in listing
+
+
+def test_retention_is_off_unless_configured(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    old = _write_export(settings, "old.mp4", age_days=3650)
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    async def exercise() -> None:
+        await state.start()
+        await state.close()
+
+    asyncio.run(exercise())
+
+    assert old.exists()
+
+
+def test_retention_deletes_only_expired_finished_videos(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), web_retention_days=30)
+    expired = _write_export(settings, "expired.mp4", age_days=31)
+    recent = _write_export(settings, "recent.mp4", age_days=29)
+    running = _write_export(settings, "running.mp4", age_days=31)
+    partial = _write_export(settings, "download.part", age_days=31)
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    camera = CameraInfo("camera-1", "Front", None, None)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+
+    def job(job_id: str, output: Path, status: JobStatus) -> ExportJob:
+        return ExportJob(job_id, camera, start, start + timedelta(hours=1), "120x", output, status=status)
+
+    async def exercise() -> None:
+        state.jobs = {"done": job("done", expired, "completed"), "live": job("live", running, "running")}
+        await state.prune_exports()
+
+    asyncio.run(exercise())
+
+    assert not expired.exists()
+    assert recent.exists()
+    assert running.exists()
+    assert partial.exists()
+    assert list(state.jobs) == ["live"]
+    assert "live" in {item["id"] for item in json.loads(state._job_state_file.read_text())["jobs"]}
+
+
+def test_retention_runs_before_the_quota_is_checked(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), max_download_mib=1, web_storage_quota_mib=2, web_retention_days=7)
+    expired = _write_export(settings, "expired.mp4", age_days=8)
+    expired.write_bytes(b"x" * (2 * 1024 * 1024))
+    os.utime(expired, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    async def exercise() -> None:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        assert await state._daily_storage_problem() is None
+        assert not expired.exists()
+
+    asyncio.run(exercise())
+
+
+def test_full_storage_explains_how_to_resume_a_daily_automation(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), web_storage_quota_mib=1)
+    full = _write_export(settings, "full.mp4")
+    full.write_bytes(b"x" * (1024 * 1024))
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    problem = asyncio.run(state._daily_storage_problem())
+
+    assert problem is not None
+    assert "1.0 MiB of 1.0 MiB" in problem
+    assert "TIMELAPSE_WEB_RETENTION_DAYS" in problem
+    assert "Resume" in problem
+
+
+def test_unreachable_console_gives_an_error_message_on_every_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unreachable(_client: object) -> list[CameraInfo]:
+        raise NvrError("Cannot connect to host protect.local:443")  # noqa: EM101, TRY003
+
+    monkeypatch.setattr(service, "load_cameras", unreachable)
+    monkeypatch.setattr(protect, "create_client", lambda _config, _connection: object())
+    settings = _settings(tmp_path)
+    state = WebState(
+        settings,
+        camera_loader=partial(service.list_available_cameras, ProtectClients()),
+        thumbnail_loader=_thumbnail,
+        exporter=_export,
+    )
+    app = create_app(settings, state=state)
+    export_form = {"camera_ids": ["camera-1"], "range_mode": "full-day", "day": "2026-07-20", "speed": "600x"}
+    automation_form = {"automation_name": "Home", "camera_ids": ["camera-1"], "speed": "600x"}
+
+    with _client(app) as client:
+        responses = (
+            client.get("/api/thumbnails/camera-1", params={"timestamp": "2026-07-20T08:00"}),
+            client.get("/partials/cameras"),
+            client.post("/actions/export", data=export_form),
+            client.post("/actions/automations", data=automation_form),
+        )
+
+    for response in responses:
+        assert response.status_code == 502
+        assert "Could not load cameras" in response.text

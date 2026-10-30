@@ -1,6 +1,6 @@
 # UniFi Protect TimeLapse
 
-Export UniFi Protect recordings as MP4 timelapses from the CLI, a desktop app, or a local web dashboard.
+Export UniFi Protect recordings as MP4 timelapses from the CLI or a local web dashboard.
 
 ![TimeLapse web dashboard](docs/screenshots/web-dashboard.jpg)
 
@@ -10,23 +10,19 @@ TimeLapse supports exact ranges, full local calendar days, and recurring daily e
 
 ## Highlights
 
-- Native macOS and Windows apps
-- Cross-platform Qt app for macOS, Linux, and Windows
-- Local web dashboard for phones and other computers
+- Local web dashboard for phones and computers
 - Multi-camera exports with progress, retry, cancellation, and notifications
 - Speeds from normal playback (`1x`) through `600x`
 - Start and end thumbnail previews
 - Durable, named Daily Automations with multi-camera catch-up
-- Credentials stored in the OS credential store
+- CLI connection profiles stored in the OS credential store
 
 ## Requirements
 
-- Python 3.11+ and [`uv`](https://docs.astral.sh/uv/) when running from source
+- Python 3.11+ and [`uv`](https://docs.astral.sh/uv/), or Docker
 - A reachable UniFi Protect console
 - A Protect Integration API token
 - A dedicated local Protect user
-
-Packaged desktop builds include Python.
 
 ## Protect access
 
@@ -113,7 +109,7 @@ uv run timelapse automation re-export "Front doors" 2026-07-30
 uv run timelapse automation remove "Front doors"
 ```
 
-The legacy `--daily` option remains as an importer and single-automation runner. It requires `--profile NAME` or an absolute `--dotenv PATH`; command-line credentials are intentionally rejected because an automation must resolve them again after restart.
+`automation run` owns the registry while it runs, so stop it before using the other `automation` commands.
 
 Create and use a saved connection profile:
 
@@ -125,47 +121,6 @@ uv run timelapse --profile home --start-date 07-30-2026
 Profiles are used when `.env` is not present. They are case-sensitive and stored in the OS credential store.
 
 Accepted date formats are `MM-DD-YYYY` and `MM-DD-YYYY-HH-MM-SS`. A date by itself means one complete local calendar day.
-
-## macOS app
-
-![Native macOS TimeLapse app](docs/screenshots/macos-native-ui.png)
-
-Build and open the native SwiftUI app:
-
-```bash
-./build-macos.sh
-open dist/macos/timelapse.app
-```
-
-Requires macOS 15+, `uv`, and the Swift/Xcode command-line tools. Set `MACOS_SIGN_IDENTITY` when building for distribution; local builds use an ad-hoc signature.
-
-## Qt desktop app
-
-![Qt TimeLapse app](docs/screenshots/pyqt-ui.png)
-
-Run from source:
-
-```bash
-uv run timelapse-gui
-```
-
-Build the Linux executable and AppImage:
-
-```bash
-./build-linux.sh
-```
-
-The Qt app runs on macOS, Linux, and Windows. Secrets are stored through `keyring` in Keychain, Windows Credential Manager, or Secret Service.
-
-## Windows app
-
-Build the native WPF app from PowerShell with .NET 8 and `uv` installed:
-
-```powershell
-.\build-windows.ps1
-```
-
-The self-contained build is written to `dist\windows\timelapse.exe`.
 
 ## Web dashboard
 
@@ -211,20 +166,26 @@ Keep the web app on a trusted LAN, behind a VPN, or behind an HTTPS reverse prox
 | `TIMELAPSE_OUTPUT` | Generated filename | Output file or daily output directory |
 | `TIMELAPSE_REQUEST_TIMEOUT_SECONDS` | `0` | Whole-operation timeout; `0` disables it |
 | `TIMELAPSE_MAX_DOWNLOAD_MIB` | `10240` | Maximum export size; `0` disables it |
-| `TIMELAPSE_MAX_ACTIVE_EXPORTS` | `4` | Concurrent exports in CLI and desktop runtimes |
-| `TIMELAPSE_MAX_QUEUED_EXPORTS` | `20` | Coordinator-admitted queued exports in CLI and desktop runtimes |
+| `TIMELAPSE_MAX_ACTIVE_EXPORTS` | `4` | Concurrent exports in the CLI automation runner |
 | `TIMELAPSE_WEB_SESSION_HOURS` | `168` | Web session length |
 | `TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS` | `4` | Concurrent web exports |
 | `TIMELAPSE_WEB_MAX_QUEUED_EXPORTS` | `20` | Queued web exports |
 | `TIMELAPSE_WEB_STORAGE_QUOTA_MIB` | `102400` | Total web export storage |
+| `TIMELAPSE_WEB_RETENTION_DAYS` | `0` | Permanently delete exports older than this many days; `0` keeps everything |
 
 Existing files are never overwritten. Downloads use a temporary `.part` file and are renamed only after they finish.
 
-## Version 2 compatibility changes
+When exports fill the quota, manual exports are refused and Daily Automations pause with an explanation. Free some space, then select Resume: the automation catches up on missed days while Protect still has the footage. With `TIMELAPSE_WEB_RETENTION_DAYS` set, the web app deletes every MP4 in the export folder older than that age, including manual exports, at startup and before each export. Videos whose job has left the 100-item history stay available under Older Exports.
 
-Version 2.0 uses one automation engine, registry, and export coordinator in each CLI, Web, or desktop runtime. Each runtime allows four active and twenty queued exports by default; manual and daily work share those limits and rate-limit recovery. A lone rate-limited job becomes eligible again after 60 seconds when Protect supplies no `Retry-After` value.
+## Upgrading to version 3
 
-Daily Automations are durable and may contain multiple cameras. Desktop apps keep one long-lived version-2 Python supervisor so jobs share capacity and output reservations. The Web interface now distinguishes **Stop** (retain the automation) from **Remove** (remove it after submitted work drains); **Delete** is reserved for an exported MP4. CLI Daily Automations require a named profile or absolute `.env` reference. Existing Web schedule state and legacy CLI daily checkpoints are backed up and migrated on first use.
+Version 3 removes the Qt, macOS, and Windows apps. Use the web dashboard or the CLI instead.
+
+Existing `web-automations.json` and `cli-automations.json` files keep working and are rewritten in the smaller format on their next change. Batch and job history in those files is dropped; finished MP4s and each automation's progress are kept.
+
+Also removed: the `--daily` flag (use `timelapse automation`), `TIMELAPSE_MAX_QUEUED_EXPORTS`, and migration of version 1 web schedules and daily checkpoints. If you still have those files, start version 2 once before upgrading.
+
+An interrupted day is simply run again: artifacts that already exist are skipped. Because of that, a stopped automation finishes an interrupted day only after it is resumed.
 
 ## Troubleshooting
 
@@ -241,11 +202,4 @@ uv run ruff check .
 uv run ruff format --check .
 uv run pyright
 uv run pytest -q
-```
-
-Native checks:
-
-```bash
-swift test --package-path native-macos
-dotnet build native-windows/TimeLapseNative.csproj -p:EnableWindowsTargeting=true
 ```

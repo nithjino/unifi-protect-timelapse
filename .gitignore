@@ -10,8 +10,4 @@ timelapse.egg-info
 build/
 dist/
 data/
-/native-windows/bin/
-/native-windows/obj/
-/native-windows-tests/bin/
-/native-windows-tests/obj/
 CODE_REVIEW*.md
