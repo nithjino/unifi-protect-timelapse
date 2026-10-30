@@ -979,6 +979,13 @@ button:disabled {
   animation: spin 700ms linear infinite;
 }
 
+.job-section-label {
+  margin: 20px 0 8px;
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 .empty-state {
   display: grid;
   min-height: 210px;

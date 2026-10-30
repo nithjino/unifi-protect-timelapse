@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+import base64
+import json
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
@@ -11,18 +12,16 @@ from uiprotect import ProtectApiClient
 
 import timelapse.protect as protect_module
 from timelapse import TimelapseError
-from timelapse.config import Config
+from timelapse.config import Config, ConnectionSettings
 from timelapse.protect import (
     CameraInfo,
+    ProtectClients,
     create_client,
     load_cameras,
     parse_connection,
-    protect_client,
-    protect_session_scope,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
     from pathlib import Path
 
 
@@ -146,11 +145,9 @@ def test_session_scope_reuses_and_closes_one_client(monkeypatch: pytest.MonkeyPa
 
     async def exercise() -> tuple[object, object]:
         connection = parse_connection(config.instance_url)
-        async with protect_session_scope():
-            async with protect_client(config, connection) as first:
-                pass
-            async with protect_client(config, connection) as second:
-                pass
+        async with ProtectClients() as clients:
+            first = clients.get(config, connection)
+            second = clients.get(config, connection)
             assert cast("FakeClient", first).closed is False
         return first, second
 
@@ -159,6 +156,27 @@ def test_session_scope_reuses_and_closes_one_client(monkeypatch: pytest.MonkeyPa
     assert first is second
     assert created == [first]
     assert cast("FakeClient", first).closed is True
+
+
+def test_failed_client_cleanup_is_contained(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeClient:
+        async def close_session(self) -> None:
+            raise OSError
+
+    config = ConnectionSettings(
+        instance_url="https://protect.local",
+        token="test-token",  # noqa: S106
+        username="timelapse-user",
+        password="test-password",  # noqa: S106
+        verify_ssl=True,
+    )
+    monkeypatch.setattr(protect_module, "create_client", lambda _config, _connection: FakeClient())
+
+    async def exercise() -> None:
+        async with ProtectClients() as clients:
+            clients.get(config, parse_connection(config.instance_url))
+
+    asyncio.run(exercise())
 
 
 def test_retry_layer_honors_retry_after_and_is_bounded(
@@ -262,92 +280,86 @@ def test_retry_layer_stops_after_four_total_attempts(
     assert sleeps == [1.0, 2.0, 4.0]
 
 
-def test_concurrent_clients_collapse_login_to_one_attempt(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    stored_session = False
-    login_count = 0
-    authentication_lock = asyncio.Lock()
+def _session_token() -> str:
+    def encode(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
 
-    @asynccontextmanager
-    async def fake_file_lock(_path: Path) -> AsyncIterator[None]:
-        async with authentication_lock:
-            yield
+    expires = int((datetime.now(UTC) + timedelta(days=1)).timestamp())
+    return f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode({'exp': expires})}.{encode({})}"
 
-    def fake_is_authenticated(client: object) -> bool:
-        return bool(getattr(client, "_test_authenticated", False))
 
-    async def fake_load_session(client: object) -> None:
-        client.__dict__["_test_authenticated"] = stored_session
+def _login_client(tmp_path: Path) -> protect_module._RetryingProtectApiClient:
+    return protect_module._RetryingProtectApiClient(
+        "protect.local",
+        443,
+        "user",
+        "password",
+        config_dir=tmp_path,
+        store_sessions=True,
+        max_retries=0,
+    )
 
-    async def fake_authenticate(client: object) -> None:
-        nonlocal login_count, stored_session
-        login_count += 1
-        stored_session = True
-        client.__dict__["_test_authenticated"] = True
 
-    monkeypatch.setattr(protect_module, "_exclusive_file_lock", fake_file_lock)
-    monkeypatch.setattr(protect_module._RetryingProtectApiClient, "is_authenticated", fake_is_authenticated)
-    monkeypatch.setattr(protect_module._RetryingProtectApiClient, "_load_session", fake_load_session)
-    monkeypatch.setattr(ProtectApiClient, "authenticate", fake_authenticate)
-    monkeypatch.setattr(protect_module, "_secure_session_storage", lambda: None)
+def test_login_is_shared_and_reused_after_a_restart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    logins = 0
+
+    async def fake_request(_client: object, _method: str, url: str, **_kwargs: object) -> _Response:
+        nonlocal logins
+        assert url == "/api/auth/login"
+        logins += 1
+        await asyncio.sleep(0)
+        return _Response(200, {"set-cookie": f"TOKEN={_session_token()}; Path=/", "x-csrf-token": "csrf"})
+
+    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
+    monkeypatch.setattr(protect_module, "_SESSION_DIRECTORY", tmp_path)
 
     async def exercise() -> None:
-        clients = [
-            protect_module._RetryingProtectApiClient(
-                "protect.local",
-                443,
-                "user",
-                "password",
-                config_dir=tmp_path,
-                store_sessions=True,
-                max_retries=0,
-            )
-            for _ in range(2)
-        ]
-        await asyncio.gather(*(client.authenticate() for client in clients))
+        client = _login_client(tmp_path)
+        await asyncio.gather(*(client.ensure_authenticated() for _ in range(4)))
+        await client.close_session()
+        assert logins == 1
+
+        restarted = _login_client(tmp_path)
+        await restarted.ensure_authenticated()
+        await restarted.close_session()
 
     asyncio.run(exercise())
 
-    assert login_count == 1
+    assert logins == 1
 
 
-def test_private_operations_use_two_console_wide_slots(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    captured_paths: tuple[Path, ...] = ()
+def test_export_and_thumbnail_slots_are_separate_per_console() -> None:
+    clients = ProtectClients()
+    connection = parse_connection("https://protect.local")
 
-    @asynccontextmanager
-    async def fake_slots(paths: tuple[Path, ...]) -> AsyncIterator[None]:
-        nonlocal captured_paths
-        captured_paths = paths
-        yield
+    slots = clients.slots(connection)
+
+    assert slots is clients.slots(connection)
+    assert slots is not clients.slots(parse_connection("https://other.local"))
+    assert slots.exports is not slots.thumbnails
+    assert slots.exports._value == protect_module.EXPORT_SLOTS
+    assert slots.thumbnails._value == protect_module.THUMBNAIL_SLOTS
+
+
+def test_private_operation_authenticates_inside_its_slot() -> None:
+    slots = asyncio.Semaphore(1)
 
     class FakeClient:
-        authenticated = 0
+        locked_during_login = False
 
         async def ensure_authenticated(self) -> None:
-            self.authenticated += 1
+            self.locked_during_login = slots.locked()
 
     client = FakeClient()
-    monkeypatch.setattr(protect_module, "_SESSION_DIRECTORY", tmp_path)
-    monkeypatch.setattr(protect_module, "_first_available_lock", fake_slots)
 
     async def exercise() -> None:
-        async with protect_module.private_operation(
-            parse_connection("https://protect.local"),
-            cast("ProtectApiClient", client),
-            operation="test",
-        ):
-            pass
+        async with protect_module.private_operation(slots, cast("ProtectApiClient", client), operation="test"):
+            assert slots.locked()
 
     asyncio.run(exercise())
 
-    assert len(captured_paths) == 2
-    assert {path.parent for path in captured_paths} == {tmp_path}
-    assert client.authenticated == 1
+    assert client.locked_during_login is True
+    assert slots.locked() is False
 
 
 def test_load_cameras_returns_sorted_detached_camera_info() -> None:

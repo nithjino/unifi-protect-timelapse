@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 from datetime import date
+from functools import partial
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -36,7 +37,7 @@ from timelapse.config import (
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
 from timelapse.jobs import ExportJobCoordinator
 from timelapse.profiles import ConnectionProfile, ProfileError, load_profile, save_profile
-from timelapse.protect import CameraInfo, camera_name, protect_session_scope
+from timelapse.protect import CameraInfo, ProtectClients, camera_name
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
 from timelapse.service import export_timelapse, list_available_cameras
 
@@ -67,23 +68,23 @@ def _choose_camera(cameras: list[CameraInfo]) -> CameraInfo:
 
 
 async def _run() -> int:
-    async with protect_session_scope():
-        return await _run_in_session()
+    async with ProtectClients() as clients:
+        return await _run_in_session(clients)
 
 
-async def _run_in_session() -> int:
+async def _run_in_session(clients: ProtectClients) -> int:
     """Run one CLI lifecycle with reusable Protect connections."""
     try:
         if len(sys.argv) > 1 and sys.argv[1] == "automation":
-            return await _run_automation_command(sys.argv[2:])
+            return await _run_automation_command(clients, sys.argv[2:])
         command = parse_args()
         if isinstance(command, CreateProfile):
             _create_profile(command)
             return 0
         config = command
-        camera = _choose_camera(await list_available_cameras(config))
+        camera = _choose_camera(await list_available_cameras(clients, config))
         output = config.output or default_output_path(config, camera)
-        await _export(config, camera, output)
+        await _export(clients, config, camera, output)
     except KeyboardInterrupt:
         _write_stderr("\nCancelled.\n")
         return 130
@@ -122,10 +123,10 @@ def _prompt_verify_ssl() -> bool:
         _write_stdout("Please enter yes or no.\n")
 
 
-async def _export(config: Config, camera: CameraInfo, output: Path) -> None:
+async def _export(clients: ProtectClients, config: Config, camera: CameraInfo, output: Path) -> None:
     _write_stdout(f"Requesting {config.speed} timelapse export for {camera_name(camera)}...\n")
     try:
-        await export_timelapse(config, camera, output, _print_progress)
+        await export_timelapse(clients, config, camera, output, _print_progress)
     finally:
         _write_stdout("\n")
 
@@ -164,7 +165,7 @@ def _automation_parser() -> argparse.ArgumentParser:
     return parser
 
 
-async def _run_automation_command(arguments: list[str]) -> int:
+async def _run_automation_command(clients: ProtectClients, arguments: list[str]) -> int:
     """Run one management command; the registry has one owner at a time."""
     parser = _automation_parser()
     args = parser.parse_args(arguments)
@@ -172,7 +173,7 @@ async def _run_automation_command(arguments: list[str]) -> int:
     try:
         with registry.owner():
             registry.load()
-            await _automation_action(parser, args, registry)
+            await _automation_action(clients, parser, args, registry)
     except RegistryOwnedError as exc:
         _write_stderr(f"Error: {exc}. Stop the running automation process first.\n")
         return CLI_OWNER_EXIT_CODE
@@ -183,6 +184,7 @@ async def _run_automation_command(arguments: list[str]) -> int:
 
 
 async def _automation_action(
+    clients: ProtectClients,
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
     registry: AutomationRegistry,
@@ -191,7 +193,7 @@ async def _automation_action(
         _print_automations(registry, as_json=args.json)
     elif args.action == "add":
         reference = _reference_from_args(args.profile, args.dotenv)
-        resolved = await _resolve_reference(reference)
+        resolved = await _resolve_reference(clients, reference)
         automation = registry.add(
             name=args.name,
             cameras=_automation_cameras(args.camera, resolved.cameras),
@@ -208,7 +210,7 @@ async def _automation_action(
             reference = _reference_from_args(args.profile, args.dotenv)
         cameras = None
         if args.camera is not None:
-            cameras = _automation_cameras(args.camera, (await _resolve_reference(reference)).cameras)
+            cameras = _automation_cameras(args.camera, (await _resolve_reference(clients, reference)).cameras)
         updated = registry.edit(args.selector, name=args.name, cameras=cameras, connection=reference)
         _write_stdout(f"Updated {updated.name!r} ({updated.id}).\n")
     elif args.action == "stop":
@@ -220,7 +222,7 @@ async def _automation_action(
         _write_stdout("Removed Daily Automation.\n")
     else:
         coordinator = ExportJobCoordinator.from_environment()
-        engine = _automation_engine(registry, coordinator)
+        engine = _automation_engine(clients, registry, coordinator)
         try:
             if args.action == "run":
                 await engine.run_forever(args.selector)
@@ -231,20 +233,24 @@ async def _automation_action(
             await coordinator.close()
 
 
-def _automation_engine(registry: AutomationRegistry, coordinator: ExportJobCoordinator) -> DailyAutomationEngine:
+def _automation_engine(
+    clients: ProtectClients,
+    registry: AutomationRegistry,
+    coordinator: ExportJobCoordinator,
+) -> DailyAutomationEngine:
     return DailyAutomationEngine(
         registry,
         coordinator,
-        resolve_connection=_resolve_automation,
-        exporter=export_timelapse,
+        resolve_connection=partial(_resolve_automation, clients),
+        exporter=partial(export_timelapse, clients),
     )
 
 
-async def _resolve_automation(automation: DailyAutomation) -> ResolvedAutomation:
-    return await _resolve_reference(automation.connection)
+async def _resolve_automation(clients: ProtectClients, automation: DailyAutomation) -> ResolvedAutomation:
+    return await _resolve_reference(clients, automation.connection)
 
 
-async def _resolve_reference(reference: ConnectionReference) -> ResolvedAutomation:
+async def _resolve_reference(clients: ProtectClients, reference: ConnectionReference) -> ResolvedAutomation:
     if reference.kind == "python-profile":
         profile = load_profile(reference.value)
         config = ConnectionSettings(
@@ -255,7 +261,7 @@ async def _resolve_reference(reference: ConnectionReference) -> ResolvedAutomati
     else:
         message = f"CLI cannot resolve {reference.kind} connection references"
         raise RegistryError(message)
-    cameras = tuple(await list_available_cameras(config))
+    cameras = tuple(await list_available_cameras(clients, config))
     return ResolvedAutomation(config, cameras)
 
 

@@ -7,7 +7,7 @@ from timelapse import cli
 from timelapse.automation_registry import AutomationCamera, AutomationRegistry, ConnectionReference
 from timelapse.config import ConnectionSettings
 from timelapse.jobs import ExportJobCoordinator
-from timelapse.protect import CameraInfo
+from timelapse.protect import CameraInfo, ProtectClients
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,7 +35,7 @@ def test_cli_dotenv_automation_uses_stored_speed(tmp_path: Path, monkeypatch: py
         timezone="UTC",
     )
 
-    async def cameras(connection):
+    async def cameras(_clients, connection):
         assert isinstance(connection, ConnectionSettings)
         assert connection.token == "test-token"  # noqa: S105 - test credential
         assert connection.request_timeout_seconds == 37
@@ -43,14 +43,16 @@ def test_cli_dotenv_automation_uses_stored_speed(tmp_path: Path, monkeypatch: py
         assert connection.verify_ssl is False
         return [camera]
 
-    async def export(config, _camera, output):
+    async def export(_clients, config, _camera, output):
         assert config.speed == "120x"
         assert "120x" in output.name
         output.write_bytes(b"\0\0\0\x18ftypisom")
 
     monkeypatch.setattr(cli, "list_available_cameras", cameras)
     monkeypatch.setattr(cli, "export_timelapse", export)
-    assert asyncio.run(cli._automation_engine(registry, ExportJobCoordinator()).run_due_once(automation.id))
+    assert asyncio.run(
+        cli._automation_engine(ProtectClients(), registry, ExportJobCoordinator()).run_due_once(automation.id)
+    )
 
 
 def test_management_commands_are_refused_while_a_runner_owns_the_registry(
@@ -61,6 +63,6 @@ def test_management_commands_are_refused_while_a_runner_owns_the_registry(
     path = tmp_path / "automations.json"
     monkeypatch.setenv(cli.CLI_REGISTRY_ENV, str(path))
     with AutomationRegistry(path).owner():
-        assert asyncio.run(cli._run_automation_command(["list"])) == cli.CLI_OWNER_EXIT_CODE
+        assert asyncio.run(cli._run_automation_command(ProtectClients(), ["list"])) == cli.CLI_OWNER_EXIT_CODE
     assert "Stop the running automation process" in capsys.readouterr().err
-    assert asyncio.run(cli._run_automation_command(["list"])) == 0
+    assert asyncio.run(cli._run_automation_command(ProtectClients(), ["list"])) == 0

@@ -1,11 +1,11 @@
-{% if not jobs %}
+{% if not jobs and not unlisted_exports %}
   <div class="empty-state">
     <span class="empty-glyph" aria-hidden="true">▶</span>
     <strong>No Exports Yet</strong>
     <p>Your active and completed timelapses will appear here.</p>
   </div>
 {% else %}
-  <div class="job-list">
+  {% if jobs %}<div class="job-list">
     {% for job in jobs %}
       <article class="job-card status-{{ job.status }}">
         <div class="job-topline">
@@ -95,5 +95,38 @@
         </div>
       </article>
     {% endfor %}
-  </div>
+  </div>{% endif %}
+  {% if unlisted_exports %}
+    <p class="job-section-label">Older Exports</p>
+    <div class="job-list">
+      {% for file in unlisted_exports %}
+        <article class="job-card status-completed">
+          <div class="job-topline">
+            <div class="job-title-row"><strong>{{ file.name }}</strong></div>
+            <p class="job-range">Saved {{ file.modified | datetime }}</p>
+            <small class="job-file-size">{{ file.size | bytes }}</small>
+          </div>
+          <div class="job-footer">
+            <span></span>
+            <div class="job-actions">
+              <a class="small-button primary" href="/files/{{ file.name | urlencode }}">Download</a>
+              <button
+                class="small-button play-button"
+                type="button"
+                data-video-url="/files/{{ file.name | urlencode }}/play"
+                data-video-title="{{ file.name }}"
+                aria-label="Play {{ file.name }}"
+              >Play</button>
+              <button
+                class="small-button danger"
+                hx-delete="/actions/files/{{ file.name | urlencode }}"
+                hx-target="#notifications"
+                hx-swap="innerHTML"
+              >Delete</button>
+            </div>
+          </div>
+        </article>
+      {% endfor %}
+    </div>
+  {% endif %}
 {% endif %}

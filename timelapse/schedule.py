@@ -38,6 +38,7 @@ class ResolvedAutomation:
 
 ConnectionResolver = Callable[[DailyAutomation], Awaitable[ResolvedAutomation]]
 Exporter = Callable[[Config, CameraInfo, Path], Awaitable[None]]
+StorageCheck = Callable[[], Awaitable[str | None]]
 Sleep = Callable[[float], Awaitable[None]]
 
 
@@ -76,6 +77,7 @@ class DailyAutomationEngine:
         *,
         resolve_connection: ConnectionResolver,
         exporter: Exporter,
+        check_storage: StorageCheck | None = None,
         now: Callable[[], datetime] | None = None,
         sleep: Sleep = asyncio.sleep,
         jitter: Callable[[float, float], float] = random.uniform,
@@ -85,6 +87,7 @@ class DailyAutomationEngine:
         self.coordinator = coordinator
         self._resolve_connection = resolve_connection
         self._exporter = exporter
+        self._check_storage = check_storage
         self._now = now or (lambda: datetime.now(UTC))
         self._sleep = sleep
         self._jitter = jitter
@@ -187,7 +190,9 @@ class DailyAutomationEngine:
             )
         return False
 
-    async def _submit_day(self, automation: DailyAutomation, day: date) -> tuple[CoordinatorJob, ...] | None:
+    async def _submit_day(  # noqa: PLR0911
+        self, automation: DailyAutomation, day: date
+    ) -> tuple[CoordinatorJob, ...] | None:
         """Submit every missing artifact, or pause and return None when review is needed."""
         resolved = await self._resolve_or_pause(automation)
         if resolved is None:
@@ -221,6 +226,11 @@ class DailyAutomationEngine:
                     camera=camera,
                 )
             )
+        if specs and self._check_storage is not None:
+            problem = await self._check_storage()
+            if problem is not None:
+                self.registry.pause(automation.id, problem)
+                return None
         try:
             return await self.coordinator.submit(specs)
         except OutputCollisionError as exc:

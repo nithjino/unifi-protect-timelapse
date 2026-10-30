@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -20,7 +21,7 @@ from timelapse.download import DownloadProgress
 from timelapse.protect import CameraInfo
 from timelapse.service import CameraThumbnail
 from timelapse.web import APP_CSS_VERSION, create_app, main
-from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
+from timelapse.web_state import ExportJob, JobStatus, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1222,3 +1223,138 @@ def test_automation_that_never_ran_says_so(tmp_path: Path) -> None:
 
     with _client(app) as client:
         assert "Last Completed Day: Not Run Yet" in client.get("/partials/automations").text
+
+
+def _write_export(settings: WebSettings, name: str, *, age_days: float = 0) -> Path:
+    settings.output_dir.mkdir(parents=True, exist_ok=True)
+    path = settings.output_dir / name
+    path.write_bytes(b"video")
+    stamp = time.time() - age_days * 86400
+    os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_older_exports_can_be_listed_played_and_deleted(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+    video = _write_export(state.settings, "timelapse_old_day.mp4")
+    metadata = _write_export(state.settings, "._timelapse_old_day.mp4")
+
+    with _client(app) as client:
+        listing = client.get("/partials/jobs").text
+        download = client.get("/files/timelapse_old_day.mp4")
+        playback = client.get("/files/timelapse_old_day.mp4/play")
+        hidden = client.get("/files/._timelapse_old_day.mp4")
+        outside = client.get("/files/..%2Fweb-jobs.json")
+        deleted = client.delete("/actions/files/timelapse_old_day.mp4")
+        repeated = client.delete("/actions/files/timelapse_old_day.mp4")
+        emptied = client.get("/partials/jobs").text
+
+    assert "Older Exports" in listing
+    assert "timelapse_old_day.mp4" in listing
+    assert "._timelapse" not in listing
+    assert download.status_code == 200
+    assert "attachment" in download.headers["content-disposition"]
+    assert playback.status_code == 200
+    assert "content-disposition" not in playback.headers
+    assert hidden.status_code == 404
+    assert outside.status_code == 404
+    assert deleted.status_code == 200
+    assert not video.exists()
+    assert metadata.exists()
+    assert repeated.status_code == 404
+    assert "No Exports Yet" in emptied
+
+
+def test_older_export_routes_require_a_web_session(tmp_path: Path) -> None:
+    app, state = _app(tmp_path, web_password="web-secret")  # noqa: S106 - test credential
+    video = _write_export(state.settings, "timelapse_old_day.mp4")
+
+    with _client(app) as client:
+        download = client.get("/files/timelapse_old_day.mp4", follow_redirects=False)
+        deleted = client.delete("/actions/files/timelapse_old_day.mp4", follow_redirects=False)
+
+    assert download.status_code == 303
+    assert deleted.status_code != 200
+    assert video.exists()
+
+
+def test_exports_are_never_listed_twice(tmp_path: Path) -> None:
+    app, state = _app(tmp_path)
+
+    with _client(app) as client:
+        start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+        assert client.portal is not None
+        client.portal.call(state.create_jobs, ["camera-1"], start, start + timedelta(hours=1), "120x")
+        listing = _wait_for_completed_jobs(client, state)
+
+    assert "Older Exports" not in listing
+
+
+def test_retention_is_off_unless_configured(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    old = _write_export(settings, "old.mp4", age_days=3650)
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    async def exercise() -> None:
+        await state.start()
+        await state.close()
+
+    asyncio.run(exercise())
+
+    assert old.exists()
+
+
+def test_retention_deletes_only_expired_finished_videos(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), web_retention_days=30)
+    expired = _write_export(settings, "expired.mp4", age_days=31)
+    recent = _write_export(settings, "recent.mp4", age_days=29)
+    running = _write_export(settings, "running.mp4", age_days=31)
+    partial = _write_export(settings, "download.part", age_days=31)
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+    camera = CameraInfo("camera-1", "Front", None, None)
+    start = datetime(2026, 7, 20, 8, tzinfo=UTC)
+
+    def job(job_id: str, output: Path, status: JobStatus) -> ExportJob:
+        return ExportJob(job_id, camera, start, start + timedelta(hours=1), "120x", output, status=status)
+
+    async def exercise() -> None:
+        state.jobs = {"done": job("done", expired, "completed"), "live": job("live", running, "running")}
+        await state.prune_exports()
+
+    asyncio.run(exercise())
+
+    assert not expired.exists()
+    assert recent.exists()
+    assert running.exists()
+    assert partial.exists()
+    assert list(state.jobs) == ["live"]
+    assert "live" in {item["id"] for item in json.loads(state._job_state_file.read_text())["jobs"]}
+
+
+def test_retention_runs_before_the_quota_is_checked(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), max_download_mib=1, web_storage_quota_mib=2, web_retention_days=7)
+    expired = _write_export(settings, "expired.mp4", age_days=8)
+    expired.write_bytes(b"x" * (2 * 1024 * 1024))
+    os.utime(expired, (time.time() - 8 * 86400, time.time() - 8 * 86400))
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    async def exercise() -> None:
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        assert await state._daily_storage_problem() is None
+        assert not expired.exists()
+
+    asyncio.run(exercise())
+
+
+def test_full_storage_explains_how_to_resume_a_daily_automation(tmp_path: Path) -> None:
+    settings = replace(_settings(tmp_path), web_storage_quota_mib=1)
+    full = _write_export(settings, "full.mp4")
+    full.write_bytes(b"x" * (1024 * 1024))
+    state = WebState(settings, camera_loader=_cameras, thumbnail_loader=_thumbnail, exporter=_export)
+
+    problem = asyncio.run(state._daily_storage_problem())
+
+    assert problem is not None
+    assert "1.0 MiB of 1.0 MiB" in problem
+    assert "TIMELAPSE_WEB_RETENTION_DAYS" in problem
+    assert "Resume" in problem

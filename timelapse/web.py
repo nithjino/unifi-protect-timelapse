@@ -35,7 +35,6 @@ from starlette.templating import Jinja2Templates
 from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.config import SPEED_TO_FPS
 from timelapse.download import format_bytes
-from timelapse.protect import protect_session_scope
 from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
 
 if TYPE_CHECKING:
@@ -366,12 +365,11 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         if configured_settings.web_password is None and not _is_loopback_host(configured_settings.web_host):
             message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
             raise RuntimeError(message)
-        async with protect_session_scope():
-            await web_state.start()
-            try:
-                yield
-            finally:
-                await web_state.close()
+        await web_state.start()
+        try:
+            yield
+        finally:
+            await web_state.close()
 
     application = FastAPI(
         title="TimeLapse Web",
@@ -600,7 +598,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         return templates.TemplateResponse(
             request=request,
             name="partials/jobs.html",
-            context={"jobs": ordered_jobs},
+            context={"jobs": ordered_jobs, "unlisted_exports": await web_state.unlisted_exports()},
         )
 
     @application.get("/partials/automations", response_class=HTMLResponse)
@@ -657,6 +655,14 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
             return message_response(request, str(exc), kind="error", status_code=404)
         message = "Cancellation requested." if action == "cancelled" else "Export deleted."
         return message_response(request, message)
+
+    @application.delete("/actions/files/{name}", response_class=HTMLResponse)
+    async def delete_unlisted_export(request: Request, name: str) -> Response:
+        try:
+            await web_state.remove_unlisted_export(name)
+        except ValueError as exc:
+            return message_response(request, str(exc), kind="error", status_code=404)
+        return message_response(request, "Export deleted.")
 
     @application.post("/actions/jobs/{job_id}/retry", response_class=HTMLResponse)
     async def retry_job(request: Request, job_id: JOB_ID) -> Response:
@@ -733,6 +739,20 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
         if job is None or job.status != "completed" or not job.output.is_file():
             return PlainTextResponse("Export is not available.", status_code=404)
         return FileResponse(job.output, media_type="video/mp4", filename=job.output.name if attachment else None)
+
+    async def unlisted_file(name: str, *, attachment: bool) -> Response:
+        path = await web_state.unlisted_export_path(name)
+        if path is None:
+            return PlainTextResponse("Export is not available.", status_code=404)
+        return FileResponse(path, media_type="video/mp4", filename=name if attachment else None)
+
+    @application.get("/files/{name}")
+    async def download_unlisted_export(name: str) -> Response:
+        return await unlisted_file(name, attachment=True)
+
+    @application.get("/files/{name}/play")
+    async def play_unlisted_export(name: str) -> Response:
+        return await unlisted_file(name, attachment=False)
 
     @application.get("/exports/{job_id}")
     async def download_export(job_id: JOB_ID) -> Response:

@@ -171,8 +171,11 @@ Keep the web app on a trusted LAN, behind a VPN, or behind an HTTPS reverse prox
 | `TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS` | `4` | Concurrent web exports |
 | `TIMELAPSE_WEB_MAX_QUEUED_EXPORTS` | `20` | Queued web exports |
 | `TIMELAPSE_WEB_STORAGE_QUOTA_MIB` | `102400` | Total web export storage |
+| `TIMELAPSE_WEB_RETENTION_DAYS` | `0` | Permanently delete exports older than this many days; `0` keeps everything |
 
 Existing files are never overwritten. Downloads use a temporary `.part` file and are renamed only after they finish.
+
+When exports fill the quota, manual exports are refused and Daily Automations pause with an explanation. Free some space, then select Resume: the automation catches up on missed days while Protect still has the footage. With `TIMELAPSE_WEB_RETENTION_DAYS` set, the web app deletes every MP4 in the export folder older than that age, including manual exports, at startup and before each export. Videos whose job has left the 100-item history stay available under Older Exports.
 
 ## Upgrading to version 3
 
