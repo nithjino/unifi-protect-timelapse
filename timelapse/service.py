@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from uiprotect.exceptions import UnifiProtectError
+
 from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.download import download_timelapse
 from timelapse.protect import load_cameras, parse_connection, private_operation
@@ -46,8 +48,12 @@ async def _operation_timeout(seconds: int, operation: str) -> AsyncIterator[None
 async def list_available_cameras(clients: ProtectClients, config: ConnectionSettings) -> list[CameraInfo]:
     """Load cameras with the runtime's shared client."""
     client = clients.get(config, parse_connection(config.instance_url))
-    async with _operation_timeout(config.request_timeout_seconds, "Camera discovery"):
-        return await load_cameras(client)
+    try:
+        async with _operation_timeout(config.request_timeout_seconds, "Camera discovery"):
+            return await load_cameras(client)
+    except UnifiProtectError as exc:
+        message = f"Could not load cameras from UniFi Protect: {exc}"
+        raise TimelapseError(message) from exc
 
 
 async def fetch_camera_thumbnail(

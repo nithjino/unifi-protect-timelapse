@@ -7,6 +7,7 @@ import os
 import time
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
+from functools import partial
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock
@@ -14,11 +15,12 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
+from uiprotect.exceptions import NvrError
 
-from timelapse import OperationTimeoutError, TimelapseError, __version__
+from timelapse import OperationTimeoutError, TimelapseError, __version__, protect, service
 from timelapse.automation_registry import AutomationCamera, ConnectionReference
 from timelapse.download import DownloadProgress
-from timelapse.protect import CameraInfo
+from timelapse.protect import CameraInfo, ProtectClients
 from timelapse.service import CameraThumbnail
 from timelapse.web import APP_CSS_VERSION, create_app, main
 from timelapse.web_state import ExportJob, JobStatus, WebCapacityError, WebSettings, WebState
@@ -1358,3 +1360,36 @@ def test_full_storage_explains_how_to_resume_a_daily_automation(tmp_path: Path) 
     assert "1.0 MiB of 1.0 MiB" in problem
     assert "TIMELAPSE_WEB_RETENTION_DAYS" in problem
     assert "Resume" in problem
+
+
+def test_unreachable_console_gives_an_error_message_on_every_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unreachable(_client: object) -> list[CameraInfo]:
+        raise NvrError("Cannot connect to host protect.local:443")  # noqa: EM101, TRY003
+
+    monkeypatch.setattr(service, "load_cameras", unreachable)
+    monkeypatch.setattr(protect, "create_client", lambda _config, _connection: object())
+    settings = _settings(tmp_path)
+    state = WebState(
+        settings,
+        camera_loader=partial(service.list_available_cameras, ProtectClients()),
+        thumbnail_loader=_thumbnail,
+        exporter=_export,
+    )
+    app = create_app(settings, state=state)
+    export_form = {"camera_ids": ["camera-1"], "range_mode": "full-day", "day": "2026-07-20", "speed": "600x"}
+    automation_form = {"automation_name": "Home", "camera_ids": ["camera-1"], "speed": "600x"}
+
+    with _client(app) as client:
+        responses = (
+            client.get("/api/thumbnails/camera-1", params={"timestamp": "2026-07-20T08:00"}),
+            client.get("/partials/cameras"),
+            client.post("/actions/export", data=export_form),
+            client.post("/actions/automations", data=automation_form),
+        )
+
+    for response in responses:
+        assert response.status_code == 502
+        assert "Could not load cameras" in response.text

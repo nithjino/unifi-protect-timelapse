@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 
 import pytest
-from uiprotect.exceptions import NotAuthorized
+from uiprotect.exceptions import NotAuthorized, NvrError
 
 from timelapse import OperationTimeoutError, TimelapseError, service
 from timelapse.config import Config
@@ -164,6 +164,20 @@ def test_camera_discovery_timeout_covers_the_complete_operation(
 
     with pytest.raises(OperationTimeoutError, match="configured 1-second operation timeout"):
         asyncio.run(service.list_available_cameras(clients, config))
+
+
+def test_console_failure_during_discovery_is_a_timelapse_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def unreachable(_client: object) -> list[CameraInfo]:
+        raise NvrError("Cannot connect to host protect.local:443")  # noqa: EM101, TRY003
+
+    clients = _clients(monkeypatch, _FakeClient())
+    monkeypatch.setattr(service, "load_cameras", unreachable)
+
+    with pytest.raises(TimelapseError, match=r"Could not load cameras.*Cannot connect to host"):
+        asyncio.run(service.list_available_cameras(clients, _config(tmp_path)))
 
 
 def test_thumbnail_does_not_wait_behind_exports(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
