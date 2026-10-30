@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -29,9 +30,9 @@ from timelapse.config import (
     ConnectionSettings,
     is_truthy,
 )
-from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
+from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path, format_bytes
 from timelapse.jobs import DEFAULT_MAX_ACTIVE_EXPORTS, CoordinatorJob, ExportJobCoordinator, ExportJobSpec
-from timelapse.protect import CameraInfo
+from timelapse.protect import CameraInfo, ProtectClients
 from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation, seconds_until_next_local_day
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
@@ -101,6 +102,7 @@ class WebSettings:
     web_max_queued_exports: int = DEFAULT_MAX_QUEUED_EXPORTS
     web_max_export_hours: int = DEFAULT_MAX_EXPORT_HOURS
     web_storage_quota_mib: int = DEFAULT_STORAGE_QUOTA_MIB
+    web_retention_days: int = 0
     timezone: ZoneInfo = field(default_factory=lambda: ZoneInfo("UTC"))
 
     @classmethod
@@ -137,6 +139,7 @@ class WebSettings:
             web_storage_quota_mib=_environment_integer(
                 "TIMELAPSE_WEB_STORAGE_QUOTA_MIB", DEFAULT_STORAGE_QUOTA_MIB, minimum=1
             ),
+            web_retention_days=_environment_integer("TIMELAPSE_WEB_RETENTION_DAYS", 0),
             timezone=_environment_timezone(),
         )
 
@@ -245,6 +248,15 @@ class ExportJob:
             return None
 
 
+@dataclass(frozen=True)
+class ExportFile:
+    """A finished video on disk that no retained job describes."""
+
+    name: str
+    size: int
+    modified: datetime
+
+
 class WebState:
     """Own camera cache, export jobs, and Daily Automation tasks."""
 
@@ -252,17 +264,18 @@ class WebState:
         self,
         settings: WebSettings,
         *,
-        camera_loader: CameraLoader = list_available_cameras,
-        thumbnail_loader: ThumbnailLoader = fetch_camera_thumbnail,
-        exporter: Exporter = export_timelapse,
+        camera_loader: CameraLoader | None = None,
+        thumbnail_loader: ThumbnailLoader | None = None,
+        exporter: Exporter | None = None,
     ) -> None:
         """Initialize state with overridable service operations for tests."""
         self.settings = settings
         self.jobs: dict[str, ExportJob] = {}
         self.version = 0
-        self._camera_loader = camera_loader
-        self._thumbnail_loader = thumbnail_loader
-        self._exporter = exporter
+        self._protect = ProtectClients()
+        self._camera_loader = camera_loader or partial(list_available_cameras, self._protect)
+        self._thumbnail_loader = thumbnail_loader or partial(fetch_camera_thumbnail, self._protect)
+        self._exporter = exporter or partial(export_timelapse, self._protect)
         self._cameras: list[CameraInfo] = []
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
@@ -280,6 +293,7 @@ class WebState:
             self._coordinator,
             resolve_connection=self._resolve_web_automation,
             exporter=self._export_automation_job,
+            check_storage=self._daily_storage_problem,
         )
 
     @property
@@ -300,6 +314,7 @@ class WebState:
                 )
                 raise RuntimeError(message) from exc
         await self._load_jobs()
+        await self.prune_exports()
         self._automation_registry.load()
         for automation in self._automation_registry.list():
             if automation.status == "active":
@@ -314,6 +329,7 @@ class WebState:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._coordinator.close()
         await self._persist_jobs()
+        await self._protect.close()
 
     async def cameras(self, *, refresh: bool = False) -> list[CameraInfo]:
         """Return cached cameras, refreshing them when stale or requested."""
@@ -365,6 +381,7 @@ class WebState:
             message = f"Exports are limited to {self.settings.web_max_export_hours} hours."
             raise WebCapacityError(message)
         selected = await self._selected_cameras(camera_ids)
+        await self.prune_exports()
         async with self._job_mutation_lock:
             await self._ensure_export_capacity(len(selected))
             config = self.settings.config(start, end, speed, full_day=full_day or daily)
@@ -421,6 +438,41 @@ class WebState:
                 return "removed"
         await self._coordinator.cancel(job.id)
         return "cancelled"
+
+    async def unlisted_exports(self) -> list[ExportFile]:
+        """Return finished videos with no job in the list, newest first."""
+        listed = {job.output.name for job in self.jobs.values() if job.status in {"queued", "running", "completed"}}
+        return await asyncio.to_thread(self._read_export_files, listed)
+
+    async def unlisted_export_path(self, name: str) -> Path | None:
+        """Resolve a filename only if it is a listed unlisted export."""
+        files = await self.unlisted_exports()
+        return self.settings.output_dir / name if any(item.name == name for item in files) else None
+
+    async def remove_unlisted_export(self, name: str) -> None:
+        """Delete a finished video that has no job."""
+        path = await self.unlisted_export_path(name)
+        if path is None:
+            message = "That export is no longer on the server."
+            raise ValueError(message)
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+        self._changed()
+
+    async def prune_exports(self) -> None:
+        """Delete exports past the configured retention age and forget their jobs."""
+        if not self.settings.web_retention_days:
+            return
+        cutoff = self.settings.now() - timedelta(days=self.settings.web_retention_days)
+        async with self._job_mutation_lock:
+            active = {job.output.name for job in self.jobs.values() if not job.terminal}
+            removed = await asyncio.to_thread(self._delete_exports_before, cutoff, active)
+            if not removed:
+                return
+            _LOGGER.info("Retention removed %d export(s) older than %s", len(removed), cutoff.date())
+            for job in [item for item in self.jobs.values() if item.terminal and item.output.name in removed]:
+                del self.jobs[job.id]
+            await self._persist_jobs()
+            self._changed()
 
     async def retry_job(self, job_id: str) -> ExportJob:
         """Create a replacement for a failed or cancelled export."""
@@ -550,6 +602,22 @@ class WebState:
                 name=f"daily-automation-{automation_id}",
             )
 
+    async def _daily_storage_problem(self) -> str | None:
+        """Explain why a daily export must wait; its unknown size only counts once on disk."""
+        quota_bytes = self.settings.web_storage_quota_mib * MEBIBYTE
+        try:
+            await self.prune_exports()
+            usage_bytes = await asyncio.to_thread(self._output_storage_bytes)
+        except (OSError, WebCapacityError) as exc:
+            return f"Could not check export storage: {exc}"
+        if usage_bytes < quota_bytes:
+            return None
+        return (
+            f"Export storage is full ({format_bytes(usage_bytes)} of {format_bytes(quota_bytes)}). "
+            "Delete old exports, or raise TIMELAPSE_WEB_STORAGE_QUOTA_MIB or set TIMELAPSE_WEB_RETENTION_DAYS, "
+            "then Resume this automation."
+        )
+
     async def _ensure_export_capacity(self, requested_jobs: int) -> None:
         active_jobs = sum(not job.terminal for job in self.jobs.values())
         maximum_jobs = self.settings.web_max_active_exports + self.settings.web_max_queued_exports
@@ -571,6 +639,33 @@ class WebState:
         except OSError as exc:
             message = f"Could not measure export storage usage: {exc}"
             raise WebCapacityError(message) from exc
+
+    def _export_paths(self) -> list[Path]:
+        """List finished videos, skipping dotfiles such as macOS ._ metadata."""
+        return [path for path in self.settings.output_dir.glob("*.mp4") if not path.name.startswith(".")]
+
+    def _read_export_files(self, listed: set[str]) -> list[ExportFile]:
+        files: list[ExportFile] = []
+        for path in self._export_paths():
+            if path.name not in listed:
+                with suppress(OSError):
+                    stat = path.stat()
+                    modified = datetime.fromtimestamp(stat.st_mtime, self.settings.timezone)
+                    files.append(ExportFile(path.name, stat.st_size, modified))
+        return sorted(files, key=lambda item: item.modified, reverse=True)
+
+    def _delete_exports_before(self, cutoff: datetime, active: set[str]) -> set[str]:
+        removed: set[str] = set()
+        for path in self._export_paths():
+            if path.name in active:
+                continue
+            try:
+                if path.stat().st_mtime < cutoff.timestamp():
+                    path.unlink()
+                    removed.add(path.name)
+            except OSError:
+                _LOGGER.warning("Could not apply retention to %s", path, exc_info=True)
+        return removed
 
     def _trim_jobs(self) -> None:
         excess = len(self.jobs) - MAX_VISIBLE_JOBS

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 from timelapse import OperationTimeoutError, TimelapseError
 from timelapse.download import download_timelapse
-from timelapse.protect import load_cameras, parse_connection, private_operation, protect_client
+from timelapse.protect import load_cameras, parse_connection, private_operation
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
     from timelapse.config import Config, ConnectionSettings
     from timelapse.download import ProgressCallback
-    from timelapse.protect import CameraInfo
+    from timelapse.protect import CameraInfo, ProtectClients
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -43,17 +43,15 @@ async def _operation_timeout(seconds: int, operation: str) -> AsyncIterator[None
         raise OperationTimeoutError(message) from exc
 
 
-async def list_available_cameras(config: ConnectionSettings) -> list[CameraInfo]:
-    """Load cameras with a client owned by the current event loop."""
-    connection = parse_connection(config.instance_url)
-    async with (
-        protect_client(config, connection) as client,
-        _operation_timeout(config.request_timeout_seconds, "Camera discovery"),
-    ):
+async def list_available_cameras(clients: ProtectClients, config: ConnectionSettings) -> list[CameraInfo]:
+    """Load cameras with the runtime's shared client."""
+    client = clients.get(config, parse_connection(config.instance_url))
+    async with _operation_timeout(config.request_timeout_seconds, "Camera discovery"):
         return await load_cameras(client)
 
 
 async def fetch_camera_thumbnail(
+    clients: ProtectClients,
     config: Config,
     camera: CameraInfo,
     timestamp: datetime,
@@ -63,12 +61,11 @@ async def fetch_camera_thumbnail(
 ) -> CameraThumbnail:
     """Fetch an exact historical snapshot, falling back to the API-token live image."""
     connection = parse_connection(config.instance_url)
-    async with (
-        protect_client(config, connection) as client,
-        _operation_timeout(config.request_timeout_seconds, f"Thumbnail request for {camera.name}"),
-    ):
+    client = clients.get(config, connection)
+    async with _operation_timeout(config.request_timeout_seconds, f"Thumbnail request for {camera.name}"):
         try:
-            async with private_operation(connection, client, operation=f"thumbnail request for {camera.name}"):
+            slots = clients.slots(connection).thumbnails
+            async with private_operation(slots, client, operation=f"thumbnail request for {camera.name}"):
                 image = await client.api_request_raw(
                     f"cameras/{camera.id}/recording-snapshot",
                     params={"ts": int(timestamp.timestamp() * 1000), "w": width, "h": height},
@@ -103,6 +100,7 @@ async def fetch_camera_thumbnail(
 
 
 async def export_timelapse(
+    clients: ProtectClients,
     config: Config,
     camera: CameraInfo,
     output: Path,
@@ -118,13 +116,15 @@ async def export_timelapse(
         config.speed,
         output,
     )
-    async with protect_client(config, connection) as client:
-        try:
-            async with (
-                _operation_timeout(config.request_timeout_seconds, f"Timelapse export for {camera.name}"),
-                private_operation(connection, client, operation=f"timelapse export for {camera.name}"),
-            ):
-                await download_timelapse(config, connection, client, camera, output, progress_callback)
-        except Exception:
-            _LOGGER.exception("Timelapse export failed for %s", camera.name)
-            raise
+    client = clients.get(config, connection)
+    try:
+        async with (
+            _operation_timeout(config.request_timeout_seconds, f"Timelapse export for {camera.name}"),
+            private_operation(
+                clients.slots(connection).exports, client, operation=f"timelapse export for {camera.name}"
+            ),
+        ):
+            await download_timelapse(config, connection, client, camera, output, progress_callback)
+    except Exception:
+        _LOGGER.exception("Timelapse export failed for %s", camera.name)
+        raise

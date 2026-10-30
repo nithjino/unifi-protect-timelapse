@@ -341,3 +341,55 @@ def test_manual_claim_safety_pauses_daily_batch_without_running_it(tmp_path) -> 
         await coordinator.close()
 
     asyncio.run(exercise())
+
+
+def test_engine_pauses_before_exporting_when_storage_is_full(tmp_path) -> None:
+    async def exercise() -> None:
+        output = tmp_path / "exports"
+        output.mkdir()
+        camera = CameraInfo("camera-1", "Front", None, None)
+        registry = AutomationRegistry(tmp_path / "automations.json")
+        registry.load()
+        automation = registry.add(
+            name="Home",
+            cameras=(AutomationCamera(camera.id, camera.name),),
+            connection=ConnectionReference("python-profile", "home"),
+            speed="600x",
+            output_directory=output,
+            timezone="UTC",
+            now=datetime(2026, 8, 23, 12, tzinfo=UTC),
+            next_day=date(2026, 8, 22),
+        )
+        problem: str | None = "Export storage is full."
+
+        async def resolve(_automation):
+            return ResolvedAutomation(_connection(), (camera,))
+
+        async def export(_config, _camera, path) -> None:
+            path.write_bytes(_valid_mp4())
+
+        async def check_storage() -> str | None:
+            return problem
+
+        engine = DailyAutomationEngine(
+            registry,
+            ExportJobCoordinator(),
+            resolve_connection=resolve,
+            exporter=export,
+            check_storage=check_storage,
+            now=lambda: datetime(2026, 8, 23, 12, tzinfo=UTC),
+        )
+
+        assert await engine.run_due_once(automation.id) is False
+        paused = registry.resolve(automation.id)
+        assert paused.status == "paused"
+        assert paused.last_error == "Export storage is full."
+        assert paused.next_day == date(2026, 8, 22)
+        assert not list(output.iterdir())
+
+        problem = None
+        registry.resume(automation.id)
+        assert await engine.run_due_once(automation.id) is True
+        assert registry.resolve(automation.id).next_day == date(2026, 8, 23)
+
+    asyncio.run(exercise())

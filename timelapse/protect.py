@@ -8,12 +8,10 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
-from pathlib import Path  # noqa: TC003 - constructs the module-level session directory
-from typing import TYPE_CHECKING, BinaryIO
+from typing import TYPE_CHECKING, Self
 from urllib.parse import ParseResult, urlparse
 
 from platformdirs import user_config_path
@@ -31,7 +29,8 @@ if TYPE_CHECKING:
     from timelapse.config import ConnectionSettings
 
 CLIENT_CLOSE_TIMEOUT_SECONDS = 5.0
-PRIVATE_OPERATION_SLOTS = 2
+EXPORT_SLOTS = 2
+THUMBNAIL_SLOTS = 2
 PROTECT_RETRY_ATTEMPTS = 3
 RETRY_BASE_DELAY_SECONDS = 1.0
 RETRY_MAX_DELAY_SECONDS = 30.0
@@ -39,13 +38,8 @@ RETRY_AFTER_MAX_WAIT_SECONDS = 5 * 60.0
 RETRY_JITTER_RATIO = 0.25
 RETRY_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 HTTP_TOO_MANY_REQUESTS = 429
-LOCK_POLL_SECONDS = 0.1
 _LOGGER = logging.getLogger(__name__)
 _SESSION_DIRECTORY = user_config_path("TimeLapse") / "protect"
-_CLIENT_POOL: ContextVar[dict[_ClientKey, ProtectApiClient] | None] = ContextVar(
-    "timelapse_protect_client_pool",
-    default=None,
-)
 
 
 @dataclass(frozen=True)
@@ -76,11 +70,18 @@ class _ClientKey:
     verify_ssl: bool
 
 
+@dataclass
+class ConsoleSlots:
+    """Private-operation limits for one console; thumbnails never wait behind exports."""
+
+    exports: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(EXPORT_SLOTS))
+    thumbnails: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(THUMBNAIL_SLOTS))
+
+
 class _RetryingProtectApiClient(ProtectApiClient):
-    """Protect client with coordinated login and explicit bounded retries."""
+    """Protect client with actionable login errors and explicit bounded retries."""
 
     rate_limit_retry_after: float | None = None
-    _force_fresh_login = False
 
     async def request(  # type: ignore[override]
         self,
@@ -132,28 +133,16 @@ class _RetryingProtectApiClient(ProtectApiClient):
         raise AssertionError(message)
 
     async def authenticate(self) -> None:
-        """Collapse login attempts across clients and backend processes."""
+        """Log in unless a session is live; uiprotect collapses concurrent callers."""
         if self.is_authenticated():
             return
-        previous_cookie = self._last_token_cookie  # pyright: ignore[reportPrivateUsage]
-        async with _exclusive_file_lock(_SESSION_DIRECTORY / "authentication.lock"):
-            if self.is_authenticated():
-                return
-
-            # Another process may have refreshed the persisted cookie while this
-            # client waited for the authentication lock.
-            self._loaded_session = False  # pyright: ignore[reportPrivateUsage]
-            await self._load_session()  # pyright: ignore[reportPrivateUsage]
-            loaded_cookie = self._last_token_cookie  # pyright: ignore[reportPrivateUsage]
-            if self.is_authenticated() and (not self._force_fresh_login or loaded_cookie != previous_cookie):
-                return
-            try:
-                await super().authenticate()
-            except NvrError as exc:
-                if _is_http_429(exc):
-                    raise rate_limit_error(self.rate_limit_retry_after) from exc
-                raise
-            _secure_session_storage()
+        try:
+            await super().authenticate()
+        except NvrError as exc:
+            if _is_http_429(exc):
+                raise rate_limit_error(self.rate_limit_retry_after) from exc
+            raise
+        _secure_session_storage()
 
     async def _raise_for_status(
         self,
@@ -166,14 +155,6 @@ class _RetryingProtectApiClient(ProtectApiClient):
             self.rate_limit_retry_after = retry_after
             raise rate_limit_error(retry_after)
         await super()._raise_for_status(response, raise_exception)  # pyright: ignore[reportPrivateUsage]
-
-    async def _reauthenticate(self) -> None:
-        """Force one coordinated login when UniFi invalidates a live cookie early."""
-        self._force_fresh_login = True
-        try:
-            await super()._reauthenticate()  # pyright: ignore[reportPrivateUsage]
-        finally:
-            self._force_fresh_login = False
 
 
 def parse_connection(instance_url: str) -> ProtectConnection:
@@ -227,58 +208,51 @@ def create_client(config: ConnectionSettings, connection: ProtectConnection) -> 
     )
 
 
-@asynccontextmanager
-async def protect_session_scope() -> AsyncIterator[None]:
-    """Reuse Protect clients for all operations in the current async scope."""
-    existing_pool = _CLIENT_POOL.get()
-    if existing_pool is not None:
-        yield
-        return
+class ProtectClients:
+    """Own one client per credential set, and per-console slots, until closed."""
 
-    pool: dict[_ClientKey, ProtectApiClient] = {}
-    token = _CLIENT_POOL.set(pool)
-    try:
-        yield
-    finally:
-        await asyncio.gather(
-            *(_close_client(client, operation="session scope") for client in pool.values()),
-            return_exceptions=True,
-        )
-        _CLIENT_POOL.reset(token)
+    def __init__(self) -> None:
+        """Start empty; clients are created by the first operation that needs them."""
+        self._clients: dict[_ClientKey, ProtectApiClient] = {}
+        self._slots: dict[tuple[str, int], ConsoleSlots] = {}
 
+    async def __aenter__(self) -> Self:
+        """Enter a scope that closes every client on exit."""
+        return self
 
-@asynccontextmanager
-async def protect_client(config: ConnectionSettings, connection: ProtectConnection) -> AsyncIterator[ProtectApiClient]:
-    """Return a pooled client, or an operation-owned client outside a scope."""
-    pool = _CLIENT_POOL.get()
-    if pool is None:
-        client = create_client(config, connection)
-        try:
-            yield client
-        finally:
-            await _close_client(client, operation="standalone operation")
-        return
+    async def __aexit__(self, *_exc_info: object) -> None:
+        """Close every client created in this scope."""
+        await self.close()
 
-    key = _client_key(config)
-    client = pool.get(key)
-    if client is None:
-        client = create_client(config, connection)
-        pool[key] = client
-    yield client
+    def get(self, config: ConnectionSettings, connection: ProtectConnection) -> ProtectApiClient:
+        """Return the shared client for these credentials."""
+        key = _client_key(config)
+        client = self._clients.get(key)
+        if client is None:
+            client = self._clients[key] = create_client(config, connection)
+        return client
+
+    def slots(self, connection: ProtectConnection) -> ConsoleSlots:
+        """Return the private-operation limits for one console."""
+        return self._slots.setdefault((connection.host, connection.port), ConsoleSlots())
+
+    async def close(self) -> None:
+        """Close all clients; a later operation starts fresh ones."""
+        clients = tuple(self._clients.values())
+        self._clients.clear()
+        self._slots.clear()
+        await asyncio.gather(*(_close_client(client) for client in clients), return_exceptions=True)
 
 
 @asynccontextmanager
 async def private_operation(
-    connection: ProtectConnection,
+    slots: asyncio.Semaphore,
     client: ProtectApiClient,
     *,
     operation: str,
 ) -> AsyncIterator[None]:
-    """Limit private media work per console and authenticate before it starts."""
-    lock_stem = hashlib.sha256(f"{connection.host}:{connection.port}".encode()).hexdigest()[:20]
-    async with _first_available_lock(
-        tuple(_SESSION_DIRECTORY / f"private-{lock_stem}-{slot}.lock" for slot in range(PRIVATE_OPERATION_SLOTS))
-    ):
+    """Hold one slot and authenticate before private media work starts."""
+    async with slots:
         try:
             await client.ensure_authenticated()
         except NvrError as exc:
@@ -395,105 +369,10 @@ def _secure_session_storage() -> None:
         return
 
 
-async def _close_client(client: ProtectApiClient, *, operation: str) -> None:
+async def _close_client(client: ProtectApiClient) -> None:
     try:
         await asyncio.wait_for(client.close_session(), timeout=CLIENT_CLOSE_TIMEOUT_SECONDS)
     except TimeoutError:
-        _LOGGER.warning("Protect client cleanup timed out after %s", operation)
+        _LOGGER.warning("Protect client cleanup timed out")
     except Exception:
-        _LOGGER.warning("Protect client cleanup failed after %s", operation, exc_info=True)
-
-
-class _LockedFile:
-    def __init__(self, path: Path) -> None:
-        self.path = path
-        self.file: BinaryIO | None = None
-
-    def try_acquire(self) -> bool:
-        _prepare_session_directory()
-        file = self.path.open("a+b")
-        try:
-            if os.name == "nt":
-                import msvcrt  # noqa: PLC0415
-
-                file.seek(0, os.SEEK_END)
-                if file.tell() == 0:
-                    file.write(b"\0")
-                    file.flush()
-                file.seek(0)
-                msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl  # noqa: PLC0415
-
-                fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            file.close()
-            return False
-        except OSError as exc:
-            file.close()
-            if os.name == "nt" and getattr(exc, "winerror", None) in {33, 36}:
-                return False
-            raise
-        self.file = file
-        return True
-
-    def release(self) -> None:
-        file = self.file
-        self.file = None
-        if file is None:
-            return
-        try:
-            if os.name == "nt":
-                import msvcrt  # noqa: PLC0415
-
-                file.seek(0)
-                msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl  # noqa: PLC0415
-
-                fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-        finally:
-            file.close()
-
-
-@asynccontextmanager
-async def _exclusive_file_lock(path: Path) -> AsyncIterator[None]:
-    lock = _LockedFile(path)
-    while not await _try_acquire(lock):  # noqa: ASYNC110 - cancellable lock polling
-        await asyncio.sleep(LOCK_POLL_SECONDS)
-    try:
-        yield
-    finally:
-        await asyncio.shield(asyncio.to_thread(lock.release))
-
-
-@asynccontextmanager
-async def _first_available_lock(paths: tuple[Path, ...]) -> AsyncIterator[None]:
-    if not paths:
-        message = "at least one private-operation slot is required"
-        raise ValueError(message)
-    selected: _LockedFile | None = None
-    while selected is None:
-        for path in paths:
-            candidate = _LockedFile(path)
-            if await _try_acquire(candidate):
-                selected = candidate
-                break
-        if selected is None:
-            await asyncio.sleep(LOCK_POLL_SECONDS)
-    try:
-        yield
-    finally:
-        await asyncio.shield(asyncio.to_thread(selected.release))
-
-
-async def _try_acquire(lock: _LockedFile) -> bool:
-    """Avoid leaking a just-acquired OS lock when its waiter is cancelled."""
-    task = asyncio.create_task(asyncio.to_thread(lock.try_acquire))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        result = (await asyncio.gather(task, return_exceptions=True))[0]
-        if result is True:
-            await asyncio.shield(asyncio.to_thread(lock.release))
-        raise
+        _LOGGER.warning("Protect client cleanup failed", exc_info=True)
