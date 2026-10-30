@@ -20,7 +20,6 @@ from timelapse.automation_registry import (
     AutomationRegistry,
     ConnectionReference,
     DailyAutomation,
-    RegistryError,
 )
 from timelapse.config import (
     DEFAULT_MAX_DOWNLOAD_MIB,
@@ -28,35 +27,25 @@ from timelapse.config import (
     SPEED_TO_FPS,
     Config,
     ConnectionSettings,
+    is_truthy,
 )
 from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
-from timelapse.jobs import CoordinatorJob, ExportJobCoordinator, ExportJobSpec
+from timelapse.jobs import DEFAULT_MAX_ACTIVE_EXPORTS, CoordinatorJob, ExportJobCoordinator, ExportJobSpec
 from timelapse.protect import CameraInfo
-from timelapse.schedule import (
-    DailyAutomationEngine,
-    ResolvedAutomation,
-    daily_output_path,
-    local_day_bounds,
-    seconds_until_next_local_day,
-)
+from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation, seconds_until_next_local_day
 from timelapse.service import CameraThumbnail, export_timelapse, fetch_camera_thumbnail, list_available_cameras
 
-JobStatus = Literal["queued", "running", "completed", "failed", "cancelled", "skipped"]
-TERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset({"completed", "failed", "cancelled", "skipped"})
+JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
+TERMINAL_JOB_STATUSES: frozenset[JobStatus] = frozenset({"completed", "failed", "cancelled"})
 ALL_JOB_STATUSES: frozenset[JobStatus] = frozenset({"queued", "running", *TERMINAL_JOB_STATUSES})
 CAMERA_CACHE_SECONDS = 60.0
 MAX_VISIBLE_JOBS = 100
-SCHEDULE_STATE_VERSION = 1
-DEFAULT_MAX_ACTIVE_EXPORTS = 4
 DEFAULT_MAX_QUEUED_EXPORTS = 20
 DEFAULT_MAX_EXPORT_HOURS = 24 * 7
 DEFAULT_STORAGE_QUOTA_MIB = 100 * 1024
-SCHEDULE_RETRY_INITIAL_SECONDS = 60.0
-SCHEDULE_RETRY_MAX_SECONDS = 60.0 * 60
-SCHEDULE_RETRY_MAX_FAILURES = 5
 _LOGGER = logging.getLogger(__name__)
 
-CameraLoader = Callable[[Config | ConnectionSettings], Awaitable[list[CameraInfo]]]
+CameraLoader = Callable[[ConnectionSettings], Awaitable[list[CameraInfo]]]
 ThumbnailLoader = Callable[[Config, CameraInfo, datetime], Awaitable[CameraThumbnail]]
 Exporter = Callable[[Config, CameraInfo, Path, Callable[[DownloadProgress], None] | None], Awaitable[None]]
 
@@ -65,24 +54,11 @@ class WebCapacityError(ValueError):
     """The bounded web export queue or storage budget is full."""
 
 
-def _environment_integer(name: str, default: int) -> int:
-    raw = os.environ.get(name, str(default))
+def _environment_integer(name: str, default: int, *, minimum: int = 0) -> int:
     try:
-        value = int(raw)
+        return max(int(os.environ.get(name, str(default))), minimum)
     except ValueError:
         return default
-    return max(value, 0)
-
-
-def _environment_positive_integer(name: str, default: int) -> int:
-    return max(_environment_integer(name, default), 1)
-
-
-def _environment_boolean(name: str, *, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
 
 
 def _environment_timezone() -> ZoneInfo:
@@ -94,35 +70,12 @@ def _environment_timezone() -> ZoneInfo:
         raise ValueError(message) from exc
 
 
-def _stored_datetime(value: object, *, required: bool = False) -> datetime | None:
-    if value is None and not required:
-        return None
-    if not isinstance(value, str):
-        message = "stored datetime must be an ISO-8601 string"
-        raise TypeError(message)
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
+def _stored_datetime(value: object) -> datetime:
+    parsed = datetime.fromisoformat(cast("str", value))
+    if parsed.utcoffset() is None:
         message = "stored datetime must include a timezone"
         raise ValueError(message)
     return parsed
-
-
-def _stored_nonnegative_integer(value: object, *, default: int = 0) -> int:
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        message = "stored value must be a nonnegative integer"
-        raise ValueError(message)
-    return value
-
-
-def _stored_nonnegative_number(value: object, *, default: float = 0.0) -> float:
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
-        message = "stored value must be a nonnegative number"
-        raise ValueError(message)
-    return float(value)
 
 
 @dataclass(frozen=True)
@@ -130,16 +83,16 @@ class WebSettings:
     """Server configuration loaded from the environment without exposing secrets."""
 
     instance_url: str
-    token: str
+    token: str = field(repr=False)
     username: str
-    password: str
+    password: str = field(repr=False)
     verify_ssl: bool
     request_timeout_seconds: int
     max_download_mib: int
     data_dir: Path
     output_dir: Path
     web_username: str = "timelapse"
-    web_password: str | None = None
+    web_password: str | None = field(default=None, repr=False)
     web_session_hours: int = 168
     web_cookie_secure: bool = False
     web_host: str = "127.0.0.1"
@@ -155,40 +108,34 @@ class WebSettings:
         """Load connection, storage, and web access settings."""
         data_dir = Path(os.environ.get("TIMELAPSE_WEB_DATA_DIR", "data")).expanduser().resolve()
         output_dir = Path(os.environ.get("TIMELAPSE_WEB_OUTPUT_DIR", str(data_dir / "exports"))).expanduser().resolve()
-        web_password = os.environ.get("TIMELAPSE_WEB_PASSWORD") or None
-        web_host = os.environ.get("TIMELAPSE_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1"
-        web_trusted_hosts = tuple(
-            host.strip().casefold()
-            for host in os.environ.get("TIMELAPSE_WEB_TRUSTED_HOSTS", "").split(",")
-            if host.strip()
-        )
+        trusted_hosts = os.environ.get("TIMELAPSE_WEB_TRUSTED_HOSTS", "").split(",")
         return cls(
             instance_url=os.environ.get("UNIFI_PROTECT_URL", "").strip().rstrip("/"),
             token=os.environ.get("UNIFI_PROTECT_TOKEN", ""),
             username=os.environ.get("UNIFI_PROTECT_USERNAME", ""),
             password=os.environ.get("UNIFI_PROTECT_PASSWORD", ""),
-            verify_ssl=_environment_boolean("UNIFI_PROTECT_VERIFY_SSL", default=True),
+            verify_ssl=is_truthy(os.environ.get("UNIFI_PROTECT_VERIFY_SSL", "true")),
             request_timeout_seconds=_environment_integer(
                 "TIMELAPSE_REQUEST_TIMEOUT_SECONDS", DEFAULT_REQUEST_TIMEOUT_SECONDS
             ),
             max_download_mib=_environment_integer("TIMELAPSE_MAX_DOWNLOAD_MIB", DEFAULT_MAX_DOWNLOAD_MIB),
             data_dir=data_dir,
             output_dir=output_dir,
-            web_username=os.environ.get("TIMELAPSE_WEB_USERNAME", "timelapse") or "timelapse",
-            web_password=web_password,
-            web_session_hours=max(_environment_integer("TIMELAPSE_WEB_SESSION_HOURS", 168), 1),
-            web_cookie_secure=_environment_boolean("TIMELAPSE_WEB_COOKIE_SECURE", default=False),
-            web_host=web_host,
-            web_trusted_hosts=web_trusted_hosts,
-            web_max_active_exports=_environment_positive_integer(
-                "TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS", DEFAULT_MAX_ACTIVE_EXPORTS
+            web_username=os.environ.get("TIMELAPSE_WEB_USERNAME") or "timelapse",
+            web_password=os.environ.get("TIMELAPSE_WEB_PASSWORD") or None,
+            web_session_hours=_environment_integer("TIMELAPSE_WEB_SESSION_HOURS", 168, minimum=1),
+            web_cookie_secure=is_truthy(os.environ.get("TIMELAPSE_WEB_COOKIE_SECURE", "false")),
+            web_host=os.environ.get("TIMELAPSE_WEB_HOST", "127.0.0.1").strip() or "127.0.0.1",
+            web_trusted_hosts=tuple(host.strip().casefold() for host in trusted_hosts if host.strip()),
+            web_max_active_exports=_environment_integer(
+                "TIMELAPSE_WEB_MAX_ACTIVE_EXPORTS", DEFAULT_MAX_ACTIVE_EXPORTS, minimum=1
             ),
             web_max_queued_exports=_environment_integer("TIMELAPSE_WEB_MAX_QUEUED_EXPORTS", DEFAULT_MAX_QUEUED_EXPORTS),
-            web_max_export_hours=_environment_positive_integer(
-                "TIMELAPSE_WEB_MAX_EXPORT_HOURS", DEFAULT_MAX_EXPORT_HOURS
+            web_max_export_hours=_environment_integer(
+                "TIMELAPSE_WEB_MAX_EXPORT_HOURS", DEFAULT_MAX_EXPORT_HOURS, minimum=1
             ),
-            web_storage_quota_mib=_environment_positive_integer(
-                "TIMELAPSE_WEB_STORAGE_QUOTA_MIB", DEFAULT_STORAGE_QUOTA_MIB
+            web_storage_quota_mib=_environment_integer(
+                "TIMELAPSE_WEB_STORAGE_QUOTA_MIB", DEFAULT_STORAGE_QUOTA_MIB, minimum=1
             ),
             timezone=_environment_timezone(),
         )
@@ -244,39 +191,11 @@ class WebSettings:
             verify_ssl=self.verify_ssl,
             request_timeout_seconds=self.request_timeout_seconds,
             max_download_mib=self.max_download_mib,
-            connection_kind="web-environment",
-            connection_value="default",
         )
 
-    def config(
-        self,
-        start: datetime,
-        end: datetime,
-        speed: str,
-        *,
-        daily: bool = False,
-        full_day: bool = False,
-    ) -> Config:
+    def config(self, start: datetime, end: datetime, speed: str, *, full_day: bool = False) -> Config:
         """Build an export configuration without leaking connection values."""
-        if self.missing_connection_values:
-            missing = ", ".join(self.missing_connection_values)
-            message = f"Server configuration is incomplete. Set {missing} and restart the web server."
-            raise ValueError(message)
-        return Config(
-            instance_url=self.instance_url,
-            token=self.token,
-            username=self.username,
-            password=self.password,
-            verify_ssl=self.verify_ssl,
-            speed=speed,
-            start=start,
-            end=end,
-            output=None,
-            request_timeout_seconds=self.request_timeout_seconds,
-            max_download_mib=self.max_download_mib,
-            daily=daily,
-            full_day=full_day or daily,
-        )
+        return Config.from_connection(self.connection_settings(), speed=speed, start=start, end=end, full_day=full_day)
 
 
 @dataclass
@@ -300,7 +219,6 @@ class ExportJob:
     started_at: datetime | None = None
     finished_at: datetime | None = None
     error: str | None = None
-    task: asyncio.Task[None] | None = field(default=None, repr=False)
 
     @property
     def terminal(self) -> bool:
@@ -327,11 +245,8 @@ class ExportJob:
             return None
 
 
-DailySchedule = DailyAutomation
-
-
 class WebState:
-    """Own camera cache, export tasks, and persistent daily schedules."""
+    """Own camera cache, export jobs, and Daily Automation tasks."""
 
     def __init__(
         self,
@@ -344,8 +259,6 @@ class WebState:
         """Initialize state with overridable service operations for tests."""
         self.settings = settings
         self.jobs: dict[str, ExportJob] = {}
-        self.automations: dict[str, DailyAutomation] = {}
-        self.schedules = self.automations
         self.version = 0
         self._camera_loader = camera_loader
         self._thumbnail_loader = thumbnail_loader
@@ -353,19 +266,12 @@ class WebState:
         self._cameras: list[CameraInfo] = []
         self._cameras_loaded_at = 0.0
         self._camera_lock = asyncio.Lock()
-        self._export_semaphore = asyncio.Semaphore(settings.web_max_active_exports)
         self._coordinator = ExportJobCoordinator(
             max_active=settings.web_max_active_exports,
-            max_queued=settings.web_max_queued_exports,
             on_transition=self._coordinator_transition,
         )
-        self._download_terminal_condition = asyncio.Condition()
-        self._download_terminal_generation = 0
         self._job_mutation_lock = asyncio.Lock()
-        self._schedule_mutation_lock = asyncio.Lock()
-        self._schedule_persist_lock = asyncio.Lock()
         self._job_persist_lock = asyncio.Lock()
-        self._schedule_state_file = settings.data_dir / "web-schedules.json"
         self._job_state_file = settings.data_dir / "web-jobs.json"
         self._automation_registry = AutomationRegistry(settings.data_dir / "web-automations.json")
         self._automation_tasks: dict[str, asyncio.Task[None]] = {}
@@ -376,8 +282,13 @@ class WebState:
             exporter=self._export_automation_job,
         )
 
+    @property
+    def automations(self) -> dict[str, DailyAutomation]:
+        """Return retained automations by ID."""
+        return {item.id: item for item in self._automation_registry.list()}
+
     async def start(self) -> None:
-        """Prepare storage and resume persisted schedules."""
+        """Prepare storage and resume persisted automations."""
         for directory in {self.settings.data_dir, self.settings.output_dir}:
             try:
                 await asyncio.to_thread(self._prepare_storage_directory, directory)
@@ -390,33 +301,13 @@ class WebState:
                 raise RuntimeError(message) from exc
         await self._load_jobs()
         self._automation_registry.load()
-        if self._schedule_state_file.exists():
-            try:
-                self._automation_registry.migrate_web_v1(
-                    self._schedule_state_file,
-                    output_directory=self.settings.output_dir,
-                    timezone=self.settings.timezone_name,
-                )
-            except RegistryError as exc:
-                quarantined = self._schedule_state_file.with_name(
-                    f"{self._schedule_state_file.stem}.invalid-{secrets.token_hex(4)}{self._schedule_state_file.suffix}"
-                )
-                try:
-                    self._schedule_state_file.replace(quarantined)
-                except OSError:
-                    _LOGGER.exception("Could not quarantine invalid legacy Web schedule state")
-                else:
-                    _LOGGER.warning("Moved invalid legacy Web schedule state to %s: %s", quarantined, exc)
-        self.automations.clear()
-        self.automations.update((item.id, item) for item in self._automation_registry.list())
-        for automation in self.automations.values():
+        for automation in self._automation_registry.list():
             if automation.status == "active":
                 self._start_automation_task(automation.id)
 
     async def close(self) -> None:
         """Cancel background work during server shutdown."""
-        tasks = [job.task for job in self.jobs.values() if job.task is not None and not job.task.done()]
-        tasks.extend(task for task in self._automation_tasks.values() if not task.done())
+        tasks = [task for task in self._automation_tasks.values() if not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -427,13 +318,10 @@ class WebState:
     async def cameras(self, *, refresh: bool = False) -> list[CameraInfo]:
         """Return cached cameras, refreshing them when stale or requested."""
         loop = asyncio.get_running_loop()
-        if self._cameras and not refresh and loop.time() - self._cameras_loaded_at < CAMERA_CACHE_SECONDS:
-            return list(self._cameras)
         async with self._camera_lock:
-            if self._cameras and not refresh and loop.time() - self._cameras_loaded_at < CAMERA_CACHE_SECONDS:
-                return list(self._cameras)
-            self._cameras = await self._camera_loader(self.settings.connection_settings())
-            self._cameras_loaded_at = loop.time()
+            if refresh or not self._cameras or loop.time() - self._cameras_loaded_at >= CAMERA_CACHE_SECONDS:
+                self._cameras = await self._camera_loader(self.settings.connection_settings())
+                self._cameras_loaded_at = loop.time()
             return list(self._cameras)
 
     async def camera(self, camera_id: str) -> CameraInfo:
@@ -451,6 +339,14 @@ class WebState:
         config = self.settings.config(timestamp, timestamp + timedelta(seconds=1), "600x")
         return await self._thumbnail_loader(config, camera, timestamp)
 
+    async def _selected_cameras(self, camera_ids: list[str]) -> list[CameraInfo]:
+        by_id = {camera.id: camera for camera in await self.cameras()}
+        selected = [by_id[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in by_id]
+        if not selected:
+            message = "Select at least one available camera."
+            raise ValueError(message)
+        return selected
+
     async def create_jobs(
         self,
         camera_ids: list[str],
@@ -465,26 +361,27 @@ class WebState:
         if end <= start:
             message = "End time must be after start time."
             raise ValueError(message)
-        maximum_duration = timedelta(hours=self.settings.web_max_export_hours)
-        if end - start > maximum_duration:
+        if end - start > timedelta(hours=self.settings.web_max_export_hours):
             message = f"Exports are limited to {self.settings.web_max_export_hours} hours."
             raise WebCapacityError(message)
-        cameras = await self.cameras()
-        by_id = {camera.id: camera for camera in cameras}
-        selected = [by_id[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in by_id]
-        if not selected:
-            message = "Select at least one available camera."
-            raise ValueError(message)
+        selected = await self._selected_cameras(camera_ids)
         async with self._job_mutation_lock:
             await self._ensure_export_capacity(len(selected))
-            jobs = self._plan_export_jobs(
-                selected,
-                start,
-                end,
-                speed,
-                daily=daily,
-                full_day=full_day,
-            )
+            config = self.settings.config(start, end, speed, full_day=full_day or daily)
+            jobs = [
+                ExportJob(
+                    id=secrets.token_urlsafe(9),
+                    camera=camera,
+                    start=start,
+                    end=end,
+                    speed=speed,
+                    output=self.settings.output_dir / default_output_path(config, camera).name,
+                    daily=daily,
+                    full_day=config.full_day,
+                    created_at=self.settings.now(),
+                )
+                for camera in selected
+            ]
             previous_jobs = dict(self.jobs)
 
             async def persist_intent(claimed: tuple[CoordinatorJob, ...]) -> None:
@@ -495,48 +392,15 @@ class WebState:
                 await self._persist_jobs()
 
             try:
-                runtimes = await self._coordinator.submit(
-                    (self._job_spec(job) for job in jobs),
+                await self._coordinator.submit(
+                    (self._job_spec(job, config) for job in jobs),
                     before_admission=persist_intent,
                 )
             except BaseException:
                 self.jobs = previous_jobs
                 raise
-            for job, runtime in zip(jobs, runtimes, strict=True):
-                job.task = asyncio.create_task(self._run_job(job, runtime), name=f"export-{job.id}")
             self._changed()
             return jobs
-
-    def _plan_export_jobs(
-        self,
-        cameras: list[CameraInfo],
-        start: datetime,
-        end: datetime,
-        speed: str,
-        *,
-        daily: bool,
-        full_day: bool,
-    ) -> list[ExportJob]:
-        base_config = self.settings.config(start, end, speed, daily=daily, full_day=full_day)
-        jobs: list[ExportJob] = []
-        for camera in cameras:
-            output = self.settings.output_dir / default_output_path(base_config, camera).name
-            if daily:
-                output = daily_output_path(base_config, camera, self.settings.output_dir)
-            jobs.append(
-                ExportJob(
-                    id=secrets.token_urlsafe(9),
-                    camera=camera,
-                    start=start,
-                    end=end,
-                    speed=speed,
-                    output=output,
-                    daily=daily,
-                    full_day=full_day or daily,
-                    created_at=self.settings.now(),
-                )
-            )
-        return jobs
 
     async def cancel_or_remove_job(self, job_id: str) -> str:
         """Cancel an active job or delete a terminal job and its output file."""
@@ -546,14 +410,7 @@ class WebState:
                 message = "That export is no longer in the job list."
                 raise ValueError(message)
             if job.terminal:
-                record = self._automation_registry.job(job.id) if job.daily else None
-                if record is not None:
-                    if record.status not in {"completed", "failed", "cancelled"}:
-                        message = "That Daily Automation export is still being finalized. Try again shortly."
-                        raise ValueError(message)
-                    self._automation_registry.delete_artifact(job.id)
-                else:
-                    await asyncio.to_thread(job.output.unlink, missing_ok=True)
+                await asyncio.to_thread(job.output.unlink, missing_ok=True)
                 del self.jobs[job_id]
                 try:
                     await self._persist_jobs()
@@ -571,25 +428,14 @@ class WebState:
         if job is None or job.status not in {"failed", "cancelled"}:
             message = "Only failed or cancelled exports can be retried."
             raise ValueError(message)
-        return (
-            await self.create_jobs(
-                [job.camera.id],
-                job.start,
-                job.end,
-                job.speed,
-                daily=job.daily,
-                full_day=job.full_day,
-            )
-        )[0]
+        created = await self.create_jobs(
+            [job.camera.id], job.start, job.end, job.speed, daily=job.daily, full_day=job.full_day
+        )
+        return created[0]
 
     async def create_automation(self, name: str, camera_ids: list[str], speed: str) -> DailyAutomation:
         """Persist and start a named Daily Automation."""
-        cameras = await self.cameras()
-        by_id = {camera.id: camera for camera in cameras}
-        selected = [by_id[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in by_id]
-        if not selected:
-            message = "Select at least one available camera."
-            raise ValueError(message)
+        selected = await self._selected_cameras(camera_ids)
         if speed not in SPEED_TO_FPS:
             message = "Choose a supported timelapse speed."
             raise ValueError(message)
@@ -602,120 +448,67 @@ class WebState:
             timezone=self.settings.timezone_name,
             now=self.settings.now(),
         )
-        async with self._schedule_mutation_lock:
-            self._sync_automations()
-            self._start_automation_task(automation.id)
-            self._changed()
-            return automation
-
-    async def create_schedule(self, camera_ids: list[str], speed: str) -> DailyAutomation:
-        """Create a generated-name automation for older in-process callers."""
-        base_name = "Web Daily Automation"
-        name = base_name
-        suffix = 2
-        while any(item.name.casefold() == name.casefold() for item in self.automations.values()):
-            name = f"{base_name} {suffix}"
-            suffix += 1
-        return await self.create_automation(name, camera_ids, speed)
+        self._start_automation_task(automation.id)
+        self._changed()
+        return automation
 
     async def stop_automation(self, automation_id: str) -> DailyAutomation:
         """Stop future batches without removing the automation."""
-        async with self._schedule_mutation_lock:
-            automation = await self._automation_engine.stop(automation_id)
-            self._sync_automations()
-            self._changed()
-            return automation
+        automation = self._automation_registry.stop(automation_id)
+        self._changed()
+        return automation
 
     async def remove_automation(self, automation_id: str) -> None:
         """Remove an automation after its submitted batch drains."""
-        async with self._schedule_mutation_lock:
-            if automation_id not in self.automations:
-                message = "That Daily Automation no longer exists."
-                raise ValueError(message)
-            await self._automation_engine.remove(automation_id)
-            task = self._automation_tasks.pop(automation_id, None)
-            if task is not None:
-                task.cancel()
-            self._sync_automations()
-            self._changed()
-
-    async def remove_schedule(self, schedule_id: str) -> None:
-        """Compatibility wrapper for in-process callers renamed in version 2."""
-        await self.remove_automation(schedule_id)
+        await self._automation_engine.remove(automation_id)
+        task = self._automation_tasks.pop(automation_id, None)
+        if task is not None:
+            task.cancel()
+        self._changed()
 
     async def resume_automation(self, automation_id: str) -> DailyAutomation:
         """Resume a paused or stopped automation after operator intervention."""
-        async with self._schedule_mutation_lock:
-            automation = await self._automation_engine.resume(automation_id)
-            self._sync_automations()
-            self._start_automation_task(automation.id)
-            self._changed()
-            return automation
+        automation = self._automation_registry.resume(automation_id)
+        self._start_automation_task(automation.id)
+        self._changed()
+        return automation
 
-    async def retry_schedule(self, schedule_id: str) -> DailyAutomation:
-        """Compatibility wrapper for the version-2 Resume action."""
-        return await self.resume_automation(schedule_id)
-
-    def _job_spec(self, job: ExportJob) -> ExportJobSpec:
+    def _job_spec(self, job: ExportJob, config: Config) -> ExportJobSpec:
         """Describe a manual export using the coordinator-provided output."""
-        config = self.settings.config(
-            job.start,
-            job.end,
-            job.speed,
-            daily=job.daily,
-            full_day=job.full_day,
-        )
-
-        def report_progress(progress: DownloadProgress) -> None:
-            job.downloaded_bytes = progress.downloaded_bytes
-            job.total_bytes = progress.total_bytes
-            job.bytes_per_second = progress.bytes_per_second
-            job.elapsed_seconds = progress.elapsed_seconds
-            self._changed()
 
         async def operation(output: Path) -> None:
-            await self._exporter(config, job.camera, output, report_progress)
+            await self._exporter(config, job.camera, output, lambda progress: self._report_progress(job, progress))
 
-        return ExportJobSpec.create(
-            output=job.output,
-            operation=operation,
-            job_id=job.id,
-            collision_policy="reject",
-        )
+        return ExportJobSpec.create(output=job.output, operation=operation, job_id=job.id)
 
-    async def _run_job(self, job: ExportJob, runtime: CoordinatorJob) -> None:
-        """Wait for a submitted export and forward cancellation to its owner."""
-        try:
-            await self._coordinator.wait((runtime,))
-        except asyncio.CancelledError:
-            await self._coordinator.cancel(job.id)
-            raise
+    def _report_progress(self, job: ExportJob, progress: DownloadProgress) -> None:
+        job.downloaded_bytes = progress.downloaded_bytes
+        job.total_bytes = progress.total_bytes
+        job.bytes_per_second = progress.bytes_per_second
+        job.elapsed_seconds = progress.elapsed_seconds
+        self._changed()
 
     async def _coordinator_transition(self, runtime: CoordinatorJob) -> None:
         """Project coordinator state into the retained Web job history."""
         job = self.jobs.get(runtime.id)
-        if job is None and runtime.spec.automation_id is not None:
-            context = self._automation_registry.job_context(runtime.id)
-            if context is not None and context.automation is not None:
-                record, batch, automation = context.job, context.batch, context.automation
-                start, end = local_day_bounds(batch.day, automation.timezone)
-                job = ExportJob(
-                    id=runtime.id,
-                    camera=CameraInfo(record.camera.id, record.camera.name, None, None),
-                    start=start,
-                    end=end,
-                    speed=automation.speed,
-                    output=Path(record.output),
-                    daily=True,
-                    full_day=True,
-                    created_at=record.created_at.astimezone(self.settings.timezone),
-                )
-                self.jobs[job.id] = job
+        spec = runtime.spec
+        if job is None and spec.config is not None and spec.camera is not None:
+            job = ExportJob(
+                id=runtime.id,
+                camera=spec.camera,
+                start=spec.config.start,
+                end=spec.config.end,
+                speed=spec.config.speed,
+                output=runtime.output,
+                daily=True,
+                full_day=True,
+                created_at=runtime.created_at.astimezone(self.settings.timezone),
+            )
+            self.jobs[job.id] = job
         if job is None:
             return
-        projected_status = "queued" if runtime.status == "pending" else runtime.status
         job.output = runtime.output
-        job.status = cast("JobStatus", projected_status)
+        job.status = "queued" if runtime.status == "pending" else runtime.status
         job.started_at = runtime.started_at.astimezone(self.settings.timezone) if runtime.started_at else None
         job.finished_at = runtime.finished_at.astimezone(self.settings.timezone) if runtime.finished_at else None
         job.error = runtime.error
@@ -727,34 +520,27 @@ class WebState:
         await self._persist_jobs()
 
     async def _run_automation(self, automation_id: str) -> None:
-        """Project shared-engine transitions into Web state notifications."""
-        try:
-            while True:
-                result = await self._automation_engine.run_due_once(automation_id)
-                self._sync_automations()
+        """Run one automation, reporting each pass to connected browsers."""
+        registry = self._automation_registry
+        with suppress(asyncio.CancelledError):
+            while registry.contains(automation_id):
+                progressed = await self._automation_engine.run_due_once(automation_id)
                 self._changed()
-                if not self._automation_registry.contains(automation_id):
-                    return
-                if result is not None:
+                if progressed or not registry.contains(automation_id):
                     continue
-                automation = self._automation_registry.resolve(automation_id)
-                delay = (
-                    seconds_until_next_local_day(self.settings.now(), automation.timezone)
-                    if automation.status == "active"
-                    else 60.0
+                automation = registry.resolve(automation_id)
+                active = automation.status == "active"
+                await asyncio.sleep(
+                    seconds_until_next_local_day(self.settings.now(), automation.timezone) if active else 60.0
                 )
-                await asyncio.sleep(delay)
-        except asyncio.CancelledError:
-            return
-        finally:
-            self._sync_automations()
-            self._changed()
 
     async def _resolve_web_automation(self, _automation: DailyAutomation) -> ResolvedAutomation:
         return ResolvedAutomation(self.settings.connection_settings(), tuple(await self.cameras(refresh=True)))
 
     async def _export_automation_job(self, config: Config, camera: CameraInfo, output: Path) -> None:
-        await self._exporter(config, camera, output, None)
+        job = next((item for item in self.jobs.values() if item.output == output and not item.terminal), None)
+        callback = None if job is None else lambda progress: self._report_progress(job, progress)
+        await self._exporter(config, camera, output, callback)
 
     def _start_automation_task(self, automation_id: str) -> None:
         task = self._automation_tasks.get(automation_id)
@@ -763,10 +549,6 @@ class WebState:
                 self._run_automation(automation_id),
                 name=f"daily-automation-{automation_id}",
             )
-
-    def _sync_automations(self) -> None:
-        self.automations.clear()
-        self.automations.update((item.id, item) for item in self._automation_registry.list())
 
     async def _ensure_export_capacity(self, requested_jobs: int) -> None:
         active_jobs = sum(not job.terminal for job in self.jobs.values())
@@ -791,112 +573,71 @@ class WebState:
             raise WebCapacityError(message) from exc
 
     def _trim_jobs(self) -> None:
-        if len(self.jobs) <= MAX_VISIBLE_JOBS:
-            return
-        terminal = sorted(
-            (job for job in self.jobs.values() if job.terminal),
-            key=lambda job: job.created_at,
-        )
-        for job in terminal[: max(len(self.jobs) - MAX_VISIBLE_JOBS, 0)]:
-            self.jobs.pop(job.id, None)
+        excess = len(self.jobs) - MAX_VISIBLE_JOBS
+        if excess > 0:
+            terminal = sorted((job for job in self.jobs.values() if job.terminal), key=lambda job: job.created_at)
+            for job in terminal[:excess]:
+                del self.jobs[job.id]
 
     def _changed(self) -> None:
         self.version += 1
 
-    def _stored_job(self, item: dict[object, object]) -> ExportJob:
-        job_id = str(item["id"])
-        camera_payload = item["camera"]
-        if not job_id or not isinstance(camera_payload, dict):
-            message = "stored job requires a camera"
+    def _stored_job(self, item: dict[str, object]) -> ExportJob:
+        camera = cast("dict[str, str | None]", item["camera"])
+        status = item["status"]
+        speed = item["speed"]
+        output_name = cast("str", item["output_name"])
+        if status not in ALL_JOB_STATUSES or speed not in SPEED_TO_FPS:
+            message = "stored job status or speed is invalid"
             raise ValueError(message)
-        camera_id = str(camera_payload["id"])
-        camera_name = str(camera_payload["name"])
-        if not camera_id or not camera_name:
-            message = "stored camera requires an ID and name"
-            raise ValueError(message)
-        raw_status = item["status"]
-        if not isinstance(raw_status, str) or raw_status not in ALL_JOB_STATUSES:
-            message = "stored job status is invalid"
-            raise ValueError(message)
-        status = cast("JobStatus", raw_status)
-        speed = str(item["speed"])
-        if speed not in SPEED_TO_FPS:
-            message = "stored export speed is invalid"
-            raise ValueError(message)
-        output_name = str(item["output_name"])
         if not output_name or Path(output_name).name != output_name:
             message = "stored output filename is invalid"
             raise ValueError(message)
-        output = self.settings.output_dir / output_name
-        if output.resolve().parent != self.settings.output_dir.resolve():
-            message = "stored output is outside the export directory"
-            raise ValueError(message)
-        start = _stored_datetime(item["start"], required=True)
-        end = _stored_datetime(item["end"], required=True)
-        created_at = _stored_datetime(item["created_at"], required=True)
-        if start is None or end is None or created_at is None or end <= start:
+        start = _stored_datetime(item["start"])
+        end = _stored_datetime(item["end"])
+        if end <= start:
             message = "stored export range is invalid"
             raise ValueError(message)
-        daily = item.get("daily", False)
-        if not isinstance(daily, bool):
-            message = "stored daily flag must be a boolean"
-            raise TypeError(message)
-        full_day = item.get("full_day", daily)
-        if not isinstance(full_day, bool):
-            message = "stored full-day flag must be a boolean"
-            raise TypeError(message)
-        total_value = item.get("total_bytes")
-        total_bytes = None if total_value is None else _stored_nonnegative_integer(total_value)
-        error_value = item.get("error")
-        if error_value is not None and not isinstance(error_value, str):
-            message = "stored error must be text"
-            raise TypeError(message)
+        started_at, finished_at = item.get("started_at"), item.get("finished_at")
         return ExportJob(
-            id=job_id,
+            id=cast("str", item["id"]),
             camera=CameraInfo(
-                id=camera_id,
-                name=camera_name,
-                state=None if camera_payload.get("state") is None else str(camera_payload["state"]),
-                model=None if camera_payload.get("model") is None else str(camera_payload["model"]),
+                id=cast("str", camera["id"]),
+                name=cast("str", camera["name"]),
+                state=camera.get("state"),
+                model=camera.get("model"),
             ),
             start=start,
             end=end,
-            speed=speed,
-            output=output,
-            daily=daily,
-            full_day=full_day,
-            status=status,
-            downloaded_bytes=_stored_nonnegative_integer(item.get("downloaded_bytes")),
-            total_bytes=total_bytes,
-            bytes_per_second=_stored_nonnegative_number(item.get("bytes_per_second")),
-            elapsed_seconds=_stored_nonnegative_number(item.get("elapsed_seconds")),
-            created_at=created_at,
-            started_at=_stored_datetime(item.get("started_at")),
-            finished_at=_stored_datetime(item.get("finished_at")),
-            error=error_value,
+            speed=cast("str", speed),
+            output=self.settings.output_dir / output_name,
+            daily=item.get("daily") is True,
+            full_day=item.get("full_day", item.get("daily")) is True,
+            status=cast("JobStatus", status),
+            downloaded_bytes=cast("int", item.get("downloaded_bytes") or 0),
+            total_bytes=cast("int | None", item.get("total_bytes")),
+            bytes_per_second=cast("float", item.get("bytes_per_second") or 0.0),
+            elapsed_seconds=cast("float", item.get("elapsed_seconds") or 0.0),
+            created_at=_stored_datetime(item["created_at"]),
+            started_at=_stored_datetime(started_at) if started_at else None,
+            finished_at=_stored_datetime(finished_at) if finished_at else None,
+            error=cast("str | None", item.get("error")),
         )
 
     async def _load_jobs(self) -> None:
-        if not self._job_state_file.exists():
-            return
         try:
             raw = await asyncio.to_thread(self._job_state_file.read_text, encoding="utf-8")
-            payload = json.loads(raw)
-        except (OSError, json.JSONDecodeError):
-            return
-        if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
+            items = json.loads(raw)["jobs"]
+        except (OSError, json.JSONDecodeError, KeyError, TypeError):
             return
 
         restored_jobs: dict[str, ExportJob] = {}
         changed = False
-        for item in payload["jobs"]:
-            if not isinstance(item, dict):
-                continue
+        for item in items:
             try:
                 job = self._stored_job(item)
-            except (KeyError, TypeError, ValueError):
+            except (KeyError, TypeError, ValueError, AttributeError):
                 continue
-
             if job.status in {"queued", "running"}:
                 job.status = "cancelled"
                 job.error = "The server stopped before this export completed."
@@ -944,30 +685,18 @@ class WebState:
                     for job in self.jobs.values()
                 ]
             }
-            serialized = json.dumps(payload, indent=2, sort_keys=True)
             try:
-                await self._write_state_safely(self._job_state_file, serialized)
+                await asyncio.to_thread(self._write_job_state, json.dumps(payload, indent=2, sort_keys=True))
             except Exception:
                 _LOGGER.exception("Failed to persist web export state to %s", self._job_state_file)
                 raise
 
-    async def _write_state_safely(self, state_file: Path, serialized: str) -> None:
-        write_task = asyncio.create_task(
-            asyncio.to_thread(self._write_state, state_file, serialized),
-            name=f"persist-{state_file.stem}",
-        )
-        try:
-            await asyncio.shield(write_task)
-        except asyncio.CancelledError:
-            await write_task
-            raise
-
-    def _write_state(self, state_file: Path, serialized: str) -> None:
+    def _write_job_state(self, serialized: str) -> None:
         self.settings.data_dir.mkdir(parents=True, exist_ok=True)
-        temporary = state_file.with_name(f".{state_file.name}.{secrets.token_hex(8)}.tmp")
+        temporary = self._job_state_file.with_name(f".{self._job_state_file.name}.{secrets.token_hex(8)}.tmp")
         try:
             temporary.write_text(serialized, encoding="utf-8")
-            temporary.replace(state_file)
+            temporary.replace(self._job_state_file)
         finally:
             with suppress(FileNotFoundError):
                 temporary.unlink()

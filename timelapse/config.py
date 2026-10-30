@@ -6,7 +6,7 @@ import argparse
 import getpass
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import strptime
@@ -22,6 +22,7 @@ DATE_ONLY_FORMAT = "%m-%d-%Y"
 SPEED_TO_FPS = {"1x": None, "60x": 4, "120x": 8, "300x": 20, "600x": 40}
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 0
 DEFAULT_MAX_DOWNLOAD_MIB = 10 * 1024
+TRUE_VALUES = frozenset({"true", "1", "yes", "y", "on"})
 
 
 @dataclass(frozen=True)
@@ -29,35 +30,37 @@ class ConnectionSettings:
     """Connection-owned facts, independent of export or automation policy."""
 
     instance_url: str
-    token: str
+    token: str = field(repr=False)
     username: str
-    password: str
+    password: str = field(repr=False)
     verify_ssl: bool
-    request_timeout_seconds: int
-    max_download_mib: int
-    connection_kind: str | None = None
-    connection_value: str | None = None
+    request_timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS
+    max_download_mib: int = DEFAULT_MAX_DOWNLOAD_MIB
 
 
-@dataclass(frozen=True)
-class Config:
-    """Validated runtime configuration."""
+@dataclass(frozen=True, kw_only=True)
+class Config(ConnectionSettings):
+    """One export: a connection plus what to export."""
 
-    instance_url: str
-    token: str
-    username: str
-    password: str
-    verify_ssl: bool
     speed: str
     start: datetime
     end: datetime
-    output: Path | None
-    request_timeout_seconds: int
-    max_download_mib: int
-    daily: bool = False
+    output: Path | None = None
     full_day: bool = False
-    connection_kind: str | None = None
-    connection_value: str | None = None
+
+    @classmethod
+    def from_connection(
+        cls,
+        connection: ConnectionSettings,
+        *,
+        speed: str,
+        start: datetime,
+        end: datetime,
+        full_day: bool = False,
+        output: Path | None = None,
+    ) -> Config:
+        """Combine a resolved connection with one export's settings."""
+        return cls(**vars(connection), speed=speed, start=start, end=end, full_day=full_day, output=output)
 
 
 @dataclass(frozen=True)
@@ -72,23 +75,19 @@ class CreateProfile:
 
 
 @dataclass(frozen=True)
-class _ConnectionValues:
-    instance_url: str
-    token: str
-    username: str
-    password: str
-    verify_ssl: bool
-
-
-@dataclass(frozen=True)
 class _ParsedDate:
     value: datetime
     date_only: bool
 
 
+def is_truthy(value: str) -> bool:
+    """Return whether an environment-style flag is enabled."""
+    return value.strip().casefold() in TRUE_VALUES
+
+
 def _parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
-    if normalized in {"true", "1", "yes", "y", "on"}:
+    if normalized in TRUE_VALUES:
         return True
     if normalized in {"false", "0", "no", "n", "off"}:
         return False
@@ -137,7 +136,8 @@ def _parse_date(value: str) -> _ParsedDate:
     )
 
 
-def _prompt_required(label: str, *, secret: bool = False) -> str:
+def prompt_required(label: str, *, secret: bool = False) -> str:
+    """Prompt until the user enters a value."""
     while True:
         value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")
         if value.strip():
@@ -157,29 +157,19 @@ def _date_range(
     parser: argparse.ArgumentParser,
     start: _ParsedDate | None,
     end: _ParsedDate | None,
-    *,
-    daily: bool,
 ) -> tuple[datetime, datetime, bool]:
-    if daily:
-        if start is not None or end is not None:
-            parser.error("--daily cannot be combined with --start-date or --end-date")
-        now = datetime.now().astimezone()
-        return now, now + timedelta(seconds=1), True
-    if start is None and end is None:
-        parser.error("provide --start-date, --end-date, or --daily")
-    if start is not None and end is None:
-        range_start, range_end = (
-            _full_local_day(start.value) if start.date_only else (start.value, start.value + timedelta(days=1))
-        )
-        return range_start, range_end, start.date_only
-    if start is None and end is not None:
+    if start is None:
+        if end is None:
+            parser.error("provide --start-date or --end-date")
         range_start, range_end = (
             _full_local_day(end.value) if end.date_only else (end.value - timedelta(days=1), end.value)
         )
         return range_start, range_end, end.date_only
-    if start is None or end is None:
-        message = "unreachable missing date boundary"
-        raise AssertionError(message)
+    if end is None:
+        range_start, range_end = (
+            _full_local_day(start.value) if start.date_only else (start.value, start.value + timedelta(days=1))
+        )
+        return range_start, range_end, start.date_only
     if start.date_only and end.date_only and start.value.date() == end.value.date():
         range_start, range_end = _full_local_day(start.value)
         return range_start, range_end, True
@@ -202,7 +192,7 @@ def _argument_parser() -> argparse.ArgumentParser:
     profile_group.add_argument(
         "--dotenv",
         type=Path,
-        help="load restart-safe connection details from an absolute .env path",
+        help="load connection details from an absolute .env path",
     )
     parser.add_argument(
         "--speed",
@@ -242,15 +232,10 @@ def _argument_parser() -> argparse.ArgumentParser:
         help="end in MM-DD-YYYY or MM-DD-YYYY-HH-MM-SS format; one boundary means a 24-hour export",
     )
     parser.add_argument(
-        "--daily",
-        action="store_true",
-        help="export the latest completed local day, then keep running and export each completed day",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         default=os.environ.get("TIMELAPSE_OUTPUT"),
-        help="output MP4 path, or destination directory with --daily; defaults to TIMELAPSE_OUTPUT",
+        help="output MP4 path; defaults to TIMELAPSE_OUTPUT",
     )
     parser.add_argument(
         "--request-timeout-seconds",
@@ -307,8 +292,10 @@ def _resolve_connection(
     username: str | None,
     password: str | None,
     verify_ssl: bool | None,
+    request_timeout_seconds: int,
+    max_download_mib: int,
     prompt_for_missing: bool,
-) -> _ConnectionValues:
+) -> ConnectionSettings:
     profile = _load_requested_profile(parser, profile_name)
     resolved_instance = instance or (
         profile.instance_url if profile is not None else os.environ.get("UNIFI_PROTECT_URL")
@@ -327,10 +314,10 @@ def _resolve_connection(
         )
 
     if prompt_for_missing:
-        resolved_instance = resolved_instance or _prompt_required("Protect Integration API URL")
-        resolved_token = resolved_token or _prompt_required("Protect API token", secret=True)
-        resolved_username = resolved_username or _prompt_required("Local Protect username")
-        resolved_password = resolved_password or _prompt_required("Local Protect password", secret=True)
+        resolved_instance = resolved_instance or prompt_required("Protect Integration API URL")
+        resolved_token = resolved_token or prompt_required("Protect API token", secret=True)
+        resolved_username = resolved_username or prompt_required("Local Protect username")
+        resolved_password = resolved_password or prompt_required("Local Protect password", secret=True)
 
     if not resolved_instance:
         parser.error("--instance is required when UNIFI_PROTECT_URL is not set")
@@ -340,19 +327,18 @@ def _resolve_connection(
         parser.error("--username is required when UNIFI_PROTECT_USERNAME is not set")
     if not resolved_password:
         parser.error("--password is required when UNIFI_PROTECT_PASSWORD is not set")
-    if resolved_verify_ssl is None:
-        message = "unreachable missing TLS verification setting"
-        raise AssertionError(message)
 
     normalized_instance = resolved_instance.strip().rstrip("/")
     if not normalized_instance:
         parser.error("--instance cannot be empty")
-    return _ConnectionValues(
+    return ConnectionSettings(
         normalized_instance,
         resolved_token,
         resolved_username,
         resolved_password,
-        resolved_verify_ssl,
+        bool(resolved_verify_ssl),
+        request_timeout_seconds,
+        max_download_mib,
     )
 
 
@@ -384,32 +370,19 @@ def parse_args() -> Config | CreateProfile:
         username=args.username,
         password=args.password,
         verify_ssl=args.verify_ssl,
+        request_timeout_seconds=args.request_timeout_seconds,
+        max_download_mib=args.max_download_mib,
         prompt_for_missing=dotenv_path.is_file(),
     )
-    start, end, full_day = _date_range(parser, args.start_date, args.end_date, daily=args.daily)
+    start, end, full_day = _date_range(parser, args.start_date, args.end_date)
     if end <= start:
         parser.error("--end-date must be after --start-date")
-    if args.daily and args.profile is None and args.dotenv is None and not (Path.cwd() / ".env").is_file():
-        parser.error("--daily requires --profile NAME or --dotenv /absolute/path/.env")
 
-    return Config(
-        instance_url=connection.instance_url,
-        token=connection.token,
-        username=connection.username,
-        password=connection.password,
-        verify_ssl=connection.verify_ssl,
+    return Config.from_connection(
+        connection,
         speed=args.speed,
         start=start,
         end=end,
-        output=args.output,
-        request_timeout_seconds=args.request_timeout_seconds,
-        max_download_mib=args.max_download_mib,
-        daily=args.daily,
         full_day=full_day,
-        connection_kind="python-profile" if args.profile is not None else "dotenv" if dotenv_path.is_file() else None,
-        connection_value=args.profile
-        if args.profile is not None
-        else str(dotenv_path)
-        if dotenv_path.is_file()
-        else None,
+        output=args.output,
     )

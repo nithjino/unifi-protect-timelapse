@@ -5,13 +5,13 @@ from typing import TYPE_CHECKING
 
 from timelapse.config import Config
 from timelapse.protect import CameraInfo
-from timelapse.schedule import config_for_local_day, daily_output_path, latest_complete_local_day, local_day_bounds
+from timelapse.schedule import daily_output_path, latest_complete_local_day, local_day_bounds
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def _config() -> Config:
+def _config(start: datetime, end: datetime) -> Config:
     return Config(
         instance_url="https://protect.local",
         token="token",  # noqa: S106
@@ -19,23 +19,18 @@ def _config() -> Config:
         password="password",  # noqa: S106
         verify_ssl=True,
         speed="600x",
-        start=datetime(2026, 7, 10, tzinfo=UTC),
-        end=datetime(2026, 7, 11, tzinfo=UTC),
-        output=None,
-        request_timeout_seconds=0,
-        max_download_mib=10240,
-        daily=True,
+        start=start,
+        end=end,
+        full_day=True,
     )
 
 
 def test_local_day_helpers_create_calendar_day_and_daily_output(tmp_path: Path) -> None:
-    start, end = local_day_bounds(date(2026, 7, 11))
-    config = config_for_local_day(_config(), date(2026, 7, 11))
+    start, end = local_day_bounds(date(2026, 7, 11), "UTC")
+    config = _config(start, end)
     camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
 
-    assert config.start == start
-    assert config.end == end
-    assert config.full_day is True
+    assert (end - start).days == 1
     assert daily_output_path(config, camera, tmp_path) == (
         tmp_path / "timelapse_Front_Door_2026_07_11_2026_07_12_600x_6bf6f341d9a3.mp4"
     )
@@ -44,4 +39,4 @@ def test_local_day_helpers_create_calendar_day_and_daily_output(tmp_path: Path) 
 def test_latest_complete_local_day_uses_previous_calendar_date() -> None:
     now = datetime(2026, 7, 13, 15, tzinfo=UTC)
 
-    assert latest_complete_local_day(now) == date(2026, 7, 12)
+    assert latest_complete_local_day(now, "UTC") == date(2026, 7, 12)

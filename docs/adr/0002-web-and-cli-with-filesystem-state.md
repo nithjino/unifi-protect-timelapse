@@ -1,0 +1,3 @@
+# Web and CLI only, with the filesystem as export state
+
+Version 3 keeps the web dashboard and CLI and removes the Qt, macOS, and Windows apps, because the web dashboard already works on every platform and three desktop apps cost more than the rest of the project combined. A Daily Automation now stores only its definition and `next_day`; whether an Export Artifact exists is answered by the output directory, so an interrupted day is run again and existing artifacts are skipped. We rejected keeping durable batch and job records because no recovery path needed them that the deterministic output paths did not already provide.

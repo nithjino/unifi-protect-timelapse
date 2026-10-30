@@ -40,13 +40,13 @@
         <div class="job-footer">
           <span>{{ job.speed }} · {{ job.output.name }}</span>
           <div class="job-actions">
-            {% if job.status in ('completed', 'skipped') %}
+            {% if job.status == 'completed' %}
               <a class="small-button primary" href="/exports/{{ job.id }}">Download</a>
             {% endif %}
             <button
               class="small-button play-button"
               type="button"
-              {% if job.status in ('completed', 'skipped') %}
+              {% if job.status == 'completed' %}
                 data-video-url="/exports/{{ job.id }}/play"
                 data-video-title="{{ job.camera.name }} · {{ job.start | datetime }}"
                 aria-label="Play {{ job.camera.name }} export"

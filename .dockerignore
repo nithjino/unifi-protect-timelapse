@@ -13,7 +13,5 @@ build
 dist
 data
 docs
-native-macos
-native-windows
 tests
 timelapse.egg-info
