@@ -34,6 +34,7 @@ from starlette.templating import Jinja2Templates
 
 from timelapse import OperationTimeoutError, TimelapseError, __version__
 from timelapse.config import SPEED_TO_FPS
+from timelapse.download import format_bytes
 from timelapse.protect import protect_session_scope
 from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
 
@@ -49,7 +50,6 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PACKAGE_DIR / "templates"
 STATIC_DIR = PACKAGE_DIR / "static"
 APP_CSS_VERSION = hashlib.sha256((STATIC_DIR / "app.css").read_bytes()).hexdigest()[:12]
-KIBIBYTE = 1024
 SSE_KEEPALIVE_TICKS = 30
 GRACEFUL_SHUTDOWN_SECONDS = 1
 SECONDS_PER_HOUR = 60 * 60
@@ -93,18 +93,6 @@ class _ShutdownAwareServer(uvicorn.Server):
         super().handle_exit(sig, frame)
 
 
-def _format_bytes(value: int | None) -> str:
-    if value is None:
-        return "Unknown"
-    units = ("B", "KiB", "MiB", "GiB", "TiB")
-    size = float(value)
-    for unit in units:
-        if size < KIBIBYTE or unit == units[-1]:
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= KIBIBYTE
-    return f"{value} B"
-
-
 def _storage_info(path: Path) -> _StorageInfo:
     try:
         usage = shutil.disk_usage(path)
@@ -135,7 +123,6 @@ def _job_status(job: ExportJob) -> str:
         "completed": "Ready",
         "failed": "Failed",
         "cancelled": "Cancelled",
-        "skipped": "Already Exists",
     }
     return labels[job.status]
 
@@ -399,7 +386,7 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     templates = Jinja2Templates(directory=TEMPLATES_DIR)
-    templates.env.filters["bytes"] = _format_bytes
+    templates.env.filters["bytes"] = format_bytes
     templates.env.filters["datetime"] = lambda value: _format_datetime(value, configured_settings)
     templates.env.filters["date"] = _format_date
     templates.env.filters["job_status"] = _job_status
@@ -741,19 +728,19 @@ def create_app(  # noqa: C901, PLR0915 - route construction stays together for d
 
         return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
 
+    def export_file(job_id: str, *, attachment: bool) -> Response:
+        job = web_state.jobs.get(job_id)
+        if job is None or job.status != "completed" or not job.output.is_file():
+            return PlainTextResponse("Export is not available.", status_code=404)
+        return FileResponse(job.output, media_type="video/mp4", filename=job.output.name if attachment else None)
+
     @application.get("/exports/{job_id}")
     async def download_export(job_id: JOB_ID) -> Response:
-        job = web_state.jobs.get(job_id)
-        if job is None or job.status not in {"completed", "skipped"} or not job.output.is_file():
-            return PlainTextResponse("Export is not available.", status_code=404)
-        return FileResponse(job.output, media_type="video/mp4", filename=job.output.name)
+        return export_file(job_id, attachment=True)
 
     @application.get("/exports/{job_id}/play")
     async def play_export(job_id: JOB_ID) -> Response:
-        job = web_state.jobs.get(job_id)
-        if job is None or job.status not in {"completed", "skipped"} or not job.output.is_file():
-            return PlainTextResponse("Export is not available.", status_code=404)
-        return FileResponse(job.output, media_type="video/mp4")
+        return export_file(job_id, attachment=False)
 
     return application
 

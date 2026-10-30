@@ -1,8 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=TimeLapse
-Comment=Create timelapses from UniFi Protect recordings
-Exec=timelapse
-Icon=timelapse
-Categories=AudioVideo;Video;
-Terminal=false

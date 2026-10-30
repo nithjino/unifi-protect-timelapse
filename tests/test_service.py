@@ -158,11 +158,6 @@ def test_camera_discovery_timeout_covers_the_complete_operation(
 
     _install_client(monkeypatch, client)
     monkeypatch.setattr(service, "load_cameras", blocked_load)
-    monkeypatch.setattr(
-        service,
-        "_operation_deadline",
-        lambda _seconds: asyncio.get_running_loop().time() + 0.01,
-    )
 
     with pytest.raises(OperationTimeoutError, match="configured 1-second operation timeout"):
         asyncio.run(service.list_available_cameras(config))

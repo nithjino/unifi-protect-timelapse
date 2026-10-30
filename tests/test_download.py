@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -233,7 +234,7 @@ def test_download_cancellation_releases_response_and_removes_partial_file(tmp_pa
                 output,
             )
         )
-        await content.blocked.wait()
+        await asyncio.wait_for(content.blocked.wait(), timeout=5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -244,7 +245,6 @@ def test_download_cancellation_releases_response_and_removes_partial_file(tmp_pa
     assert response.released is True
     assert not output.exists()
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
-    assert not download_module._STORAGE_RESERVATIONS
 
 
 def test_download_rejects_known_size_before_streaming_when_storage_is_insufficient(
@@ -274,89 +274,31 @@ def test_download_rejects_known_size_before_streaming_when_storage_is_insufficie
     assert content.iterated is False
     assert response.released is True
     assert list(tmp_path.iterdir()) == []
-    assert not download_module._STORAGE_RESERVATIONS
 
 
-def test_unknown_size_reserves_configured_maximum_across_concurrent_downloads(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    mebibyte = download_module.MEBIBYTE
-    monkeypatch.setattr(
-        download_module.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=10 * mebibyte, used=0, free=mebibyte + mebibyte // 2),
-    )
-    config = replace(_config(), max_download_mib=1)
+def test_download_cleans_up_when_the_disk_fills_mid_stream(tmp_path: Path) -> None:
+    class _FullDiskContent(_FakeContent):
+        async def iter_chunked(self, chunk_size: int) -> AsyncIterator[bytes]:
+            del chunk_size
+            yield b"\x00\x00\x00\x18ftypisom"
+            raise OSError(errno.ENOSPC, "No space left on device")
 
-    async def exercise() -> tuple[_FakeResponse, _FakeResponse, _FakeContent]:
-        blocking_content = _BlockingContent()
-        first_response = _FakeResponse(blocking_content, {})
-        first_task = asyncio.create_task(
-            download_timelapse(
-                config,
-                parse_connection(config.instance_url),
-                cast("ProtectApiClient", _FakeClient(first_response)),
-                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
-                tmp_path / "first.mp4",
-            )
-        )
-        await blocking_content.blocked.wait()
-
-        second_content = _FakeContent([b"\x00\x00\x00\x18ftypisom"])
-        second_response = _FakeResponse(second_content, {"Content-Length": "16"})
-        with pytest.raises(TimelapseError, match="not enough free storage"):
-            await download_timelapse(
-                config,
-                parse_connection(config.instance_url),
-                cast("ProtectApiClient", _FakeClient(second_response)),
-                CameraInfo(id="camera-2", name="Back Yard", state=None, model=None),
-                tmp_path / "second.mp4",
-            )
-
-        first_task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await first_task
-        return first_response, second_response, second_content
-
-    first_response, second_response, second_content = asyncio.run(exercise())
-
-    assert first_response.released is True
-    assert second_response.released is True
-    assert second_content.iterated is False
-    assert not download_module._STORAGE_RESERVATIONS
-
-
-def test_download_stops_and_cleans_up_when_free_space_drops_mid_stream(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    video = b"\x00\x00\x00\x18ftypisomdata"
-    content = _FakeContent([video[:8], video[8:]])
-    response = _FakeResponse(content, {"Content-Length": str(len(video))})
+    response = _FakeResponse(_FullDiskContent([]), {})
     client = cast("ProtectApiClient", _FakeClient(response))
-    free_values = iter((100, 100, 55))
-    monkeypatch.setattr(
-        download_module.shutil,
-        "disk_usage",
-        lambda _path: SimpleNamespace(total=1000, used=0, free=next(free_values)),
-    )
 
-    with pytest.raises(TimelapseError, match="free storage fell below the download safety buffer"):
+    with pytest.raises(TimelapseError, match="No space left"):
         asyncio.run(
             download_timelapse(
                 _config(),
                 parse_connection(_config().instance_url),
                 client,
                 CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
-                tmp_path / "space-dropped.mp4",
+                tmp_path / "full.mp4",
             )
         )
 
-    assert content.iterated is True
     assert response.released is True
     assert list(tmp_path.iterdir()) == []
-    assert not download_module._STORAGE_RESERVATIONS
 
 
 def test_download_preserves_an_existing_output(tmp_path: Path) -> None:

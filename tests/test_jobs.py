@@ -11,17 +11,16 @@ from timelapse.jobs import ExportJobCoordinator, ExportJobSpec, OutputCollisionE
 
 def test_runtime_capacity_environment_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TIMELAPSE_MAX_ACTIVE_EXPORTS", "3")
-    monkeypatch.setenv("TIMELAPSE_MAX_QUEUED_EXPORTS", "7")
     coordinator = ExportJobCoordinator.from_environment()
 
-    assert (coordinator.max_active, coordinator.max_queued) == (3, 7)
+    assert coordinator.max_active == 3
 
     monkeypatch.setenv("TIMELAPSE_MAX_ACTIVE_EXPORTS", "0")
     with pytest.raises(ValueError, match="at least 1"):
         ExportJobCoordinator.from_environment()
 
 
-def test_oversized_batch_is_lazily_admitted(tmp_path) -> None:
+def test_batch_larger_than_capacity_runs_within_the_active_limit(tmp_path) -> None:
     async def exercise() -> None:
         release = asyncio.Event()
         started = 0
@@ -34,15 +33,13 @@ def test_oversized_batch_is_lazily_admitted(tmp_path) -> None:
             await release.wait()
             started -= 1
 
-        coordinator = ExportJobCoordinator(max_active=2, max_queued=1)
+        coordinator = ExportJobCoordinator(max_active=2)
         jobs = await coordinator.submit(
             ExportJobSpec.create(output=tmp_path / f"{index}.mp4", operation=operation) for index in range(8)
         )
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert coordinator.active_count == 2
-        assert coordinator.queued_count <= 1
-        assert coordinator.pending_count >= 5
         release.set()
         await coordinator.wait(jobs)
         assert maximum_started == 2
@@ -62,7 +59,7 @@ def test_rate_limit_hard_floor_delays_only_the_affected_job(tmp_path) -> None:
             if calls == 1:
                 raise ProtectRateLimitError("wait", retry_not_before=now + timedelta(milliseconds=20))
 
-        coordinator = ExportJobCoordinator(max_active=1, max_queued=1, now=lambda: now)
+        coordinator = ExportJobCoordinator(max_active=1, now=lambda: now)
         jobs = await coordinator.submit([ExportJobSpec.create(output=tmp_path / "one.mp4", operation=operation)])
         await coordinator.wait(jobs)
         assert calls == 2
@@ -81,7 +78,7 @@ def test_cancelling_one_job_does_not_cancel_its_sibling(tmp_path) -> None:
         async def finish(_output) -> None:
             return None
 
-        coordinator = ExportJobCoordinator(max_active=1, max_queued=1)
+        coordinator = ExportJobCoordinator(max_active=1)
         first, second = await coordinator.submit(
             [
                 ExportJobSpec.create(output=tmp_path / "first.mp4", operation=wait),
@@ -97,8 +94,7 @@ def test_cancelling_one_job_does_not_cancel_its_sibling(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("policy", ["reject", "daily"])
-def test_exact_path_policy_rejects_existing_files_and_claims(tmp_path, policy) -> None:
+def test_existing_files_and_claims_are_rejected(tmp_path) -> None:
     async def exercise() -> None:
         path = tmp_path / "artifact.mp4"
         started = asyncio.Event()
@@ -108,42 +104,19 @@ def test_exact_path_policy_rejects_existing_files_and_claims(tmp_path, policy) -
             await asyncio.Event().wait()
 
         coordinator = ExportJobCoordinator()
-        spec = ExportJobSpec.create(output=path, operation=operation, collision_policy=policy)
+        spec = ExportJobSpec.create(output=path, operation=operation)
         path.write_bytes(b"existing")
         with pytest.raises(OutputCollisionError):
             await coordinator.submit([spec])
         path.unlink()
         jobs = await coordinator.submit([spec])
         with pytest.raises(OutputCollisionError):
-            await coordinator.submit([ExportJobSpec.create(output=path, operation=operation, collision_policy=policy)])
+            await coordinator.submit([ExportJobSpec.create(output=path, operation=operation)])
         await started.wait()
         with pytest.raises(OutputCollisionError):
-            await coordinator.submit([ExportJobSpec.create(output=path, operation=operation, collision_policy=policy)])
+            await coordinator.submit([ExportJobSpec.create(output=path, operation=operation)])
         await coordinator.cancel(jobs[0].id)
         await coordinator.wait(jobs)
-        await coordinator.close()
-
-    asyncio.run(exercise())
-
-
-def test_suffix_chooses_desktop_format_and_supplies_final_paths(tmp_path) -> None:
-    async def exercise() -> None:
-        path = tmp_path / "artifact.mp4"
-        path.write_bytes(b"existing")
-        (tmp_path / "artifact_2.mp4").write_bytes(b"existing")
-        outputs = []
-
-        async def operation(output) -> None:
-            outputs.append(output)
-
-        coordinator = ExportJobCoordinator()
-        jobs = await coordinator.submit(
-            [ExportJobSpec.create(output=path, operation=operation, collision_policy="suffix") for _ in range(3)]
-        )
-        expected = [tmp_path / f"artifact_{index}.mp4" for index in (3, 4, 5)]
-        assert [job.output for job in jobs] == expected
-        await coordinator.wait(jobs)
-        assert outputs == expected
         await coordinator.close()
 
     asyncio.run(exercise())
@@ -325,12 +298,12 @@ def test_cancellation_releases_running_queued_and_pending_claims(tmp_path, index
             started.set()
             await asyncio.Event().wait()
 
-        coordinator = ExportJobCoordinator(max_active=1, max_queued=1)
+        coordinator = ExportJobCoordinator(max_active=1)
         jobs = await coordinator.submit(
             [ExportJobSpec.create(output=tmp_path / f"{number}.mp4", operation=operation) for number in range(3)]
         )
         await started.wait()
-        assert [job.status for job in jobs] == ["running", "queued", "pending"]
+        assert [job.status for job in jobs] == ["running", "queued", "queued"]
         target = jobs[index]
         assert await coordinator.cancel(target.id)
         assert not await coordinator.cancel(target.id)
@@ -339,8 +312,6 @@ def test_cancellation_releases_running_queued_and_pending_claims(tmp_path, index
         assert replacement[0].output == target.output
         await coordinator.close()
         assert coordinator.active_count == 0
-        assert coordinator.queued_count == 0
-        assert coordinator.pending_count == 0
 
     asyncio.run(exercise())
 

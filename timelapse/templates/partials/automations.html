@@ -21,7 +21,7 @@
           {% else %}
             <p>Next Run {{ automation | next_run }} · {{ automation.speed }}</p>
           {% endif %}
-          <small>Last Completed Day: {{ automation.last_run_day | date }}</small>
+          <small>Last Completed Day: {{ automation.last_completed_day | date }}</small>
           {% if automation.last_error %}<small class="schedule-error">{{ automation.last_error }}</small>{% endif %}
         </div>
         {% if automation.status in ['paused', 'stopped'] %}
