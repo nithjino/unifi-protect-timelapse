@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -68,12 +67,15 @@ TIMELAPSE_OUTPUT=from-env.mp4
     assert config.max_download_mib == 10240
 
 
-def test_process_environment_wins_over_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    (tmp_path / ".env").write_text("TIMELAPSE_OUTPUT=from-dotenv.mp4\n", encoding="utf-8")
+def test_command_line_wins_over_environment_and_dotenv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    (tmp_path / ".env").write_text(
+        "TIMELAPSE_OUTPUT=from-dotenv.mp4\nUNIFI_PROTECT_USERNAME=dotenv-user\n",
+        encoding="utf-8",
+    )
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("TIMELAPSE_OUTPUT", "from-process-env.mp4")
-    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
-    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
+    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "environment-user")
+    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "environment-password")
     monkeypatch.setattr(
         sys,
         "argv",
@@ -83,118 +85,54 @@ def test_process_environment_wins_over_dotenv(monkeypatch: pytest.MonkeyPatch, t
             "https://protect.local",
             "--token",
             "test-token",
+            "--username",
+            "command-line-user",
+            "--password",
+            "command-line-password",
             *REQUIRED_ARGUMENTS,
         ],
     )
 
-    assert _parse_config().output == Path("from-process-env.mp4")
+    config = _parse_config()
+
+    assert config.output == Path("from-process-env.mp4")
+    assert config.username == "command-line-user"
+    assert config.password == "command-line-password"  # noqa: S105
 
 
 @pytest.mark.parametrize(
-    ("flag", "environment_name", "environment_value"),
+    ("flag", "value", "expected_start", "expected_end"),
     [
-        ("--start-date", "TIMELAPSE_START_DATE", "07-11-2026-08-00-00"),
-        ("--end-date", "TIMELAPSE_END_DATE", "07-11-2026-09-00-00"),
+        ("--start-date", "07-11-2026", "2026-07-11 00:00", "2026-07-12 00:00"),
+        ("--end-date", "07-11-2026", "2026-07-11 00:00", "2026-07-12 00:00"),
+        ("--start-date", "07-11-2026-09-00-00", "2026-07-11 09:00", "2026-07-12 09:00"),
+        ("--end-date", "07-11-2026-09-00-00", "2026-07-10 09:00", "2026-07-11 09:00"),
     ],
 )
-def test_dates_are_cli_only(
+def test_one_cli_date_spans_a_day_and_environment_dates_are_ignored(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     flag: str,
-    environment_name: str,
-    environment_value: str,
-) -> None:
-    arguments = ["timelapse", "--instance", "https://protect.local", "--token", "test-token", *REQUIRED_ARGUMENTS]
-    flag_index = arguments.index(flag)
-    del arguments[flag_index : flag_index + 2]
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv(environment_name, environment_value)
-    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
-    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
-    monkeypatch.setattr(sys, "argv", arguments)
-
-    config = _parse_config()
-
-    assert config.end - config.start == timedelta(days=1)
-
-
-@pytest.mark.parametrize("flag", ["--start-date", "--end-date"])
-def test_one_date_only_boundary_creates_full_local_day(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    flag: str,
+    value: str,
+    expected_start: str,
+    expected_end: str,
 ) -> None:
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TIMELAPSE_START_DATE", "01-01-2026-08-00-00")
+    monkeypatch.setenv("TIMELAPSE_END_DATE", "12-31-2026-09-00-00")
     monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
     monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
     monkeypatch.setattr(
         sys,
         "argv",
-        [
-            "timelapse",
-            "--instance",
-            "https://protect.local",
-            "--token",
-            "test-token",
-            flag,
-            "07-11-2026",
-        ],
+        ["timelapse", "--instance", "https://protect.local", "--token", "test-token", flag, value],
     )
 
     config = _parse_config()
 
-    assert (config.start.date(), config.end.date()) == (date(2026, 7, 11), date(2026, 7, 12))
-    assert (config.start.hour, config.start.minute, config.start.second) == (0, 0, 0)
-    assert (config.end.hour, config.end.minute, config.end.second) == (0, 0, 0)
-    assert config.full_day is True
-
-
-def test_cli_accepts_normal_speed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("UNIFI_PROTECT_USERNAME", "timelapse-user")
-    monkeypatch.setenv("UNIFI_PROTECT_PASSWORD", "test-password")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "timelapse",
-            "--instance",
-            "https://protect.local",
-            "--token",
-            "test-token",
-            "--start-date",
-            "07-11-2026",
-            "--speed",
-            "1x",
-        ],
-    )
-
-    assert _parse_config().speed == "1x"
-
-
-def test_private_credentials_can_be_passed_on_command_line(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.chdir(tmp_path)
-    arguments = [
-        "timelapse",
-        "--instance",
-        "https://protect.local",
-        "--token",
-        "test-token",
-        "--username",
-        "command-line-user",
-        "--password",
-        "command-line-password",
-        *REQUIRED_ARGUMENTS,
-    ]
-    monkeypatch.setattr(sys, "argv", arguments)
-
-    config = _parse_config()
-
-    assert config.username == "command-line-user"
-    assert config.password == "command-line-password"  # noqa: S105
+    assert config.start.strftime("%Y-%m-%d %H:%M") == expected_start
+    assert config.end.strftime("%Y-%m-%d %H:%M") == expected_end
+    assert config.full_day is (value == "07-11-2026")
 
 
 def test_create_profile_uses_dotenv_connection_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

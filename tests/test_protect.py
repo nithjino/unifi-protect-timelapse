@@ -179,116 +179,7 @@ def test_failed_client_cleanup_is_contained(monkeypatch: pytest.MonkeyPatch) -> 
     asyncio.run(exercise())
 
 
-def test_retry_layer_honors_retry_after_and_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    responses = [_Response(429, {"Retry-After": "2"}), _Response(200)]
-    sleeps: list[float] = []
-
-    async def fake_request(_client: object, *_args: object, **_kwargs: object) -> _Response:
-        return responses.pop(0)
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
-    monkeypatch.setattr(protect_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(protect_module.random, "uniform", lambda _low, _high: 0.0)
-    client = protect_module._RetryingProtectApiClient(
-        "protect.local",
-        443,
-        "user",
-        "password",
-        config_dir=tmp_path,
-        store_sessions=True,
-        max_retries=0,
-    )
-
-    response = asyncio.run(client.request("get", "/test", auto_close=False))
-
-    assert response.status == 200
-    assert sleeps == [2.0]
-
-
-def test_retry_layer_does_not_retry_before_a_long_retry_after(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    response = _Response(429, {"Retry-After": "900"})
-    calls = 0
-
-    async def fake_request(_client: object, *_args: object, **_kwargs: object) -> _Response:
-        nonlocal calls
-        calls += 1
-        return response
-
-    async def unexpected_sleep(_delay: float) -> None:
-        pytest.fail("a long Retry-After must be returned to the caller instead of retried early")
-
-    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
-    monkeypatch.setattr(protect_module.asyncio, "sleep", unexpected_sleep)
-    client = protect_module._RetryingProtectApiClient(
-        "protect.local",
-        443,
-        "user",
-        "password",
-        config_dir=tmp_path,
-        store_sessions=True,
-        max_retries=0,
-    )
-
-    result = asyncio.run(client.request("get", "/test", auto_close=False))
-
-    assert result is response
-    assert calls == 1
-    assert client.rate_limit_retry_after == 900
-
-
-def test_retry_layer_stops_after_four_total_attempts(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    calls = 0
-    sleeps: list[float] = []
-
-    async def fake_request(_client: object, *_args: object, **_kwargs: object) -> _Response:
-        nonlocal calls
-        calls += 1
-        return _Response(429)
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
-    monkeypatch.setattr(protect_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(protect_module.random, "uniform", lambda _low, _high: 0.0)
-    client = protect_module._RetryingProtectApiClient(
-        "protect.local",
-        443,
-        "user",
-        "password",
-        config_dir=tmp_path,
-        store_sessions=True,
-        max_retries=0,
-    )
-
-    response = asyncio.run(client.request("get", "/test", auto_close=False))
-
-    assert response.status == 429
-    assert calls == 4
-    assert sleeps == [1.0, 2.0, 4.0]
-
-
-def _session_token() -> str:
-    def encode(value: dict[str, object]) -> str:
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
-
-    expires = int((datetime.now(UTC) + timedelta(days=1)).timestamp())
-    return f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode({'exp': expires})}.{encode({})}"
-
-
-def _login_client(tmp_path: Path) -> protect_module._RetryingProtectApiClient:
+def _retrying_client(tmp_path: Path) -> protect_module._RetryingProtectApiClient:
     return protect_module._RetryingProtectApiClient(
         "protect.local",
         443,
@@ -298,6 +189,51 @@ def _login_client(tmp_path: Path) -> protect_module._RetryingProtectApiClient:
         store_sessions=True,
         max_retries=0,
     )
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_sleeps", "expected_retry_after"),
+    [
+        pytest.param([(429, {"Retry-After": "2"}), (200, {})], [2.0], None, id="short-retry-after-is-waited-out"),
+        pytest.param([(429, {"Retry-After": "900"})], [], 900, id="long-retry-after-goes-to-the-caller"),
+        pytest.param([(429, {})] * 4, [1.0, 2.0, 4.0], None, id="stops-after-four-attempts"),
+    ],
+)
+def test_retry_layer_honors_retry_after_and_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    responses: list[tuple[int, dict[str, str]]],
+    expected_sleeps: list[float],
+    expected_retry_after: float | None,
+) -> None:
+    pending = [_Response(status, headers) for status, headers in responses]
+    sleeps: list[float] = []
+
+    async def fake_request(_client: object, *_args: object, **_kwargs: object) -> _Response:
+        return pending.pop(0)
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
+    monkeypatch.setattr(protect_module.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(protect_module.random, "uniform", lambda _low, _high: 0.0)
+    client = _retrying_client(tmp_path)
+
+    response = asyncio.run(client.request("get", "/test", auto_close=False))
+
+    assert response.status == responses[-1][0]
+    assert not pending
+    assert sleeps == expected_sleeps
+    assert client.rate_limit_retry_after == expected_retry_after
+
+
+def _session_token() -> str:
+    def encode(value: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    expires = int((datetime.now(UTC) + timedelta(days=1)).timestamp())
+    return f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode({'exp': expires})}.{encode({})}"
 
 
 def test_login_is_shared_and_reused_after_a_restart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -314,12 +250,12 @@ def test_login_is_shared_and_reused_after_a_restart(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(protect_module, "_SESSION_DIRECTORY", tmp_path)
 
     async def exercise() -> None:
-        client = _login_client(tmp_path)
+        client = _retrying_client(tmp_path)
         await asyncio.gather(*(client.ensure_authenticated() for _ in range(4)))
         await client.close_session()
         assert logins == 1
 
-        restarted = _login_client(tmp_path)
+        restarted = _retrying_client(tmp_path)
         await restarted.ensure_authenticated()
         await restarted.close_session()
 

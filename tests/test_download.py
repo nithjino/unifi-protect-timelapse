@@ -102,46 +102,57 @@ def _config() -> Config:
     )
 
 
-def test_default_output_path_preserves_safe_unicode_camera_name() -> None:
-    camera = CameraInfo(id="camera-1", name="玄関 📷", state=None, model=None)
+@pytest.mark.parametrize(
+    ("camera_id", "camera_name", "full_day", "expected"),
+    [
+        pytest.param(
+            "camera-1",
+            "Front Door",
+            False,
+            "timelapse_Front_Door_2026_07_11_08_00_00_2026_07_11_09_00_00_120x__6bf6f341d9a3.mp4",
+            id="exact-range",
+        ),
+        pytest.param(
+            "camera-1",
+            "Front Door",
+            True,
+            "timelapse_Front_Door_2026_07_11_2026_07_12_120x_6bf6f341d9a3.mp4",
+            id="full-day",
+        ),
+        pytest.param(
+            "camera-1",
+            "玄関 📷",
+            True,
+            "timelapse_玄関_📷_2026_07_11_2026_07_12_120x_6bf6f341d9a3.mp4",
+            id="unicode-name",
+        ),
+        pytest.param(
+            "camera-2",
+            "Front Door",
+            True,
+            "timelapse_Front_Door_2026_07_11_2026_07_12_120x_381fff0067f8.mp4",
+            id="same-name-on-another-camera",
+        ),
+    ],
+)
+def test_default_output_path_names_the_camera_range_and_speed(
+    camera_id: str,
+    camera_name: str,
+    *,
+    full_day: bool,
+    expected: str,
+) -> None:
+    camera = CameraInfo(id=camera_id, name=camera_name, state=None, model=None)
+    config = _config()
+    if full_day:
+        config = replace(
+            config,
+            start=datetime(2026, 7, 11, tzinfo=UTC),
+            end=datetime(2026, 7, 12, tzinfo=UTC),
+            full_day=True,
+        )
 
-    output = default_output_path(_config(), camera)
-
-    assert "玄関_📷" in output.name
-
-
-def test_default_output_path_formats_exact_range_with_hash_last() -> None:
-    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-
-    output = default_output_path(_config(), camera)
-
-    assert output.name == ("timelapse_Front_Door_2026_07_11_08_00_00_2026_07_11_09_00_00_120x__6bf6f341d9a3.mp4")
-
-
-def test_default_output_path_formats_full_day_without_times() -> None:
-    camera = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    config = replace(
-        _config(),
-        start=datetime(2026, 7, 11, tzinfo=UTC),
-        end=datetime(2026, 7, 12, tzinfo=UTC),
-        full_day=True,
-    )
-
-    output = default_output_path(config, camera)
-
-    assert output.name == "timelapse_Front_Door_2026_07_11_2026_07_12_120x_6bf6f341d9a3.mp4"
-
-
-def test_default_output_path_distinguishes_cameras_with_colliding_names() -> None:
-    first = CameraInfo(id="camera-1", name="Front Door", state=None, model=None)
-    second = CameraInfo(id="camera-2", name="Front Door", state=None, model=None)
-
-    first_output = default_output_path(_config(), first)
-    second_output = default_output_path(_config(), second)
-
-    assert first_output != second_output
-    assert first_output.name.startswith("timelapse_Front_Door_")
-    assert second_output.name.startswith("timelapse_Front_Door_")
+    assert default_output_path(config, camera).name == expected
 
 
 @pytest.mark.parametrize(
@@ -323,45 +334,28 @@ def test_download_preserves_an_existing_output(tmp_path: Path) -> None:
     assert all(path.suffix != ".part" for path in tmp_path.iterdir())
 
 
-def test_download_surfaces_exhausted_http_429_with_actionable_message(tmp_path: Path) -> None:
-    output = tmp_path / "rate-limited.mp4"
-    response = _FakeResponse(_FakeContent([]), {}, status=429)
-    client = cast("ProtectApiClient", _FakeClient(response))
-
-    with pytest.raises(ProtectRateLimitError, match="bounded retries"):
-        asyncio.run(
-            download_timelapse(
-                _config(),
-                parse_connection(_config().instance_url),
-                client,
-                CameraInfo(id="camera-1", name="Front Door", state=None, model=None),
-                output,
-            )
-        )
-
-    assert response.released is True
-    assert not output.exists()
-
-
 @pytest.mark.parametrize(
-    ("chunks", "headers", "message"),
+    ("chunks", "headers", "status", "error", "message"),
     [
-        ([], {}, "empty response"),
-        ([b"not an mp4"], {}, "valid MP4 file signature"),
-        ([b"\x00\x00\x00\x18ftypisom"], {"Content-Type": "text/html"}, "unexpected content type"),
+        ([], {}, 200, TimelapseError, "empty response"),
+        ([b"not an mp4"], {}, 200, TimelapseError, "valid MP4 file signature"),
+        ([b"\x00\x00\x00\x18ftypisom"], {"Content-Type": "text/html"}, 200, TimelapseError, "unexpected content type"),
+        ([], {}, 429, ProtectRateLimitError, "bounded retries"),
     ],
 )
-def test_download_rejects_invalid_video_responses(
+def test_download_rejects_unusable_export_responses(
     tmp_path: Path,
     chunks: list[bytes],
     headers: dict[str, str],
+    status: int,
+    error: type[TimelapseError],
     message: str,
 ) -> None:
     output = tmp_path / "invalid.mp4"
-    response = _FakeResponse(_FakeContent(chunks), headers)
+    response = _FakeResponse(_FakeContent(chunks), headers, status=status)
     client = cast("ProtectApiClient", _FakeClient(response))
 
-    with pytest.raises(TimelapseError, match=message):
+    with pytest.raises(error, match=message):
         asyncio.run(
             download_timelapse(
                 _config(),
