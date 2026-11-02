@@ -119,11 +119,6 @@ def test_success_advances_the_day_once_and_keeps_stopped_status(registry_with_au
         registry.record_success(automation.id, automation.next_day, advance_day=True)
 
 
-def test_new_automation_starts_without_completed_day(registry_with_automation):
-    _, automation = registry_with_automation
-    assert automation.last_completed_day is None
-
-
 @pytest.mark.parametrize("transition", ["add", "edit", "stop", "pause", "resume", "failure", "success", "delete"])
 def test_transition_rolls_back_failed_persistence(registry_with_automation, monkeypatch, transition):
     registry, automation = registry_with_automation

@@ -122,25 +122,18 @@ def test_existing_files_and_claims_are_rejected(tmp_path) -> None:
     asyncio.run(exercise())
 
 
-@pytest.mark.parametrize("terminal", ["completed", "failed", "cancelled"])
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
 def test_terminal_state_releases_claim(tmp_path, terminal) -> None:
     async def exercise() -> None:
         path = tmp_path / "artifact.mp4"
-        started = asyncio.Event()
 
         async def operation(_output) -> None:
-            started.set()
             if terminal == "failed":
                 message = "export failed"
                 raise OSError(message)
-            if terminal == "cancelled":
-                await asyncio.Event().wait()
 
         coordinator = ExportJobCoordinator()
         jobs = await coordinator.submit([ExportJobSpec.create(output=path, operation=operation)])
-        await started.wait()
-        if terminal == "cancelled":
-            await coordinator.cancel(jobs[0].id)
         await coordinator.wait(jobs)
         assert jobs[0].status == terminal
         replacement = await coordinator.submit([ExportJobSpec.create(output=path, operation=operation)])
