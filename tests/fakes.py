@@ -74,6 +74,7 @@ class FakeProtect:
         self.camera_list = [CAMERA] if cameras is None else cameras
         self.camera_error: Exception | None = None
         self.export_error: Exception | None = None
+        self.failing: dict[str, Exception] = {}
         self.exports: list[ExportRequest] = []
         self.gate: asyncio.Event | None = None
         self.thumbnails: list[tuple[str, datetime]] = []
@@ -94,6 +95,8 @@ class FakeProtect:
             await self.gate.wait()
         if self.export_error is not None:
             raise self.export_error
+        if request.camera.id in self.failing:
+            raise self.failing.pop(request.camera.id)
         await save_export(FakeResponse(), output, max_bytes=0, on_progress=on_progress)
 
     async def close(self) -> None:
