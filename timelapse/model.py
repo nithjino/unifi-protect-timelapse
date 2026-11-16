@@ -22,7 +22,7 @@ class Connection:
     username: str
     password: str = field(repr=False)
     verify_ssl: bool = True
-    timeout_seconds: int = 0
+    timeout_seconds: float = 0
     max_download_mib: int = 10240
 
 

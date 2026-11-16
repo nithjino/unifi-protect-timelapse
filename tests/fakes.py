@@ -45,9 +45,13 @@ class FakeResponse:
         self.headers = {"Content-Type": "video/mp4"} if headers is None else headers
         self.content = FakeContent(body if isinstance(body, list) else [body], gate)
         self.released = 0
+        self.content_type = self.headers.get("Content-Type", "")
 
     def release(self) -> None:
         self.released += 1
+
+    async def read(self) -> bytes:
+        return b"".join(self.content.chunks)
 
 
 class Clock:
