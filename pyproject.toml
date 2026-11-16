@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "timelapse"
-version = "3.0.0"
+version = "4.0.0"
 description = "CLI and web UniFi Protect timelapse exporter"
 requires-python = ">=3.11"
 dependencies = [
@@ -92,9 +92,6 @@ testpaths = ["tests"]
 filterwarnings = ["error::starlette.exceptions.StarletteDeprecationWarning"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["ANN201", "D", "PLR2004", "S101", "SLF001"]
-"tests/test_automation_registry.py" = ["ANN001", "FBT001"]
-"tests/test_cli.py" = ["ANN001", "ANN202"]
-"tests/test_daily_automation_engine.py" = ["ANN001", "ANN202", "EM", "PT018", "S106", "TRY003"]
-"tests/test_jobs.py" = ["ANN001", "EM101"]
-"timelapse/automation_registry.py" = ["D105", "D107", "EM", "PLR0912", "PLR0915", "TRY003", "TRY004", "TRY301"]
+"tests/**/*.py" = ["ANN001", "ANN002", "ANN003", "ANN201", "ANN202", "ANN401", "ARG", "D", "EM", "FBT", "PLR2004", "RUF001", "S101", "S104", "S105", "S106", "SLF001", "TC", "TRY003", "ASYNC110", "ASYNC230", "ASYNC240"]
+"timelapse/*.py" = ["ANN401", "ASYNC230", "ASYNC240", "D105", "D107", "EM", "PLR2004", "TC", "TRY003"]
+"timelapse/cli.py" = ["ASYNC250", "T201"]

@@ -109,7 +109,7 @@ uv run timelapse automation re-export "Front doors" 2026-07-30
 uv run timelapse automation remove "Front doors"
 ```
 
-`automation run` owns the registry while it runs, so stop it before using the other `automation` commands.
+`automation run` owns the registry while it runs, so stop it before using the other `automation` commands. It exits with status 1, printing each automation's status and last error, once none of the selected automations is active, for example after one pauses.
 
 Create and use a saved connection profile:
 
@@ -118,7 +118,7 @@ uv run timelapse --create-profile
 uv run timelapse --profile home --start-date 07-30-2026
 ```
 
-Profiles are used when `.env` is not present. They are case-sensitive and stored in the OS credential store.
+Profiles are case-sensitive and stored in the OS credential store. Each connection value comes from the first of: its command-line flag, the `--profile`, the process environment, then `.env`. TimeLapse asks for any value that is still missing.
 
 Accepted date formats are `MM-DD-YYYY` and `MM-DD-YYYY-HH-MM-SS`. A date by itself means one complete local calendar day.
 
@@ -151,6 +151,8 @@ mkdir -p data
 docker compose up --build -d
 ```
 
+The dashboard refreshes the export list every 2 seconds and Daily Automations every 5 seconds, and immediately after each action.
+
 Exports, job history, and Daily Automations live in `./data`. Recreate the container after changing `.env`:
 
 ```bash
@@ -176,6 +178,20 @@ Keep the web app on a trusted LAN, behind a VPN, or behind an HTTPS reverse prox
 Existing files are never overwritten. Downloads use a temporary `.part` file and are renamed only after they finish.
 
 When exports fill the quota, manual exports are refused and Daily Automations pause with an explanation. Free some space, then select Resume: the automation catches up on missed days while Protect still has the footage. With `TIMELAPSE_WEB_RETENTION_DAYS` set, the web app deletes every MP4 in the export folder older than that age, including manual exports, at startup and before each export. Videos whose job has left the 100-item history stay available under Older Exports.
+
+## Upgrading to version 4
+
+Version 4 is a rewrite with the same data files, settings, URLs and file names, so it can replace version 3 and be rolled back without migration. Back up `data/web-automations.json` and `data/web-jobs.json` first anyway. These behaviours changed:
+
+1. The dashboard polls for updates instead of keeping an event stream open; `/api/events` is gone. Lists may take up to 2 seconds to update.
+2. Removing a Daily Automation returns at once. Exports it already started finish as ordinary exports.
+3. Each export file has one row in the job history: retrying an export, or a later daily attempt, replaces the earlier failed row.
+4. An export that already exists answers 409 instead of 502; an invalid automation, such as a duplicate name, answers 400 instead of 502; a range longer than the limit answers 400 instead of 429.
+5. When a daily run cannot list the cameras, for example during a short outage at midnight, it retries with backoff instead of pausing at once.
+6. The CLI asks for any missing connection value, with or without a `.env` file, and `--profile` can be used alongside `.env`, taking precedence over it.
+7. A failure to save the job history after an export has started is logged and no longer fails the export.
+8. `timelapse automation run` exits with status 1 once no selected automation is active, instead of waiting forever.
+9. An export whose file already exists is refused before contacting Protect, instead of after the download.
 
 ## Upgrading to version 3
 

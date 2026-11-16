@@ -1,31 +1,48 @@
-"""UniFi Protect timelapse exporter."""
+"""Export UniFi Protect recordings as MP4 timelapses."""
 
 from __future__ import annotations
 
-from importlib.metadata import PackageNotFoundError, version
-from typing import TYPE_CHECKING
+import math
+from datetime import UTC, datetime, timedelta
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
-try:
-    __version__ = version("timelapse")
-except PackageNotFoundError:
-    __version__ = "0+unknown"
+__version__ = "4.0.0"
 
 
 class TimelapseError(RuntimeError):
-    """Raised when a timelapse export cannot be completed."""
+    """Protect or export failure."""
 
 
 class OperationTimeoutError(TimelapseError):
-    """Raised when a complete Protect operation exceeds its deadline."""
+    """The whole-operation deadline passed."""
 
 
-class ProtectRateLimitError(TimelapseError):
-    """Raised after bounded retries cannot clear a Protect HTTP 429 response."""
+class RateLimitError(TimelapseError):
+    """UniFi Protect kept answering HTTP 429."""
 
-    def __init__(self, message: str, *, retry_not_before: datetime | None = None) -> None:
-        """Keep the structured UTC retry floor with the display message."""
-        super().__init__(message)
-        self.retry_not_before = retry_not_before
+    def __init__(self, wait_seconds: float | None = None, *, now: datetime | None = None) -> None:
+        if wait_seconds is None:
+            middle = "Let the console's authentication rate-limit window clear before trying again."
+            self.retry_not_before: datetime | None = None
+        else:
+            middle = f"Wait at least {math.ceil(wait_seconds)} seconds before trying again."
+            self.retry_not_before = (now or datetime.now(UTC)) + timedelta(seconds=wait_seconds)
+        super().__init__(
+            f"UniFi Protect returned HTTP 429 after bounded retries. {middle} "
+            "TimeLapse will reuse the saved session; do not rotate accounts or start repeated copies."
+        )
+
+
+class InvalidRequestError(ValueError):
+    """Bad user input or definition."""
+
+
+class NotFoundError(InvalidRequestError):
+    """Unknown job, automation or file."""
+
+
+class ConflictError(InvalidRequestError):
+    """The artifact exists or is in flight."""
+
+
+class CapacityError(InvalidRequestError):
+    """The queue is full or the quota is exhausted."""

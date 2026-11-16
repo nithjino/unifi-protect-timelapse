@@ -1,50 +1,31 @@
-"""Secure, streaming timelapse downloads."""
+"""Stream one HTTP export response to an atomic file."""
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import re
+import secrets
 import shutil
-import stat
-import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
-from time import monotonic
-from typing import TYPE_CHECKING
+from typing import Any
 
-from timelapse import TimelapseError
-from timelapse.config import SPEED_TO_FPS, Config
-from timelapse.protect import CameraInfo, ProtectConnection, camera_id, camera_name, rate_limit_error
+from timelapse import RateLimitError, TimelapseError
+from timelapse.model import format_bytes
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
-    from aiohttp import ClientResponse
-    from uiprotect import ProtectApiClient
-
-MEBIBYTE = 1024 * 1024
-KIBIBYTE = 1024
-BYTE_UNITS = ("bytes", "KiB", "MiB", "GiB", "TiB")
-CHUNK_SIZE = MEBIBYTE
-MAX_ERROR_BODY_BYTES = 8 * 1024
-MP4_PROBE_BYTES = 4 * 1024
-MIN_MP4_FTYP_OFFSET = 4
-PROGRESS_UPDATE_INTERVAL_SECONDS = 0.1
-HTTP_OK = 200
-HTTP_MULTIPLE_CHOICES = 300
-HTTP_TOO_MANY_REQUESTS = 429
-MAX_CAMERA_FILENAME_CHARACTERS = 48
-CAMERA_ID_DIGEST_CHARACTERS = 12
-STORAGE_SAFETY_RESERVE_BYTES = 1024 * MEBIBYTE
-STORAGE_SAFETY_RESERVE_PERCENT = 5
-_LOGGER = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
+CHUNK_BYTES = 1024 * 1024
+GIB = 1024**3
+MP4_TYPES = {"video/mp4", "application/mp4", "application/octet-stream"}
+PROGRESS_INTERVAL = 0.1
 
 
 @dataclass(frozen=True)
-class DownloadProgress:
-    """A point-in-time snapshot of a streaming download."""
+class Progress:
+    """Download progress for one export."""
 
     downloaded_bytes: int
     total_bytes: int | None
@@ -52,220 +33,117 @@ class DownloadProgress:
     elapsed_seconds: float
 
 
-ProgressCallback = Callable[[DownloadProgress], None]
-
-
-def default_output_path(config: Config, camera: CameraInfo) -> Path:
-    """Build a safe, descriptive output filename."""
-    start_date = config.start.strftime("%Y_%m_%d")
-    end_date = config.end.strftime("%Y_%m_%d")
-    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f\s]+', "_", camera_name(camera)).strip("._-") or "camera"
-    safe_name = safe_name[:MAX_CAMERA_FILENAME_CHARACTERS].rstrip("._-") or "camera"
-    camera_digest = hashlib.sha256(camera_id(camera).encode()).hexdigest()[:CAMERA_ID_DIGEST_CHARACTERS]
-    if config.full_day:
-        return Path(f"timelapse_{safe_name}_{start_date}_{end_date}_{config.speed}_{camera_digest}.mp4")
-    start_time = config.start.strftime("%H_%M_%S")
-    end_time = config.end.strftime("%H_%M_%S")
-    return Path(
-        f"timelapse_{safe_name}_{start_date}_{start_time}_{end_date}_{end_time}_{config.speed}__{camera_digest}.mp4"
-    )
-
-
-def _ensure_storage(directory: Path, expected_bytes: int | None) -> None:
-    """Refuse an export that cannot fit while leaving a safety buffer free."""
+def retry_after_seconds(value: str | None, now: datetime | None = None) -> float | None:
+    """Parse a Retry-After header given in seconds or as an HTTP date."""
+    if not value:
+        return None
+    value = value.strip()
+    if value.isdigit():
+        return float(value)
     try:
-        usage = shutil.disk_usage(directory)
-    except OSError as exc:
-        message = f"could not measure free export storage at {directory}: {exc}"
-        raise TimelapseError(message) from exc
-    safety_bytes = min(STORAGE_SAFETY_RESERVE_BYTES, usage.total * STORAGE_SAFETY_RESERVE_PERCENT // 100)
-    available_bytes = max(usage.free - safety_bytes, 0)
-    if available_bytes == 0 or (expected_bytes or 0) > available_bytes:
-        description = (
-            "an export of unknown size" if expected_bytes is None else f"the {format_bytes(expected_bytes)} export"
-        )
-        message = (
-            f"not enough free storage for {description}: {format_bytes(available_bytes)} is available after "
-            f"the {format_bytes(safety_bytes)} safety buffer"
-        )
-        raise TimelapseError(message)
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, (when - (now or datetime.now(UTC))).total_seconds())
 
 
-async def download_timelapse(  # noqa: PLR0912, PLR0915 - one atomic streamed-download lifecycle
-    config: Config,
-    connection: ProtectConnection,
-    client: ProtectApiClient,
-    camera: CameraInfo,
-    output: Path,
-    progress_callback: ProgressCallback | None = None,
-) -> None:
-    """Stream a Protect timelapse export to an atomic temporary file."""
-    downloaded = 0
-    params = {
-        "camera": camera_id(camera),
-        "start": str(_js_time(config.start)),
-        "end": str(_js_time(config.end)),
-        "channel": "0",
-    }
-    timelapse_fps = SPEED_TO_FPS[config.speed]
-    if timelapse_fps is not None:
-        params.update(type="timelapse", fps=str(timelapse_fps))
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    # The caller owns the whole-operation deadline, so this request has none.
-    response = await client.request(
-        "get",
-        connection.export_path,
-        require_auth=True,
-        auto_close=False,
-        params=params,
-        timeout=0,
-    )
-    total_header = response.headers.get("Content-Length")
-    total_bytes = int(total_header) if total_header and total_header.isdigit() else None
-    temp_output: Path | None = None
+def is_valid_mp4(path: Path) -> bool:
+    """Return whether ``path`` is a regular, non-empty file with an MP4 signature."""
     try:
-        if not HTTP_OK <= response.status < HTTP_MULTIPLE_CHOICES:
-            if response.status == HTTP_TOO_MANY_REQUESTS:
-                raise rate_limit_error(getattr(client, "rate_limit_retry_after", None))
-            detail = await _read_error_detail(response)
-            reason = _sanitize_terminal_text(response.reason or "unknown error")
-            message = f"timelapse export failed with HTTP {response.status}: {detail or reason}"
-            raise TimelapseError(message)
-
-        content_type = response.headers.get("Content-Type", "").partition(";")[0].strip().casefold()
-        if content_type and content_type not in {"video/mp4", "application/mp4", "application/octet-stream"}:
-            message = f"timelapse export returned unexpected content type: {content_type}"
-            raise TimelapseError(message)
-
-        max_bytes = config.max_download_mib * MEBIBYTE
-        if max_bytes and total_bytes and total_bytes > max_bytes:
-            message = (
-                f"server reported a {total_bytes / MEBIBYTE:.1f} MiB export, "
-                f"exceeding the {config.max_download_mib} MiB limit"
-            )
-            raise TimelapseError(message)
-
-        _ensure_storage(output.parent, total_bytes)
-        download_started_at = monotonic()
-        _emit_progress(progress_callback, 0, total_bytes, download_started_at, download_started_at)
-
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            dir=output.parent,
-            prefix=f".{output.name}.",
-            suffix=".part",
-            delete=False,
-        ) as file:
-            temp_output = Path(file.name)
-            last_progress_update = download_started_at
-            async for chunk in response.content.iter_chunked(CHUNK_SIZE):
-                downloaded += len(chunk)
-                if max_bytes and downloaded > max_bytes:
-                    message = f"download exceeded the {config.max_download_mib} MiB limit"
-                    raise TimelapseError(message)
-                file.write(chunk)
-                now = monotonic()
-                if now - last_progress_update >= PROGRESS_UPDATE_INTERVAL_SECONDS:
-                    _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, now)
-                    last_progress_update = now
-
-        if downloaded == 0:
-            message = "timelapse export returned an empty response"
-            raise TimelapseError(message)
-        if not validate_mp4(temp_output):
-            message = "timelapse export did not contain a valid MP4 file signature"
-            raise TimelapseError(message)
-        if output.exists():  # noqa: ASYNC240 - local metadata check immediately before the atomic replace
-            message = f"refusing to overwrite existing output file: {output}"
-            raise TimelapseError(message)
-        temp_output.replace(output)
-        _LOGGER.info("Export finalized: output=%s, size=%s", output, format_bytes(downloaded))
-        _emit_progress(progress_callback, downloaded, total_bytes, download_started_at, monotonic())
-    except OSError as exc:
-        message = f"could not write {output}: {exc}"
-        raise TimelapseError(message) from exc
-    finally:
-        _release_response(response)
-        if temp_output is not None:
-            _remove_temporary_output(temp_output)
-
-
-def _release_response(response: ClientResponse) -> None:
-    """Release the response without replacing the primary operation error."""
-    try:
-        response.release()
-    except Exception:
-        _LOGGER.warning("Could not release the Protect export response", exc_info=True)
-
-
-def _remove_temporary_output(path: Path) -> None:
-    """Remove a partial export without replacing the primary operation error."""
-    try:
-        if path.exists():
-            _LOGGER.info("Removing temporary export file: %s", path)
-        path.unlink(missing_ok=True)
-    except OSError:
-        _LOGGER.warning("Could not remove temporary export file: %s", path, exc_info=True)
-
-
-def validate_mp4(path: Path) -> bool:
-    """Return whether a path is a regular, nonempty MP4 with an ftyp marker."""
-    try:
-        info = path.lstat()
-        if not stat.S_ISREG(info.st_mode) or info.st_size <= 0:
+        if not path.is_file():
             return False
         with path.open("rb") as file:
-            header = file.read(MP4_PROBE_BYTES)
+            return file.read(4096).find(b"ftyp", 4) != -1
     except OSError:
         return False
-    return header.find(b"ftyp", MIN_MP4_FTYP_OFFSET) >= MIN_MP4_FTYP_OFFSET
 
 
-def _js_time(value: datetime) -> int:
-    return int(value.timestamp() * 1000)
-
-
-async def _read_error_detail(response: ClientResponse) -> str:
-    raw = await response.content.read(MAX_ERROR_BODY_BYTES + 1)
-    truncated = len(raw) > MAX_ERROR_BODY_BYTES
-    detail = raw[:MAX_ERROR_BODY_BYTES].decode("utf-8", errors="replace").strip()
-    safe_detail = _sanitize_terminal_text(detail)
-    return f"{safe_detail}... (truncated)" if truncated else safe_detail
-
-
-def _sanitize_terminal_text(value: str) -> str:
-    return value.encode("unicode_escape", errors="backslashreplace").decode("ascii")
-
-
-def format_bytes(value: int | None) -> str:
-    """Return a human-readable size."""
-    if value is None:
-        return "unknown"
-    size = float(value)
-    for unit in BYTE_UNITS:
-        if size < KIBIBYTE or unit == BYTE_UNITS[-1]:
-            return f"{value} {unit}" if unit == BYTE_UNITS[0] else f"{size:.1f} {unit}"
-        size /= KIBIBYTE
-    return f"{value} bytes"
-
-
-def _emit_progress(
-    callback: ProgressCallback | None,
-    downloaded_bytes: int,
-    total_bytes: int | None,
-    started_at: float,
-    now: float,
-) -> None:
-    if callback is None:
-        return
-    elapsed_seconds = max(now - started_at, 0.0)
-    bytes_per_second = downloaded_bytes / elapsed_seconds if elapsed_seconds else 0.0
-    callback(
-        DownloadProgress(
-            downloaded_bytes=downloaded_bytes,
-            total_bytes=total_bytes,
-            bytes_per_second=bytes_per_second,
-            elapsed_seconds=elapsed_seconds,
+def _check_free_space(directory: Path, total: int | None) -> None:
+    usage = shutil.disk_usage(directory)
+    reserve = min(GIB, usage.total // 20)
+    available = max(0, usage.free - reserve)
+    if available == 0 or (total is not None and total > available):
+        size = f"the {format_bytes(total)} export" if total is not None else "an export of unknown size"
+        raise TimelapseError(
+            f"not enough free storage for {size}: {format_bytes(available)} is available "
+            f"after the {format_bytes(reserve)} safety buffer"
         )
-    )
+
+
+async def _check_response(response: Any, max_bytes: int) -> int | None:
+    status = response.status
+    if status == 429:
+        raise RateLimitError(retry_after_seconds(response.headers.get("Retry-After")))
+    if not 200 <= status < 300:
+        body = await response.content.read(8192)
+        text = body.decode(errors="replace").strip()
+        detail = text.encode("unicode_escape").decode() if text else response.reason
+        raise TimelapseError(f"timelapse export failed with HTTP {status}: {detail}")
+    content_type = (response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if content_type and content_type not in MP4_TYPES:
+        raise TimelapseError(f"unexpected content type from UniFi Protect: {content_type}")
+    length = (response.headers.get("Content-Length") or "").strip()
+    total = int(length) if length.isdigit() else None
+    if max_bytes and total is not None and total > max_bytes:
+        raise TimelapseError(f"the export is {format_bytes(total)}, above the {format_bytes(max_bytes)} limit")
+    return total
+
+
+async def save_export(
+    response: Any,
+    output: Path,
+    *,
+    max_bytes: int,
+    on_progress: Callable[[Progress], None] | None = None,
+) -> None:
+    """Stream ``response`` into ``output`` through a temporary ``.part`` file."""
+    part = output.with_name(f".{output.name}.{secrets.token_hex(4)}.part")
+    started = time.monotonic()
+    downloaded = 0
+    total: int | None = None
+
+    def report() -> None:
+        elapsed = time.monotonic() - started
+        if on_progress is not None:
+            on_progress(Progress(downloaded, total, downloaded / elapsed if elapsed > 0 else 0.0, elapsed))
+
+    try:
+        if output.exists():
+            raise TimelapseError(f"refusing to overwrite existing output file: {output}")
+        total = await _check_response(response, max_bytes)
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            _check_free_space(output.parent, total)
+            report()
+            head = b""
+            last_report = time.monotonic()
+            with part.open("xb") as file:
+                async for chunk in response.content.iter_chunked(CHUNK_BYTES):
+                    downloaded += len(chunk)
+                    if max_bytes and downloaded > max_bytes:
+                        raise TimelapseError(f"the export grew past the {format_bytes(max_bytes)} limit")
+                    if len(head) < 4096:
+                        head += chunk[:4096]
+                    file.write(chunk)
+                    if time.monotonic() - last_report >= PROGRESS_INTERVAL:
+                        last_report = time.monotonic()
+                        report()
+            if downloaded == 0:
+                raise TimelapseError("UniFi Protect returned an empty response")
+            if head[:4096].find(b"ftyp", 4) == -1:
+                raise TimelapseError("UniFi Protect did not return a valid MP4 file signature")
+            if output.exists():
+                raise TimelapseError(f"refusing to overwrite existing output file: {output}")
+            part.rename(output)
+        except OSError as error:
+            raise TimelapseError(f"could not write {output}: {error}") from error
+        report()
+    finally:
+        try:
+            response.release()
+        except Exception:
+            LOGGER.exception("Could not release the export response")
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            LOGGER.exception("Could not remove %s", part)

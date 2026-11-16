@@ -1,5 +1,7 @@
-"""Allow the package to run with ``python -m timelapse``."""
+"""Run the CLI with ``python -m timelapse``."""
+
+import sys
 
 from timelapse.cli import main
 
-raise SystemExit(main())
+sys.exit(main())

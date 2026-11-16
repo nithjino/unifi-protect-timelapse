@@ -340,19 +340,18 @@
   updateSelectionCount();
   updatePreviewCameraOptions();
 
-  const events = new EventSource("/api/events");
-  events.addEventListener("open", () => {
+  document.body.addEventListener("htmx:afterRequest", (event) => {
+    if (!event.detail.successful) return;
     serverConnected = true;
     renderConnectedState();
   });
-  events.addEventListener("state", () => {
-    if (window.htmx) window.htmx.trigger(document.body, "stateChanged");
-  });
-  events.addEventListener("error", () => {
+  const showReconnecting = () => {
     serverConnected = false;
     liveDot?.classList.remove("online");
     liveDot?.classList.remove("storage-low");
     liveDot?.classList.add("offline");
     if (liveLabel) liveLabel.textContent = "Reconnecting";
-  });
+  };
+  document.body.addEventListener("htmx:sendError", showReconnecting);
+  document.body.addEventListener("htmx:timeout", showReconnecting);
 })();

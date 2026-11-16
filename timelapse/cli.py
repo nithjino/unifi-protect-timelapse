@@ -1,399 +1,448 @@
-"""CLI orchestration and interactive camera selection."""
+"""The ``timelapse`` command: one-off exports, profiles and Daily Automations."""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
-import logging
 import os
 import sys
-from datetime import date
-from functools import partial
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
+import tzlocal
 from dotenv import dotenv_values
 from platformdirs import user_config_path
 
-from timelapse import TimelapseError
-from timelapse.automation_registry import (
-    AutomationCamera,
-    AutomationRegistry,
-    ConnectionReference,
-    DailyAutomation,
-    RegistryError,
-    RegistryOwnedError,
-)
-from timelapse.config import (
-    DEFAULT_MAX_DOWNLOAD_MIB,
-    SPEED_TO_FPS,
-    Config,
-    ConnectionSettings,
-    CreateProfile,
-    is_truthy,
-    parse_args,
-    prompt_required,
-)
-from timelapse.download import MEBIBYTE, DownloadProgress, default_output_path
-from timelapse.jobs import ExportJobCoordinator
-from timelapse.profiles import ConnectionProfile, ProfileError, load_profile, save_profile
-from timelapse.protect import CameraInfo, ProtectClients, camera_name
-from timelapse.schedule import DailyAutomationEngine, ResolvedAutomation
-from timelapse.service import export_timelapse, list_available_cameras
+from timelapse import InvalidRequestError, TimelapseError
+from timelapse.daily import DailyRunner
+from timelapse.download import Progress
+from timelapse.jobs import JobQueue
+from timelapse.model import DEFAULT_SPEED, SPEEDS, Camera, Connection, ExportRequest, day_bounds
+from timelapse.profiles import load_profile, save_profile
+from timelapse.protect import Protect
+from timelapse.registry import Automation, Registry, RegistryOwnedError
+from timelapse.settings import CONNECTION_NAMES, FALSE, TRUE, protect_values
 
-CLI_REGISTRY_ENV = "TIMELAPSE_CLI_REGISTRY"
-CLI_OWNER_EXIT_CODE = 3
+MakeProtect = Callable[[Connection], Any]
+PROMPTS = {
+    "UNIFI_PROTECT_URL": ("instance", "UniFi Protect URL"),
+    "UNIFI_PROTECT_TOKEN": ("token", "Integration API token"),
+    "UNIFI_PROTECT_USERNAME": ("username", "Local Protect username"),
+    "UNIFI_PROTECT_PASSWORD": ("password", "Local Protect password"),
+}
 
 
-def _choose_camera(cameras: list[CameraInfo]) -> CameraInfo:
-    if not cameras:
-        message = "no cameras were returned by UniFi Protect"
-        raise TimelapseError(message)
+def parse_bool(value: str, name: str = "--verify-ssl") -> bool:
+    """Read a yes/no value strictly."""
+    text = value.strip().lower()
+    if text in TRUE | FALSE:
+        return text in TRUE
+    raise InvalidRequestError(f"{name} must be true or false, not {value!r}")
 
-    _write_stdout("Available cameras:\n")
-    for index, camera in enumerate(cameras, start=1):
-        details = ", ".join(value for value in (camera.state, camera.model, camera.id) if value)
-        _write_stdout(f"{index:>2}. {camera_name(camera)} ({details})\n")
 
-    while True:
-        selection = input("Select a camera by number: ").strip()
+def _bool_arg(value: str) -> bool:
+    try:
+        return parse_bool(value)
+    except InvalidRequestError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _count(value: str) -> int:
+    if not value.strip().isdigit():
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, not {value!r}")
+    return int(value)
+
+
+def _absolute_file(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute() or not path.is_file():
+        raise argparse.ArgumentTypeError(f"must be an absolute path to an existing file: {value}")
+    return path
+
+
+def _moment(value: str) -> tuple[datetime, bool]:
+    """Read ``MM-DD-YYYY`` or ``MM-DD-YYYY-HH-MM-SS`` in the system timezone; also say whether a time was given."""
+    for pattern, has_time in (("%m-%d-%Y", False), ("%m-%d-%Y-%H-%M-%S", True)):
         try:
-            index = int(selection)
+            return datetime.strptime(value, pattern).replace(tzinfo=tzlocal.get_localzone()), has_time
         except ValueError:
-            _write_stdout("Please enter a camera number.\n")
             continue
-        if 1 <= index <= len(cameras):
-            return cameras[index - 1]
-        _write_stdout(f"Please enter a number from 1 to {len(cameras)}.\n")
+    raise argparse.ArgumentTypeError(f"expected MM-DD-YYYY or MM-DD-YYYY-HH-MM-SS, not {value!r}")
 
 
-async def _run() -> int:
-    async with ProtectClients() as clients:
-        return await _run_in_session(clients)
+def export_range(
+    start: tuple[datetime, bool] | None, end: tuple[datetime, bool] | None, error: Callable[[str], Any]
+) -> tuple[datetime, datetime, bool]:
+    """Turn the date flags into a range and whether it is one full local day."""
+    day = timedelta(hours=24)
+    if start is None and end is None:
+        error("provide --start-date or --end-date")
+    if start is not None and end is not None:
+        if not start[1] and not end[1] and start[0] == end[0]:
+            return (*day_bounds(start[0].date(), tzlocal.get_localzone()), True)
+        if end[0] <= start[0]:
+            error("--end-date must be after --start-date")
+        return start[0], end[0], False
+    moment, has_time = start or end  # type: ignore[misc]
+    if not has_time:
+        return (*day_bounds(moment.date(), tzlocal.get_localzone()), True)
+    if start is not None:
+        return moment, (moment.astimezone(UTC) + day).astimezone(moment.tzinfo), False
+    return (moment.astimezone(UTC) - day).astimezone(moment.tzinfo), moment, False
 
 
-async def _run_in_session(clients: ProtectClients) -> int:
-    """Run one CLI lifecycle with reusable Protect connections."""
+@dataclass
+class Context:
+    """What every command needs: arguments, environment, input and the console factory."""
+
+    args: argparse.Namespace
+    env: Mapping[str, str]
+    dotenv: Mapping[str, str]
+    make_protect: MakeProtect
+
+    def setting(self, name: str) -> str | None:
+        """Process environment first, then the ``.env`` file."""
+        return self.env.get(name) or self.dotenv.get(name) or None
+
+    def env_count(self, name: str, default: int, minimum: int = 0) -> int:
+        """Read a non-negative integer setting."""
+        text = self.setting(name)
+        if text is None:
+            return default
+        if not text.strip().lstrip("-").isdigit():
+            raise InvalidRequestError(f"{name} must be an integer, not {text!r}")
+        if int(text) < minimum:
+            raise InvalidRequestError(f"{name} must be at least {minimum}")
+        return int(text)
+
+    def prompt(self, label: str, flag: str, *, secret: bool = False) -> str:
+        """Ask until a value is given; end of input is an error."""
+        while True:
+            try:
+                value = getpass.getpass(f"{label}: ") if secret else input(f"{label}: ")
+            except EOFError:
+                raise InvalidRequestError(f"{label} is required; pass {flag}") from None
+            if value.strip():
+                return value if secret else value.strip()
+
+    def connection(self, *, ask_tls: bool = False) -> Connection:
+        """Resolve each value from the flag, the profile, the environment, the ``.env`` file, then a prompt."""
+        args = self.args
+        profile = load_profile(args.profile) if getattr(args, "profile", None) else None
+        from_profile = dict(zip(CONNECTION_NAMES, (profile.url, profile.token, profile.username, profile.password),
+                                strict=True)) if profile else {}  # fmt: skip
+        values = []
+        for name in CONNECTION_NAMES:
+            attr, label = PROMPTS[name]
+            secret = attr in {"token", "password"}
+            value = getattr(args, attr, None) or from_profile.get(name) or self.setting(name)
+            values.append(value or self.prompt(label, f"--{attr}", secret=secret))
+        verify = getattr(args, "verify_ssl", None)
+        if verify is None and profile is not None:
+            verify = profile.verify_ssl
+        if verify is None and (text := self.setting("UNIFI_PROTECT_VERIFY_SSL")) is not None:
+            verify = parse_bool(text, "UNIFI_PROTECT_VERIFY_SSL")
+        if verify is None and ask_tls:
+            answer = self.prompt_optional("Verify TLS certificates? [Y/n] ")
+            verify = parse_bool(answer or "yes", "the TLS answer")
+        timeout = getattr(args, "request_timeout_seconds", None)
+        limit = getattr(args, "max_download_mib", None)
+        return Connection(
+            values[0].strip().rstrip("/"),
+            values[1],
+            values[2],
+            values[3],
+            verify_ssl=True if verify is None else verify,
+            timeout_seconds=self.env_count("TIMELAPSE_REQUEST_TIMEOUT_SECONDS", 0) if timeout is None else timeout,
+            max_download_mib=self.env_count("TIMELAPSE_MAX_DOWNLOAD_MIB", 10240) if limit is None else limit,
+        )
+
+    @staticmethod
+    def prompt_optional(text: str) -> str:
+        """Ask once; end of input means the default."""
+        try:
+            return input(text).strip()
+        except EOFError:
+            return ""
+
+    def registry(self) -> Registry:
+        """Return the CLI registry."""
+        override = self.setting("TIMELAPSE_CLI_REGISTRY")
+        return Registry(Path(override) if override else user_config_path("TimeLapse") / "cli-automations.json")
+
+    def resolve_reference(self, ref: tuple[str, str]) -> Connection:
+        """Read an automation's credentials now, never from the registry."""
+        kind, value = ref
+        if kind == "python-profile":
+            return load_profile(value)
+        if kind == "dotenv":
+            values = {key: text for key, text in dotenv_values(value).items() if text is not None}
+            found = protect_values(values)
+            missing = [name for name in CONNECTION_NAMES if name not in found]
+            if missing:
+                raise InvalidRequestError(f"{value} does not define {missing[0]}")
+            reader = Context(self.args, {}, values, self.make_protect)
+            verify = reader.setting("UNIFI_PROTECT_VERIFY_SSL")
+            return Connection(
+                *(found[name] for name in CONNECTION_NAMES),
+                verify_ssl=True if verify is None else parse_bool(verify, "UNIFI_PROTECT_VERIFY_SSL"),
+                timeout_seconds=reader.env_count("TIMELAPSE_REQUEST_TIMEOUT_SECONDS", 0),
+                max_download_mib=reader.env_count("TIMELAPSE_MAX_DOWNLOAD_MIB", 10240),
+            )
+        raise InvalidRequestError("web-environment references can only be used by the web server")
+
+
+async def export_once(context: Context, start: datetime, end: datetime, full_day: bool) -> None:  # noqa: FBT001
+    """List cameras, ask for one and export it."""
+    args = context.args
+    protect = context.make_protect(context.connection())
     try:
-        if len(sys.argv) > 1 and sys.argv[1] == "automation":
-            return await _run_automation_command(clients, sys.argv[2:])
-        command = parse_args()
-        if isinstance(command, CreateProfile):
-            _create_profile(command)
-            return 0
-        config = command
-        camera = _choose_camera(await list_available_cameras(clients, config))
-        output = config.output or default_output_path(config, camera)
-        await _export(clients, config, camera, output)
-    except KeyboardInterrupt:
-        _write_stderr("\nCancelled.\n")
-        return 130
-    except Exception as exc:
-        _write_stderr(f"Error: {exc}\n")
-        return 1
+        cameras: list[Camera] = await protect.cameras()
+        if not cameras:
+            raise TimelapseError("no cameras are available to this Integration API token")
+        print("Available cameras:")
+        for number, camera in enumerate(cameras, 1):
+            print(f"{number}. {camera.name} ({camera.state}, {camera.model}, {camera.id})")
+        while True:
+            try:
+                choice = input("Select a camera by number: ").strip()
+            except EOFError:
+                raise InvalidRequestError("a camera must be selected") from None
+            if choice.isdigit() and 1 <= int(choice) <= len(cameras):
+                break
+        request = ExportRequest(cameras[int(choice) - 1], start, end, args.speed, full_day)
+        output = Path(args.output) if args.output else Path.cwd() / request.filename
 
-    _write_stdout(f"Saved timelapse to {output}\n")
-    return 0
+        def show(progress: Progress) -> None:
+            text = f"\rDownloaded {progress.downloaded_bytes / 1024 / 1024:.1f} MiB"
+            if progress.total_bytes:
+                text += f" ({progress.downloaded_bytes * 100 / progress.total_bytes:.1f}%)"
+            print(text, end="", flush=True)
 
-
-def _create_profile(command: CreateProfile) -> None:
-    _write_stdout("Create a connection profile. Every field is required.\n")
-    profile = ConnectionProfile(
-        name=prompt_required("Profile name"),
-        instance_url=command.instance_url or prompt_required("Protect Integration API URL"),
-        token=command.token or prompt_required("Protect API token", secret=True),
-        username=command.username or prompt_required("Local Protect username"),
-        password=command.password or prompt_required("Local Protect password", secret=True),
-        verify_ssl=command.verify_ssl if command.verify_ssl is not None else _prompt_verify_ssl(),
-    )
-    try:
-        save_profile(profile)
-    except ProfileError as exc:
-        raise TimelapseError(str(exc)) from exc
-    _write_stdout(f"Created profile {profile.name.strip()!r}.\n")
-
-
-def _prompt_verify_ssl() -> bool:
-    while True:
-        value = input("Verify TLS certificates? [Y/n]: ").strip().lower()
-        if value in {"", "y", "yes"}:
-            return True
-        if value in {"n", "no"}:
-            return False
-        _write_stdout("Please enter yes or no.\n")
-
-
-async def _export(clients: ProtectClients, config: Config, camera: CameraInfo, output: Path) -> None:
-    _write_stdout(f"Requesting {config.speed} timelapse export for {camera_name(camera)}...\n")
-    try:
-        await export_timelapse(clients, config, camera, output, _print_progress)
+        print(f"Requesting {args.speed} timelapse export for {request.camera.name}...")
+        await protect.export(request, output, show)
+        print(f"\nSaved timelapse to {output}")
     finally:
-        _write_stdout("\n")
+        await protect.close()
 
 
-def _automation_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="timelapse automation", description="Manage durable Daily Automations.")
-    subparsers = parser.add_subparsers(dest="action", required=True)
-    add = subparsers.add_parser("add", help="create a Daily Automation")
+def create_profile(context: Context) -> None:
+    """Ask for a name and store the resolved connection under it."""
+    while True:
+        try:
+            name = input("Profile name: ").strip()
+        except EOFError:
+            raise InvalidRequestError("Profile name is required.") from None
+        if name:
+            break
+        print("Profile name is required.")
+    context.args.profile = None
+    saved = save_profile(name, context.connection(ask_tls=True))
+    print(f"Created profile '{saved}'.")
+
+
+def reference(args: argparse.Namespace) -> tuple[str, str] | None:
+    """Return the connection reference named by ``--profile`` or ``--dotenv``."""
+    if args.profile:
+        return ("python-profile", args.profile.strip())
+    if args.dotenv:
+        return ("dotenv", str(args.dotenv.resolve()))
+    return None
+
+
+async def pick_cameras(context: Context, ref: tuple[str, str], wanted: list[str]) -> list[Camera]:
+    """Match each ``--camera`` by ID, then by exact case-insensitive name."""
+    protect = context.make_protect(context.resolve_reference(ref))
+    try:
+        cameras: list[Camera] = await protect.cameras()
+    finally:
+        await protect.close()
+    chosen = []
+    for item in wanted:
+        match = [camera for camera in cameras if camera.id == item] or [
+            camera for camera in cameras if camera.name.casefold() == item.strip().casefold()
+        ]
+        if len(match) > 1:
+            raise InvalidRequestError(f"camera name is ambiguous; use its ID: {item}")
+        if not match:
+            raise InvalidRequestError(f"camera does not exist: {item}")
+        chosen.append(Camera(match[0].id, match[0].name))
+    return chosen
+
+
+async def run_automations(context: Context, registry: Registry) -> None:
+    """Run the selected automations until none is active."""
+    max_active = context.env_count("TIMELAPSE_MAX_ACTIVE_EXPORTS", 4, 1)
+    selected = [registry.resolve(context.args.selector)] if context.args.selector else registry.automations
+    clients: dict[Connection, Any] = {}
+
+    def connect(automation: Automation) -> Any:
+        connection = context.resolve_reference(automation.connection)
+        if connection not in clients:
+            clients[connection] = context.make_protect(connection)
+        return clients[connection]
+
+    queue = JobQueue(max_active=max_active)
+    runner = DailyRunner(registry, queue, connect=connect)
+    try:
+        for automation in selected:
+            runner.start(automation.id)
+        await runner.wait()
+    finally:
+        await runner.close()
+        await queue.close()
+        for client in clients.values():
+            await client.close()
+    for automation in selected:
+        current = registry.get(automation.id) or automation
+        print(f"{current.name}: {current.status}" + (f" ({current.last_error})" if current.last_error else ""))
+    raise TimelapseError("no selected Daily Automation is active")
+
+
+def automation_command(context: Context) -> None:
+    """Run one ``timelapse automation`` command while holding the registry."""
+    args = context.args
+    registry = context.registry()
+    with registry.lock():
+        registry.load()
+        command = args.automation_command
+        if command == "add":
+            ref = reference(args) or ("dotenv", "")
+            timezone = args.timezone or tzlocal.get_localzone_name()
+            if not timezone:
+                raise InvalidRequestError("could not determine the system timezone; pass --timezone")
+            cameras = asyncio.run(pick_cameras(context, ref, args.camera))
+            automation = registry.add(
+                name=args.name, cameras=cameras, connection=ref, speed=args.speed,
+                output_directory=Path(args.output), timezone=timezone,
+            )  # fmt: skip
+            print(f"Created '{automation.name}' ({automation.id}).")
+        elif command == "edit":
+            current = registry.resolve(args.selector)
+            ref = reference(args) or current.connection
+            cameras = asyncio.run(pick_cameras(context, ref, args.camera)) if args.camera else None
+            automation = registry.edit(current.id, name=args.name, cameras=cameras, connection=ref)
+            print(f"Updated '{automation.name}' ({automation.id}).")
+        elif command == "list":
+            list_automations(registry.automations, as_json=args.json)
+        elif command == "run":
+            asyncio.run(run_automations(context, registry))
+        elif command == "stop":
+            print(f"Stopped '{registry.put(registry.resolve(args.selector).stopped()).name}'.")
+        elif command == "resume":
+            print(f"Resumed '{registry.put(registry.resolve(args.selector).resumed()).name}'.")
+        elif command == "remove":
+            registry.delete(registry.resolve(args.selector).id)
+            print("Removed Daily Automation.")
+        else:
+            automation = registry.resolve(args.selector)
+            runner = DailyRunner(
+                registry,
+                JobQueue(max_active=context.env_count("TIMELAPSE_MAX_ACTIVE_EXPORTS", 4, 1)),
+                connect=lambda item: context.make_protect(context.resolve_reference(item.connection)),
+            )
+            finished = asyncio.run(runner.reexport(automation.id, args.day))
+            print("Re-export finished." if finished else "No export was needed.")
+
+
+def list_automations(automations: list[Automation], *, as_json: bool) -> None:
+    """Print automations as text or JSON."""
+    if as_json:
+        rows = []
+        for item in automations:
+            data = item.to_dict()
+            row = {key: data[key] for key in ("id", "name", "status", "speed", "output_directory", "timezone",
+                                               "next_day", "consecutive_failures", "next_retry_at", "last_error",
+                                               "connection")}  # fmt: skip
+            rows.append(row | {"camera_ids": [camera.id for camera in item.cameras]})
+        print(json.dumps(rows, indent=2, ensure_ascii=False))
+    elif not automations:
+        print("No Daily Automations.")
+    for item in [] if as_json else automations:
+        print(f"{item.id}  {item.status:<8}  {item.name}  next {item.next_day.isoformat()}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Describe every command and option."""
+    parser = argparse.ArgumentParser(prog="timelapse", description="Export UniFi Protect recordings as timelapses.")
+    parser.add_argument("--speed", choices=list(SPEEDS), default=DEFAULT_SPEED)
+    for flag in ("--instance", "--token", "--username", "--password"):
+        parser.add_argument(flag)
+    parser.add_argument("--verify-ssl", type=_bool_arg, metavar="BOOL")
+    parser.add_argument("--start-date", type=_moment, help="MM-DD-YYYY or MM-DD-YYYY-HH-MM-SS")
+    parser.add_argument("--end-date", type=_moment, help="MM-DD-YYYY or MM-DD-YYYY-HH-MM-SS")
+    parser.add_argument("--output")
+    parser.add_argument("--request-timeout-seconds", type=_count)
+    parser.add_argument("--max-download-mib", type=_count)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument("--profile", metavar="NAME")
+    source.add_argument("--dotenv", type=_absolute_file, metavar="ABSOLUTE_PATH")
+    source.add_argument("--create-profile", action="store_true")
+
+    commands = parser.add_subparsers(dest="command")
+    automation = commands.add_parser("automation", help="manage Daily Automations")
+    actions = automation.add_subparsers(dest="automation_command", required=True)
+
+    def with_reference(sub: argparse.ArgumentParser, *, required: bool) -> None:
+        group = sub.add_mutually_exclusive_group(required=required)
+        group.add_argument("--profile")
+        group.add_argument("--dotenv", type=_absolute_file)
+
+    add = actions.add_parser("add")
     add.add_argument("--name", required=True)
-    add.add_argument("--camera", action="append", required=True, help="camera ID or exact display name; repeatable")
-    add.add_argument("--speed", choices=tuple(SPEED_TO_FPS), default="600x")
-    add.add_argument("--output", type=Path, required=True)
-    add.add_argument("--timezone", default=None, help="IANA timezone; defaults to this system's timezone")
-    add_connection = add.add_mutually_exclusive_group(required=True)
-    add_connection.add_argument("--profile")
-    add_connection.add_argument("--dotenv", type=Path)
-
-    edit = subparsers.add_parser("edit", help="edit a Daily Automation")
+    add.add_argument("--camera", action="append", required=True)
+    add.add_argument("--output", required=True)
+    add.add_argument("--speed", choices=list(SPEEDS), default=DEFAULT_SPEED)
+    add.add_argument("--timezone")
+    with_reference(add, required=True)
+    edit = actions.add_parser("edit")
     edit.add_argument("selector")
     edit.add_argument("--name")
-    edit.add_argument("--camera", action="append", help="replace cameras; repeatable")
-    edit_connection = edit.add_mutually_exclusive_group()
-    edit_connection.add_argument("--profile")
-    edit_connection.add_argument("--dotenv", type=Path)
-
-    listing = subparsers.add_parser("list", help="list Daily Automations")
-    listing.add_argument("--json", action="store_true")
-    run = subparsers.add_parser("run", help="run active Daily Automations")
-    run.add_argument("selector", nargs="?")
-    for action in ("resume", "stop", "remove"):
-        command = subparsers.add_parser(action)
-        command.add_argument("selector")
-    reexport = subparsers.add_parser("re-export", aliases=["reexport"])
+    edit.add_argument("--camera", action="append")
+    with_reference(edit, required=False)
+    actions.add_parser("list").add_argument("--json", action="store_true")
+    actions.add_parser("run").add_argument("selector", nargs="?")
+    for name in ("stop", "resume", "remove"):
+        actions.add_parser(name).add_argument("selector")
+    reexport = actions.add_parser("re-export", aliases=["reexport"])
     reexport.add_argument("selector")
-    reexport.add_argument("day", type=date.fromisoformat, help="local calendar day in YYYY-MM-DD form")
+    reexport.add_argument("day", type=date.fromisoformat, metavar="YYYY-MM-DD")
     return parser
 
 
-async def _run_automation_command(clients: ProtectClients, arguments: list[str]) -> int:
-    """Run one management command; the registry has one owner at a time."""
-    parser = _automation_parser()
-    args = parser.parse_args(arguments)
-    registry = AutomationRegistry(_cli_registry_path())
+def main(
+    argv: Sequence[str] | None = None, *, env: Mapping[str, str] | None = None, make_protect: MakeProtect = Protect
+) -> int:
+    """Run the CLI and return its exit code."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    env = os.environ if env is None else env
+    dotenv_path = getattr(args, "dotenv", None) if args.command is None else None
+    dotenv_path = dotenv_path or Path.cwd() / ".env"
+    dotenv = {key: value for key, value in dotenv_values(dotenv_path).items() if value is not None}
+    if args.command is None and args.output is None:
+        args.output = env.get("TIMELAPSE_OUTPUT") or dotenv.get("TIMELAPSE_OUTPUT")
+    context = Context(args, env, dotenv, make_protect)
     try:
-        with registry.owner():
-            registry.load()
-            await _automation_action(clients, parser, args, registry)
-    except RegistryOwnedError as exc:
-        _write_stderr(f"Error: {exc}. Stop the running automation process first.\n")
-        return CLI_OWNER_EXIT_CODE
-    except (RegistryError, ProfileError, ValueError) as exc:
-        _write_stderr(f"Error: {exc}\n")
+        if args.command == "automation":
+            automation_command(context)
+        elif args.create_profile:
+            create_profile(context)
+        else:
+            start, end, full_day = export_range(args.start_date, args.end_date, parser.error)
+            asyncio.run(export_once(context, start, end, full_day))
+    except RegistryOwnedError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 3
+    except (TimelapseError, InvalidRequestError) as error:
+        print(f"Error: {error}", file=sys.stderr)
         return 1
-    return 0
-
-
-async def _automation_action(
-    clients: ProtectClients,
-    parser: argparse.ArgumentParser,
-    args: argparse.Namespace,
-    registry: AutomationRegistry,
-) -> None:
-    if args.action == "list":
-        _print_automations(registry, as_json=args.json)
-    elif args.action == "add":
-        reference = _reference_from_args(args.profile, args.dotenv)
-        resolved = await _resolve_reference(clients, reference)
-        automation = registry.add(
-            name=args.name,
-            cameras=_automation_cameras(args.camera, resolved.cameras),
-            connection=reference,
-            speed=args.speed,
-            output_directory=args.output,
-            timezone=args.timezone or _discover_timezone(parser),
-        )
-        _write_stdout(f"Created {automation.name!r} ({automation.id}).\n")
-    elif args.action == "edit":
-        automation = registry.resolve(args.selector)
-        reference = automation.connection
-        if args.profile is not None or args.dotenv is not None:
-            reference = _reference_from_args(args.profile, args.dotenv)
-        cameras = None
-        if args.camera is not None:
-            cameras = _automation_cameras(args.camera, (await _resolve_reference(clients, reference)).cameras)
-        updated = registry.edit(args.selector, name=args.name, cameras=cameras, connection=reference)
-        _write_stdout(f"Updated {updated.name!r} ({updated.id}).\n")
-    elif args.action == "stop":
-        _write_stdout(f"Stopped {registry.stop(args.selector).name!r}.\n")
-    elif args.action == "resume":
-        _write_stdout(f"Resumed {registry.resume(args.selector).name!r}.\n")
-    elif args.action == "remove":
-        registry.delete(registry.resolve(args.selector).id)
-        _write_stdout("Removed Daily Automation.\n")
-    else:
-        coordinator = ExportJobCoordinator.from_environment()
-        engine = _automation_engine(clients, registry, coordinator)
-        try:
-            if args.action == "run":
-                await engine.run_forever(args.selector)
-            else:
-                exported = await engine.reexport(args.selector, args.day)
-                _write_stdout("Re-export finished.\n" if exported else "No export was needed.\n")
-        finally:
-            await coordinator.close()
-
-
-def _automation_engine(
-    clients: ProtectClients,
-    registry: AutomationRegistry,
-    coordinator: ExportJobCoordinator,
-) -> DailyAutomationEngine:
-    return DailyAutomationEngine(
-        registry,
-        coordinator,
-        resolve_connection=partial(_resolve_automation, clients),
-        exporter=partial(export_timelapse, clients),
-    )
-
-
-async def _resolve_automation(clients: ProtectClients, automation: DailyAutomation) -> ResolvedAutomation:
-    return await _resolve_reference(clients, automation.connection)
-
-
-async def _resolve_reference(clients: ProtectClients, reference: ConnectionReference) -> ResolvedAutomation:
-    if reference.kind == "python-profile":
-        profile = load_profile(reference.value)
-        config = ConnectionSettings(
-            profile.instance_url, profile.token, profile.username, profile.password, profile.verify_ssl
-        )
-    elif reference.kind == "dotenv":
-        config = _connection_from_dotenv(Path(reference.value))
-    else:
-        message = f"CLI cannot resolve {reference.kind} connection references"
-        raise RegistryError(message)
-    cameras = tuple(await list_available_cameras(clients, config))
-    return ResolvedAutomation(config, cameras)
-
-
-def _connection_from_dotenv(path: Path) -> ConnectionSettings:
-    absolute = path.expanduser()
-    if not absolute.is_absolute():
-        message = "dotenv connection references must use an absolute path"
-        raise RegistryError(message)
-    values = dotenv_values(absolute)
-
-    def required(name: str) -> str:
-        value = values.get(name)
-        if not value:
-            message = f"{absolute} does not define {name}"
-            raise RegistryError(message)
-        return value
-
-    return ConnectionSettings(
-        instance_url=required("UNIFI_PROTECT_URL").rstrip("/"),
-        token=required("UNIFI_PROTECT_TOKEN"),
-        username=required("UNIFI_PROTECT_USERNAME"),
-        password=required("UNIFI_PROTECT_PASSWORD"),
-        verify_ssl=is_truthy(values.get("UNIFI_PROTECT_VERIFY_SSL") or "true"),
-        request_timeout_seconds=int(values.get("TIMELAPSE_REQUEST_TIMEOUT_SECONDS") or 0),
-        max_download_mib=int(values.get("TIMELAPSE_MAX_DOWNLOAD_MIB", str(DEFAULT_MAX_DOWNLOAD_MIB)) or 0),
-    )
-
-
-def _reference_from_args(profile: str | None, dotenv: Path | None) -> ConnectionReference:
-    if profile is not None:
-        return ConnectionReference("python-profile", profile)
-    if dotenv is None:
-        message = "choose a named profile or an absolute dotenv path"
-        raise RegistryError(message)
-    return ConnectionReference("dotenv", str(dotenv))
-
-
-def _automation_cameras(selectors: list[str], cameras: tuple[CameraInfo, ...]) -> tuple[AutomationCamera, ...]:
-    selected: list[AutomationCamera] = []
-    for selector in selectors:
-        match = next((camera for camera in cameras if camera.id == selector), None)
-        if match is None:
-            name_matches = [camera for camera in cameras if camera.name.casefold() == selector.strip().casefold()]
-            if len(name_matches) > 1:
-                message = f"camera name is ambiguous; use its ID: {selector}"
-                raise ValueError(message)
-            match = name_matches[0] if name_matches else None
-        if match is None:
-            message = f"camera does not exist: {selector}"
-            raise ValueError(message)
-        if all(existing.id != match.id for existing in selected):
-            selected.append(AutomationCamera(match.id, match.name))
-    return tuple(selected)
-
-
-def _print_automations(registry: AutomationRegistry, *, as_json: bool) -> None:
-    automations = registry.list()
-    if as_json:
-        payload = [
-            {
-                "id": item.id,
-                "name": item.name,
-                "status": item.status,
-                "camera_ids": [camera.id for camera in item.cameras],
-                "speed": item.speed,
-                "output_directory": item.output_directory,
-                "timezone": item.timezone,
-                "next_day": item.next_day.isoformat(),
-                "consecutive_failures": item.consecutive_failures,
-                "next_retry_at": item.next_retry_at.isoformat() if item.next_retry_at else None,
-                "last_error": item.last_error,
-                "connection": {"kind": item.connection.kind, "value": item.connection.value},
-            }
-            for item in automations
-        ]
-        _write_stdout(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
-        return
-    if not automations:
-        _write_stdout("No Daily Automations.\n")
-        return
-    for item in automations:
-        _write_stdout(f"{item.id}  {item.status:<8}  {item.name}  next {item.next_day.isoformat()}\n")
-
-
-def _discover_timezone(parser: argparse.ArgumentParser) -> str:
-    try:
-        return _local_timezone_name()
-    except Exception as exc:
-        parser.error(f"could not discover an IANA timezone; pass --timezone explicitly: {exc}")
-
-
-def _cli_registry_path() -> Path:
-    configured = os.environ.get(CLI_REGISTRY_ENV)
-    if configured:
-        return Path(configured).expanduser().resolve(strict=False)
-    return user_config_path("TimeLapse") / "cli-automations.json"
-
-
-def _local_timezone_name() -> str:
-    from tzlocal import get_localzone_name  # noqa: PLC0415
-
-    return get_localzone_name()
-
-
-def _print_progress(progress: DownloadProgress) -> None:
-    downloaded_mib = progress.downloaded_bytes / MEBIBYTE
-    if progress.total_bytes:
-        percent = min(progress.downloaded_bytes / progress.total_bytes * 100, 100.0)
-        _write_stdout(f"\rDownloaded {downloaded_mib:.1f} MiB ({percent:.1f}%)")
-    else:
-        _write_stdout(f"\rDownloaded {downloaded_mib:.1f} MiB")
-
-
-def _write_stdout(message: str) -> None:
-    sys.stdout.write(message)
-    sys.stdout.flush()
-
-
-def _write_stderr(message: str) -> None:
-    sys.stderr.write(message)
-    sys.stderr.flush()
-
-
-def main() -> int:
-    """Run the timelapse CLI."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
-    try:
-        return asyncio.run(_run())
     except KeyboardInterrupt:
-        _write_stderr("\nCancelled.\n")
+        print("\nCancelled.", file=sys.stderr)
         return 130
+    return 0

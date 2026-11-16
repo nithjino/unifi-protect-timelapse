@@ -1,317 +1,336 @@
-from __future__ import annotations
-
 import asyncio
-import base64
-import json
-from datetime import UTC, datetime, timedelta
+import enum
+import time
+from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, cast
 
+import jwt
 import pytest
-from uiprotect import ProtectApiClient
+from uiprotect.exceptions import NotAuthorized, NvrError
 
-import timelapse.protect as protect_module
-from timelapse import TimelapseError
-from timelapse.config import Config, ConnectionSettings
-from timelapse.protect import (
-    CameraInfo,
-    ProtectClients,
-    create_client,
-    load_cameras,
-    parse_connection,
-)
+from tests.fakes import CAMERA, MP4, FakeResponse
+from timelapse import OperationTimeoutError, RateLimitError, TimelapseError
+from timelapse.model import Connection, ExportRequest
+from timelapse.protect import Protect, RetryingClient, parse_url
 
-if TYPE_CHECKING:
-    from pathlib import Path
+URL = "https://protect.local/proxy/protect/integration/v1"
+CONNECTION = Connection(URL, "test-token", "test-user", "test-password")
+AT = datetime(2026, 7, 20, 8, tzinfo=UTC)
+REQUEST = ExportRequest(CAMERA, AT, AT.replace(hour=10), "600x")
 
 
-class _CameraClient:
-    def __init__(self, cameras: list[object]) -> None:
-        self.cameras = cameras
-
-    async def get_cameras_public(self) -> list[object]:
-        return self.cameras
-
-
-class _Response:
-    def __init__(self, status: int, headers: dict[str, str] | None = None) -> None:
-        self.status = status
-        self.headers = headers or {}
-        self.released = False
-
-    def release(self) -> None:
-        self.released = True
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://p:7443/proxy/protect/integration/v1", ("p", 7443, "/proxy/protect/api/video/export")),
+        ("https://protect.local/", ("protect.local", 443, "/proxy/protect/api/video/export")),
+        ("https://protect.local/custom/v1", ("protect.local", 443, "/custom/api/video/export")),
+        ("https://protect.local/custom", ("protect.local", 443, "/custom/api/video/export")),
+        ("https://h/a/integration/v1/b/integration/v1", ("h", 443, "/a/integration/v1/b/api/video/export")),
+    ],
+)  # fmt: skip
+def test_pr1_parse_url(url, expected):
+    assert parse_url(url) == expected
 
 
 @pytest.mark.parametrize(
     "url",
-    [
-        "http://protect.local",
-        "https://user:password@protect.local",  # trufflehog:ignore
-        "https://protect.local?token=secret",
-        "https://protect.local#fragment",
-        "https://protect.local:invalid",
-    ],
+    ["http://protect.local", "https://user:pw@protect.local", "https://h/?a=1", "https://h/#x", "https://h:99999"],
 )
-def test_parse_connection_rejects_unsafe_urls(url: str) -> None:
+def test_pr1_rejects_unsafe_urls(url):
     with pytest.raises(TimelapseError):
-        parse_connection(url)
+        parse_url(url)
 
 
-def test_parse_connection_builds_export_path() -> None:
-    connection = parse_connection("https://protect.local:7443/proxy/protect/integration/v1")
+def test_pr2_client_arguments_and_session_directory(tmp_path):
+    session_dir = tmp_path / "protect"
+    protect = Protect(Connection("https://h:7443", "test-token", "u", "p", verify_ssl=False), session_dir=session_dir)
+    client = protect.client
+    assert (client._host, client._port, client._username, client._password, client._api_key) == (
+        "h", 7443, "u", "p", "test-token"
+    )  # fmt: skip
+    assert (client._verify_ssl, client.config_dir, client.store_sessions, client._max_retries) == (
+        False, session_dir, True, 0
+    )  # fmt: skip
+    assert session_dir.stat().st_mode & 0o777 == 0o700
 
-    assert connection.host == "protect.local"
-    assert connection.port == 7443
-    assert connection.export_path == "/proxy/protect/api/video/export"
+
+class State(enum.Enum):
+    CONNECTED = "CONNECTED"
 
 
-def test_create_client_persists_sessions_and_bounds_library_retries(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    config = Config(
-        instance_url="https://protect.local",
-        token="test-token",  # noqa: S106
-        username="timelapse-user",
-        password="test-password",  # noqa: S106
-        verify_ssl=True,
-        speed="120x",
-        start=datetime(2026, 7, 11, tzinfo=UTC),
-        end=datetime(2026, 7, 12, tzinfo=UTC),
-        output=None,
-        request_timeout_seconds=3600,
-        max_download_mib=10240,
-    )
+class FakeClient:
+    def __init__(self) -> None:
+        self.logins = 0
+        self.events: list[str] = []
+        self.gate = asyncio.Event()
+        self.gate.set()
+        self.camera_items: list = []
+        self.camera_error: Exception | None = None
+        self.exact: object = b"exact-jpeg"
+        self.live: object = b"live-jpeg"
+        self.requests: list[dict] = []
+        self.login_error: Exception | None = None
+        self.last_retry_after: float | None = None
+        self.closed = False
 
-    sentinel = object()
-    received: list[tuple[str, int, dict[str, object]]] = []
+    async def ensure_authenticated(self) -> None:
+        self.logins += 1
+        self.events.append("login")
+        if self.login_error:
+            raise self.login_error
 
-    def fake_client(host: str, port: int, **kwargs: object) -> object:
-        received.append((host, port, kwargs))
-        return sentinel
+    async def get_cameras_public(self):
+        if self.camera_error:
+            raise self.camera_error
+        return self.camera_items
 
-    monkeypatch.setattr(protect_module, "_RetryingProtectApiClient", fake_client)
-    monkeypatch.setattr(protect_module, "_SESSION_DIRECTORY", tmp_path)
+    async def api_request_raw(self, url, **kwargs):
+        result = self.live if kwargs.get("public_api") else self.exact
+        self.events.append("live" if kwargs.get("public_api") else "exact")
+        if isinstance(result, Exception):
+            raise result
+        return result
 
-    client = create_client(config, parse_connection(config.instance_url))
+    async def request(self, method, path, **kwargs):
+        self.requests.append({"method": method, "path": path, **kwargs})
+        self.events.append("export")
+        await self.gate.wait()
+        return FakeResponse()
 
-    assert client is sentinel
-    assert received == [
-        (
-            "protect.local",
-            443,
-            {
-                "username": "timelapse-user",
-                "password": "test-password",
-                "api_key": "test-token",
-                "verify_ssl": True,
-                "config_dir": tmp_path,
-                "store_sessions": True,
-                "max_retries": 0,
-            },
-        )
+    async def close_session(self) -> None:
+        self.closed = True
+
+
+def fake_protect(**changes) -> tuple[Protect, FakeClient]:
+    client = FakeClient()
+    connection = Connection(URL, "test-token", "u", "p", **changes)
+    return Protect(connection, client=client, session_dir=Path("/nonexistent")), client
+
+
+def test_pr3_cameras_sorted_and_converted():
+    protect, client = fake_protect()
+    client.camera_items = [
+        SimpleNamespace(id="b", name="porch", state=State.CONNECTED, model="G4"),
+        SimpleNamespace(id="a", name="Porch", state=None, model=None),
+        SimpleNamespace(id="c", name=None, state=None, model=None),
     ]
+    cameras = asyncio.run(protect.cameras())
+    assert [(c.id, c.name, c.state, c.model) for c in cameras] == [
+        ("c", "c", None, None), ("a", "Porch", None, None), ("b", "porch", "CONNECTED", "G4")
+    ]  # fmt: skip
+    client.camera_error = NvrError("network down")
+    with pytest.raises(TimelapseError, match="Could not load cameras from UniFi Protect: network down"):
+        asyncio.run(protect.cameras())
 
 
-def test_session_scope_reuses_and_closes_one_client(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = Config(
-        instance_url="https://protect.local",
-        token="test-token",  # noqa: S106
-        username="timelapse-user",
-        password="test-password",  # noqa: S106
-        verify_ssl=True,
-        speed="120x",
-        start=datetime(2026, 7, 11, tzinfo=UTC),
-        end=datetime(2026, 7, 12, tzinfo=UTC),
-        output=None,
-        request_timeout_seconds=3600,
-        max_download_mib=10240,
-    )
-    created: list[object] = []
+def stub_transport(client: RetryingClient, statuses: list[tuple[int, dict]]) -> list[str]:
+    calls: list[str] = []
+    token = jwt.encode({"exp": int(time.time()) + 3600}, "k" * 32, algorithm="HS256")
 
-    class FakeClient:
-        closed = False
+    async def do_request(session, method, url, headers, **kwargs):
+        calls.append(method)
+        await asyncio.sleep(0)
+        if method == "post":
+            return FakeResponse(headers={"set-cookie": f"TOKEN={token}; Path=/", "x-csrf-token": "csrf"})
+        status, response_headers = statuses.pop(0) if statuses else (200, {"Content-Type": "video/mp4"})
+        return FakeResponse(MP4, status=status, headers=response_headers)
 
-        async def close_session(self) -> None:
-            self.closed = True
-
-    def fake_create(_config: Config, _connection: object) -> FakeClient:
-        client = FakeClient()
-        created.append(client)
-        return client
-
-    monkeypatch.setattr(protect_module, "create_client", fake_create)
-
-    async def exercise() -> tuple[object, object]:
-        connection = parse_connection(config.instance_url)
-        async with ProtectClients() as clients:
-            first = clients.get(config, connection)
-            second = clients.get(config, connection)
-            assert cast("FakeClient", first).closed is False
-        return first, second
-
-    first, second = asyncio.run(exercise())
-
-    assert first is second
-    assert created == [first]
-    assert cast("FakeClient", first).closed is True
+    client._do_request = do_request  # type: ignore[method-assign]
+    return calls
 
 
-def test_failed_client_cleanup_is_contained(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeClient:
-        async def close_session(self) -> None:
-            raise OSError
+def real_client(tmp_path: Path, sleeps: list[float]) -> RetryingClient:
+    async def sleep(seconds: float) -> None:
+        sleeps.append(seconds)
 
-    config = ConnectionSettings(
-        instance_url="https://protect.local",
-        token="test-token",  # noqa: S106
-        username="timelapse-user",
-        password="test-password",  # noqa: S106
-        verify_ssl=True,
-    )
-    monkeypatch.setattr(protect_module, "create_client", lambda _config, _connection: FakeClient())
-
-    async def exercise() -> None:
-        async with ProtectClients() as clients:
-            clients.get(config, parse_connection(config.instance_url))
-
-    asyncio.run(exercise())
-
-
-def _retrying_client(tmp_path: Path) -> protect_module._RetryingProtectApiClient:
-    return protect_module._RetryingProtectApiClient(
-        "protect.local",
-        443,
-        "user",
-        "password",
-        config_dir=tmp_path,
-        store_sessions=True,
-        max_retries=0,
-    )
+    return RetryingClient(
+        "h", 443, username="u", password="p", api_key="test-token", config_dir=tmp_path, max_retries=0,
+        sleep=sleep, jitter=lambda _a, _b: 0.0,
+    )  # fmt: skip
 
 
 @pytest.mark.parametrize(
-    ("responses", "expected_sleeps", "expected_retry_after"),
+    ("statuses", "expected_sleeps", "final_status", "recorded"),
     [
-        pytest.param([(429, {"Retry-After": "2"}), (200, {})], [2.0], None, id="short-retry-after-is-waited-out"),
-        pytest.param([(429, {"Retry-After": "900"})], [], 900, id="long-retry-after-goes-to-the-caller"),
-        pytest.param([(429, {})] * 4, [1.0, 2.0, 4.0], None, id="stops-after-four-attempts"),
+        ([(429, {"Retry-After": "2"}), (200, {})], [2.0], 200, None),
+        ([(429, {})] * 4, [1.0, 2.0, 4.0], 429, None),
+        ([(429, {"Retry-After": "900"})], [], 429, 900.0),
+        ([(503, {}), (408, {}), (200, {})], [1.0, 2.0], 200, None),
+        ([(429, {"Retry-After": "0"}), (404, {})], [0.1], 404, None),
     ],
 )
-def test_retry_layer_honors_retry_after_and_is_bounded(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    responses: list[tuple[int, dict[str, str]]],
-    expected_sleeps: list[float],
-    expected_retry_after: float | None,
-) -> None:
-    pending = [_Response(status, headers) for status, headers in responses]
+def test_pr4_retry_policy(tmp_path, statuses, expected_sleeps, final_status, recorded):
     sleeps: list[float] = []
 
-    async def fake_request(_client: object, *_args: object, **_kwargs: object) -> _Response:
-        return pending.pop(0)
-
-    async def fake_sleep(delay: float) -> None:
-        sleeps.append(delay)
-
-    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
-    monkeypatch.setattr(protect_module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(protect_module.random, "uniform", lambda _low, _high: 0.0)
-    client = _retrying_client(tmp_path)
-
-    response = asyncio.run(client.request("get", "/test", auto_close=False))
-
-    assert response.status == responses[-1][0]
-    assert not pending
-    assert sleeps == expected_sleeps
-    assert client.rate_limit_retry_after == expected_retry_after
-
-
-def _session_token() -> str:
-    def encode(value: dict[str, object]) -> str:
-        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
-
-    expires = int((datetime.now(UTC) + timedelta(days=1)).timestamp())
-    return f"{encode({'alg': 'HS256', 'typ': 'JWT'})}.{encode({'exp': expires})}.{encode({})}"
-
-
-def test_login_is_shared_and_reused_after_a_restart(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    logins = 0
-
-    async def fake_request(_client: object, _method: str, url: str, **_kwargs: object) -> _Response:
-        nonlocal logins
-        assert url == "/api/auth/login"
-        logins += 1
-        await asyncio.sleep(0)
-        return _Response(200, {"set-cookie": f"TOKEN={_session_token()}; Path=/", "x-csrf-token": "csrf"})
-
-    monkeypatch.setattr(ProtectApiClient, "request", fake_request)
-    monkeypatch.setattr(protect_module, "_SESSION_DIRECTORY", tmp_path)
-
-    async def exercise() -> None:
-        client = _retrying_client(tmp_path)
-        await asyncio.gather(*(client.ensure_authenticated() for _ in range(4)))
+    async def scenario():
+        client = real_client(tmp_path, sleeps)
+        stub_transport(client, list(statuses))
+        response = await client.request("get", "/x", auto_close=False)
         await client.close_session()
-        assert logins == 1
+        return response.status, client.last_retry_after
 
-        restarted = _retrying_client(tmp_path)
-        await restarted.ensure_authenticated()
-        await restarted.close_session()
-
-    asyncio.run(exercise())
-
-    assert logins == 1
+    assert asyncio.run(scenario()) == (final_status, recorded)
+    assert sleeps == expected_sleeps
 
 
-def test_export_and_thumbnail_slots_are_separate_per_console() -> None:
-    clients = ProtectClients()
-    connection = parse_connection("https://protect.local")
+def test_pr4_jitter_bounds(tmp_path):
+    seen: list[tuple[float, float]] = []
 
-    slots = clients.slots(connection)
+    async def scenario():
+        client = real_client(tmp_path, [])
+        client.jitter = lambda a, b: seen.append((a, b)) or b
+        stub_transport(client, [(500, {}), (429, {"Retry-After": "8"})])
+        await client.request("get", "/x")
+        await client.close_session()
 
-    assert slots is clients.slots(connection)
-    assert slots is not clients.slots(parse_connection("https://other.local"))
-    assert slots.exports is not slots.thumbnails
-    assert slots.exports._value == protect_module.EXPORT_SLOTS
-    assert slots.thumbnails._value == protect_module.THUMBNAIL_SLOTS
-
-
-def test_private_operation_authenticates_inside_its_slot() -> None:
-    slots = asyncio.Semaphore(1)
-
-    class FakeClient:
-        locked_during_login = False
-
-        async def ensure_authenticated(self) -> None:
-            self.locked_during_login = slots.locked()
-
-    client = FakeClient()
-
-    async def exercise() -> None:
-        async with protect_module.private_operation(slots, cast("ProtectApiClient", client), operation="test"):
-            assert slots.locked()
-
-    asyncio.run(exercise())
-
-    assert client.locked_during_login is True
-    assert slots.locked() is False
+    asyncio.run(scenario())
+    assert seen == [(-0.25, 0.25), (0, 2.0)]
 
 
-def test_load_cameras_returns_sorted_detached_camera_info() -> None:
-    client = cast(
-        "ProtectApiClient",
-        _CameraClient(
-            [
-                SimpleNamespace(id="camera-2", name="Zebra", state="CONNECTED", model="G5"),
-                SimpleNamespace(id="camera-1", name="alpha", state=None, model="G4"),
-            ]
-        ),
-    )
+def test_pr6_one_login_shared_and_reused(tmp_path):
+    async def scenario():
+        protect = Protect(CONNECTION, client=real_client(tmp_path, []), session_dir=tmp_path)
+        calls = stub_transport(protect.client, [])
+        await asyncio.gather(
+            protect.export(REQUEST, tmp_path / "a.mp4"),
+            protect.export(ExportRequest(CAMERA, AT, AT.replace(hour=11), "1x"), tmp_path / "b.mp4"),
+            protect.thumbnail(CAMERA, AT),
+            protect.thumbnail(CAMERA, AT),
+        )
+        await protect.thumbnail(CAMERA, AT)
+        await protect.close()
+        again = Protect(CONNECTION, client=real_client(tmp_path, []), session_dir=tmp_path)
+        again_calls = stub_transport(again.client, [])
+        await again.thumbnail(CAMERA, AT)
+        await again.close()
+        return calls.count("post"), again_calls.count("post")
 
-    cameras = asyncio.run(load_cameras(client))
+    assert asyncio.run(scenario()) == (1, 0)
+    assert (tmp_path / "unifi_protect.json").stat().st_mode & 0o777 == 0o600
 
-    assert cameras == [
-        CameraInfo(id="camera-1", name="alpha", state=None, model="G4"),
-        CameraInfo(id="camera-2", name="Zebra", state="CONNECTED", model="G5"),
+
+def test_pr5_rate_limit_messages():
+    protect, client = fake_protect()
+    client.login_error = NvrError("Request failed: /api/auth/login - Status: 429 - Reason: Too Many Requests")
+    client.last_retry_after = 120
+    with pytest.raises(RateLimitError) as caught:
+        asyncio.run(protect.export(REQUEST, Path("/nonexistent/out.mp4")))
+    assert "UniFi Protect returned HTTP 429 after bounded retries. Wait at least 120 seconds" in str(caught.value)
+    assert "do not rotate accounts or start repeated copies" in str(caught.value)
+    assert caught.value.retry_not_before is not None
+    client.last_retry_after = None
+    client.camera_error = NvrError("HTTP 429 from console")
+    with pytest.raises(RateLimitError, match="authentication rate-limit window clear") as caught:
+        asyncio.run(protect.cameras())
+    assert caught.value.retry_not_before is None
+    client.live = NvrError("too many requests")
+    with pytest.raises(RateLimitError):
+        asyncio.run(protect.thumbnail(CAMERA, AT))
+
+
+def test_pr7_separate_slots_and_login_after_slot(tmp_path):
+    protect, client = fake_protect()
+    client.gate.clear()
+
+    async def scenario():
+        exports = [asyncio.create_task(protect.export(REQUEST, tmp_path / f"{n}.mp4")) for n in range(3)]
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert client.events.count("export") == 2
+        assert client.logins == 2
+        assert await protect.thumbnail(CAMERA, AT) == (b"exact-jpeg", "exact")
+        client.gate.set()
+        await asyncio.gather(*exports)
+
+    asyncio.run(scenario())
+    assert client.logins == 4
+    params = client.requests[0]["params"]
+    assert params == {
+        "camera": "camera-1", "start": str(int(AT.timestamp() * 1000)),
+        "end": str(int(AT.replace(hour=10).timestamp() * 1000)), "channel": "0", "type": "timelapse", "fps": "40",
+    }  # fmt: skip
+    assert client.requests[0]["path"] == "/proxy/protect/api/video/export"
+    assert client.requests[0]["require_auth"] is True
+    assert client.requests[0]["timeout"] == 0
+
+
+def test_export_params_for_normal_speed(tmp_path):
+    protect, client = fake_protect()
+    asyncio.run(protect.export(ExportRequest(CAMERA, AT, AT.replace(hour=9), "1x"), tmp_path / "a.mp4"))
+    assert set(client.requests[0]["params"]) == {"camera", "start", "end", "channel"}
+
+
+@pytest.mark.parametrize(
+    ("exact", "live", "result"),
+    [
+        (NotAuthorized("no permission"), b"live-jpeg", (b"live-jpeg", "live")),
+        (b"", b"live-jpeg", (b"live-jpeg", "live")),
+        (b"exact-jpeg", NvrError("unused"), (b"exact-jpeg", "exact")),
+    ],
+)
+def test_pr8_thumbnail_fallback(exact, live, result):
+    protect, client = fake_protect()
+    client.exact, client.live = exact, live
+    assert asyncio.run(protect.thumbnail(CAMERA, AT)) == result
+
+
+def test_pr8_thumbnail_failure_names_camera():
+    protect, client = fake_protect()
+    client.exact, client.live = NvrError("a"), NvrError("b")
+    with pytest.raises(TimelapseError, match=r"Front Door.*readmedia/livestream"):
+        asyncio.run(protect.thumbnail(CAMERA, AT))
+
+
+def test_pr9_operation_deadline(tmp_path):
+    protect, client = fake_protect(timeout_seconds=0.01)
+    client.gate.clear()
+
+    async def hang(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    client.get_cameras_public = hang  # type: ignore[method-assign]
+    client.api_request_raw = hang  # type: ignore[method-assign]
+
+    async def scenario():
+        return await asyncio.gather(
+            protect.cameras(), protect.thumbnail(CAMERA, AT), protect.export(REQUEST, tmp_path / "a.mp4"),
+            return_exceptions=True,
+        )  # fmt: skip
+
+    errors = asyncio.run(scenario())
+    assert [str(error) for error in errors] == [
+        "Camera discovery exceeded the configured 0.01-second operation timeout.",
+        "Thumbnail request for Front Door exceeded the configured 0.01-second operation timeout.",
+        "Timelapse export for Front Door exceeded the configured 0.01-second operation timeout.",
     ]
+    assert all(isinstance(error, OperationTimeoutError) for error in errors)
+
+
+def test_pr10_close_is_bounded_and_quiet(caplog):
+    protect, client = fake_protect()
+    asyncio.run(protect.close())
+    assert client.closed
+
+    async def hang() -> None:
+        await asyncio.Event().wait()
+
+    client.close_session = hang  # type: ignore[method-assign]
+    protect.close_timeout = 0.01
+    asyncio.run(protect.close())
+
+    async def fail() -> None:
+        raise RuntimeError("boom")
+
+    client.close_session = fail  # type: ignore[method-assign]
+    asyncio.run(protect.close())
+    assert "Could not close" in caplog.text
+
+
+def test_d9_existing_output_refused_before_request(tmp_path):
+    protect, client = fake_protect()
+    (tmp_path / "a.mp4").write_bytes(MP4)
+    with pytest.raises(TimelapseError, match="refusing to overwrite"):
+        asyncio.run(protect.export(REQUEST, tmp_path / "a.mp4"))
+    assert client.requests == []

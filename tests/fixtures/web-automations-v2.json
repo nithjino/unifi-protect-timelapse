@@ -1,0 +1,52 @@
+{
+  "version": 2,
+  "automations": [
+    {
+      "id": "auto_81d31296ae0844fa8156c962c2111efd",
+      "name": "Plant",
+      "cameras": [{"id": "camera-1", "name": "Plant Cam"}],
+      "connection": {"kind": "web-environment", "value": "default"},
+      "speed": "600x",
+      "output_directory": "/data/exports",
+      "timezone": "America/New_York",
+      "created_at": "2026-08-23T12:00:00+00:00",
+      "status": "active",
+      "next_day": "2026-10-30",
+      "consecutive_failures": 0,
+      "next_retry_at": null,
+      "last_error": null,
+      "source_fingerprint": "abc123",
+      "imported_at": "2026-08-24T12:00:00+00:00"
+    },
+    {
+      "id": "auto_00000000000000000000000000000002",
+      "name": "Garage",
+      "cameras": [{"id": "camera-2", "name": "Garage Cam"}],
+      "connection": {"kind": "dotenv", "value": "/home/user/.env"},
+      "speed": "120x",
+      "output_directory": "/data/exports",
+      "timezone": "UTC",
+      "created_at": "2026-08-23T12:00:00+00:00",
+      "status": "paused",
+      "next_day": "2026-09-01",
+      "consecutive_failures": 5,
+      "next_retry_at": null,
+      "last_error": "1 Export Job(s) failed: Garage Cam: boom Paused after 5 attempts."
+    },
+    {
+      "id": "auto_00000000000000000000000000000003",
+      "name": "Old",
+      "cameras": [{"id": "camera-3", "name": "Old Cam"}],
+      "connection": {"kind": "python-profile", "value": "home"},
+      "speed": "60x",
+      "output_directory": "/data/exports",
+      "timezone": "UTC",
+      "created_at": "2026-08-23T12:00:00+00:00",
+      "status": "removing",
+      "next_day": "2026-09-01"
+    }
+  ],
+  "batches": [{"automation_id": "auto_81d31296ae0844fa8156c962c2111efd", "day": "2026-10-29"}],
+  "jobs": [],
+  "reexport_generations": {}
+}

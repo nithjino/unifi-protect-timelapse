@@ -24,29 +24,34 @@
           <small>Last Completed Day: {{ automation.last_completed_day | date }}</small>
           {% if automation.last_error %}<small class="schedule-error">{{ automation.last_error }}</small>{% endif %}
         </div>
-        {% if automation.status in ['paused', 'stopped'] %}
+        <div class="job-actions">
+          {% if automation.status in ['paused', 'stopped'] %}
+            <button
+              class="small-button primary"
+              type="button"
+              hx-post="/actions/automations/{{ automation.id }}/resume"
+              hx-target="#notifications"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this"
+            >{% if automation.status == 'stopped' %}Start{% else %}Resume{% endif %}</button>
+          {% elif automation.status == 'active' %}
+            <button
+              class="small-button"
+              type="button"
+              hx-post="/actions/automations/{{ automation.id }}/stop"
+              hx-target="#notifications"
+              hx-swap="innerHTML"
+              hx-disabled-elt="this"
+            >Stop</button>
+          {% endif %}
           <button
-            class="button button-secondary"
+            class="small-button danger"
             type="button"
-            hx-post="/actions/automations/{{ automation.id }}/resume"
-            hx-target="#message-region"
+            hx-delete="/actions/automations/{{ automation.id }}"
+            hx-target="#notifications"
             hx-swap="innerHTML"
-          >Resume</button>
-        {% else %}
-          <button
-            class="button button-secondary"
-            type="button"
-            hx-post="/actions/automations/{{ automation.id }}/stop"
-            hx-target="#message-region"
-            hx-swap="innerHTML"
-          >Stop</button>
-        {% endif %}
-        <button
-          class="small-button danger"
-          hx-delete="/actions/automations/{{ automation.id }}"
-          hx-target="#notifications"
-          hx-swap="innerHTML"
-        >Remove</button>
+          >Remove</button>
+        </div>
       </article>
     {% endfor %}
   </div>

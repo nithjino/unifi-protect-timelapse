@@ -1,0 +1,65 @@
+{
+  "jobs": [
+    {
+      "id": "Zk3v0Q1xYb7P",
+      "camera": {"id": "camera-1", "name": "Front Door", "state": "CONNECTED", "model": "G5 Pro"},
+      "start": "2026-07-20T08:00:00+00:00",
+      "end": "2026-07-20T10:00:00+00:00",
+      "speed": "120x",
+      "output_name": "timelapse_Front_Door_2026_07_20_08_00_00_2026_07_20_10_00_00_120x__6bf6f341d9a3.mp4",
+      "daily": false,
+      "full_day": false,
+      "status": "completed",
+      "downloaded_bytes": 0,
+      "total_bytes": null,
+      "bytes_per_second": 0.0,
+      "elapsed_seconds": 0.0,
+      "created_at": "2026-07-20T10:05:00+00:00",
+      "started_at": "2026-07-20T10:05:00+00:00",
+      "finished_at": "2026-07-20T10:06:00+00:00",
+      "error": null
+    },
+    {
+      "id": "batch:auto_81d31296ae0844fa8156c962c2111efd:2026-07-19:camera-1",
+      "camera": {"id": "camera-1", "name": "Front Door", "state": null, "model": null},
+      "start": "2026-07-19T00:00:00+00:00",
+      "end": "2026-07-20T00:00:00+00:00",
+      "speed": "600x",
+      "output_name": "timelapse_Front_Door_2026_07_19_2026_07_20_600x_6bf6f341d9a3.mp4",
+      "daily": true,
+      "status": "completed",
+      "created_at": "2026-07-20T00:00:05+00:00"
+    },
+    {
+      "id": "Running00001",
+      "camera": {"id": "camera-2", "name": "Yard", "state": null, "model": null},
+      "start": "2026-07-20T08:00:00+00:00",
+      "end": "2026-07-20T09:00:00+00:00",
+      "speed": "60x",
+      "output_name": "timelapse_Yard_2026_07_20_08_00_00_2026_07_20_09_00_00_60x__381fff0067f8.mp4",
+      "daily": false,
+      "full_day": false,
+      "status": "running",
+      "downloaded_bytes": 1024,
+      "total_bytes": 4096,
+      "bytes_per_second": 12.5,
+      "elapsed_seconds": 3.0,
+      "created_at": "2026-07-20T10:05:00+00:00",
+      "started_at": "2026-07-20T10:05:00+00:00",
+      "finished_at": null,
+      "error": null
+    },
+    {
+      "id": "Escape00001x",
+      "camera": {"id": "camera-2", "name": "Yard"},
+      "start": "2026-07-20T08:00:00+00:00",
+      "end": "2026-07-20T09:00:00+00:00",
+      "speed": "60x",
+      "output_name": "../web-jobs.json",
+      "daily": false,
+      "status": "completed",
+      "created_at": "2026-07-20T10:05:00+00:00"
+    },
+    {"id": "broken"}
+  ]
+}

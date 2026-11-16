@@ -1,805 +1,637 @@
-"""FastAPI web interface for centrally hosted TimeLapse exports."""
+"""The web dashboard: app factory, security, routes and ``main``."""
 
 from __future__ import annotations
 
-import asyncio
+import contextlib
 import hashlib
+import hmac
 import ipaddress
 import logging
-import os
+import math
 import secrets
-import shutil
-from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+import sys
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from time import monotonic
-from typing import TYPE_CHECKING, Annotated
-from urllib.parse import urlsplit
+from typing import Any
+from urllib.parse import quote, urlsplit
+from zoneinfo import ZoneInfo
 
-import uvicorn
-from dotenv import load_dotenv
-from fastapi import FastAPI, Query, Request
-from fastapi import Path as ApiPath
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    PlainTextResponse,
-    RedirectResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from starlette.templating import Jinja2Templates
-
-from timelapse import OperationTimeoutError, TimelapseError, __version__
-from timelapse.config import SPEED_TO_FPS
-from timelapse.download import format_bytes
-from timelapse.web_state import ExportJob, WebCapacityError, WebSettings, WebState
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
-    from types import FrameType
-
-    from starlette.datastructures import FormData
-
-    from timelapse.automation_registry import DailyAutomation
-
-PACKAGE_DIR = Path(__file__).resolve().parent
-TEMPLATES_DIR = PACKAGE_DIR / "templates"
-STATIC_DIR = PACKAGE_DIR / "static"
-APP_CSS_VERSION = hashlib.sha256((STATIC_DIR / "app.css").read_bytes()).hexdigest()[:12]
-SSE_KEEPALIVE_TICKS = 30
-GRACEFUL_SHUTDOWN_SECONDS = 1
-SECONDS_PER_HOUR = 60 * 60
-SESSION_COOKIE = "timelapse_session"
-LOGIN_FAILURE_LIMIT = 5
-LOGIN_FAILURE_WINDOW_SECONDS = 60.0
-LOW_STORAGE_PERCENT = 20
-# Registry IDs include automation prefixes and composite batch/camera identifiers.
-JOB_ID = Annotated[str, ApiPath(min_length=8)]
-SCHEDULE_ID = Annotated[str, ApiPath(min_length=8)]
-TIMESTAMP_QUERY = Annotated[str, Query(min_length=10, max_length=40)]
-NEXT_QUERY = Annotated[str | None, Query(alias="next")]
-_LOGGER = logging.getLogger(__name__)
-
-load_dotenv(override=False)
-
-
-@dataclass(frozen=True)
-class _StorageInfo:
-    """Available capacity on the filesystem used for web exports."""
-
-    free_bytes: int | None
-    total_bytes: int | None
-    free_percent: float | None
-
-    @property
-    def low(self) -> bool:
-        """Return whether less than 20 percent of the filesystem is free."""
-        return self.free_percent is not None and self.free_percent < LOW_STORAGE_PERCENT
-
-
-class _ShutdownAwareServer(uvicorn.Server):
-    """Notify application streams before Uvicorn drains connections."""
-
-    def __init__(self, config: uvicorn.Config, shutdown_requested: asyncio.Event) -> None:
-        super().__init__(config)
-        self._shutdown_requested = shutdown_requested
-
-    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
-        self._shutdown_requested.set()
-        super().handle_exit(sig, frame)
-
-
-def _storage_info(path: Path) -> _StorageInfo:
-    try:
-        usage = shutil.disk_usage(path)
-    except OSError:
-        _LOGGER.warning("Could not measure available storage for %s", path, exc_info=True)
-        return _StorageInfo(free_bytes=None, total_bytes=None, free_percent=None)
-    free_percent = usage.free / usage.total * 100 if usage.total else None
-    return _StorageInfo(free_bytes=usage.free, total_bytes=usage.total, free_percent=free_percent)
-
-
-def _format_datetime(value: datetime | None, settings: WebSettings) -> str:
-    if value is None:
-        return "—"
-    local = settings.localize(value)
-    return f"{local:%b} {local.day}, {local:%Y} · {local.strftime('%I').lstrip('0')}:{local:%M %p}"
-
-
-def _format_date(value: date | None) -> str:
-    return "Not Run Yet" if value is None else f"{value:%b} {value.day}, {value:%Y}"
-
-
-def _job_status(job: ExportJob) -> str:
-    if job.status == "queued" and job.error:
-        return "Queued — Rate Limited"
-    labels = {
-        "queued": "Queued",
-        "running": "Exporting",
-        "completed": "Ready",
-        "failed": "Failed",
-        "cancelled": "Cancelled",
-    }
-    return labels[job.status]
-
-
-def _schedule_next_run(schedule: DailyAutomation, settings: WebSettings) -> str:
-    if schedule.status == "paused":
-        return "paused"
-    if schedule.status == "stopped":
-        return "stopped"
-    if schedule.next_retry_at is not None:
-        return _format_datetime(schedule.next_retry_at, settings)
-    now = settings.now()
-    tomorrow = settings.day_bounds(now.date())[1]
-    hour = tomorrow.strftime("%I").lstrip("0")
-    return f"{tomorrow:%b} {tomorrow.day} at {hour}:{tomorrow:%M %p %Z}"
-
-
-class _SessionStore:
-    """Keep opaque browser sessions in server memory."""
-
-    def __init__(self, lifetime_seconds: int) -> None:
-        self._lifetime_seconds = lifetime_seconds
-        self._sessions: dict[str, float] = {}
-
-    def create(self) -> str:
-        """Create and retain a new opaque session token."""
-        self._prune()
-        token = secrets.token_urlsafe(32)
-        self._sessions[self._digest(token)] = monotonic() + self._lifetime_seconds
-        return token
-
-    def valid(self, token: str | None) -> bool:
-        """Return whether a token exists and has not expired."""
-        if not token:
-            return False
-        expires_at = self._sessions.get(self._digest(token))
-        if expires_at is None:
-            return False
-        if expires_at <= monotonic():
-            self.revoke(token)
-            return False
-        return True
-
-    def revoke(self, token: str | None) -> None:
-        """Remove a browser session if it exists."""
-        if token:
-            self._sessions.pop(self._digest(token), None)
-
-    def _prune(self) -> None:
-        now = monotonic()
-        self._sessions = {digest: expires_at for digest, expires_at in self._sessions.items() if expires_at > now}
-
-    @staticmethod
-    def _digest(token: str) -> str:
-        return hashlib.sha256(token.encode()).hexdigest()
-
-
-class _LoginThrottle:
-    """Apply a small per-client delay after repeated login failures."""
-
-    def __init__(self) -> None:
-        self._failures: dict[str, list[float]] = {}
-
-    def retry_after(self, client: str) -> int:
-        """Return seconds before another attempt, or zero when allowed."""
-        failures = self._recent_failures(client)
-        if len(failures) < LOGIN_FAILURE_LIMIT:
-            return 0
-        return max(round(LOGIN_FAILURE_WINDOW_SECONDS - (monotonic() - failures[0])), 1)
-
-    def failed(self, client: str) -> None:
-        """Record one rejected login."""
-        failures = self._recent_failures(client)
-        failures.append(monotonic())
-        self._failures[client] = failures
-
-    def clear(self, client: str) -> None:
-        """Clear failures after a successful login."""
-        self._failures.pop(client, None)
-
-    def _recent_failures(self, client: str) -> list[float]:
-        cutoff = monotonic() - LOGIN_FAILURE_WINDOW_SECONDS
-        failures = [attempt for attempt in self._failures.get(client, []) if attempt > cutoff]
-        self._failures[client] = failures
-        return failures
-
-
-def _safe_return_path(value: str | None) -> str:
-    if not value or not value.startswith("/") or value.startswith("//"):
-        return "/"
-    parsed = urlsplit(value)
-    return "/" if parsed.scheme or parsed.netloc else value
-
-
-def _client_key(request: Request) -> str:
-    return request.client.host if request.client is not None else "unknown"
-
-
-def _is_same_origin(request: Request, trusted_hosts: frozenset[str]) -> bool:
-    fetch_site = request.headers.get("Sec-Fetch-Site", "").casefold()
-    if fetch_site == "same-origin":
-        return True
-    if fetch_site in {"cross-site", "same-site"}:
-        return False
-    origin = request.headers.get("Origin")
-    if not origin:
-        return True
-    actual = _normalized_origin(origin)
-    if actual is None or actual[1] not in trusted_hosts:
-        return False
-    expected = _origin_from_parts(request.url.scheme, request.headers.get("Host"))
-    return actual == expected
-
-
-def _normalized_origin(value: str) -> tuple[str, str, int | None] | None:
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
-        return None
-    try:
-        port = parsed.port
-    except ValueError:
-        return None
-    default_port = 80 if parsed.scheme == "http" else 443
-    return parsed.scheme, parsed.hostname.casefold(), None if port in {None, default_port} else port
-
-
-def _origin_from_parts(scheme: str, host: str | None) -> tuple[str, str, int | None] | None:
-    if not scheme or not host:
-        return None
-    return _normalized_origin(f"{scheme}://{host}")
-
-
-def _hostname(value: str | None) -> str | None:
-    if not value:
-        return None
-    try:
-        parsed = urlsplit(f"//{value}")
-        _ = parsed.port
-    except ValueError:
-        return None
-    return parsed.hostname.casefold() if parsed.hostname else None
-
-
-def _trusted_hosts(settings: WebSettings) -> frozenset[str]:
-    hosts = {"localhost", "127.0.0.1", "::1"}
-    hosts.update(filter(None, (_hostname(host) for host in settings.web_trusted_hosts)))
-    configured_host = _hostname(settings.web_host)
-    if configured_host is not None and configured_host not in {
-        "0.0.0.0",  # noqa: S104 - wildcard bind value is intentionally excluded from trusted hosts
-        "::",
-    }:
-        hosts.add(configured_host)
-    return frozenset(hosts)
-
-
-def _is_loopback_client(request: Request) -> bool:
-    if request.client is None:
-        return False
-    return _is_loopback_host(request.client.host)
-
-
-def _add_security_headers(response: Response) -> Response:
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; "
-        "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
-    )
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["X-Frame-Options"] = "DENY"
-    return response
-
-
-def _form_values(form: FormData, name: str) -> list[str]:
-    return [str(value) for value in form.getlist(name) if str(value)]
-
-
-def _required_form_value(form: FormData, name: str, label: str) -> str:
-    value = str(form.get(name, "")).strip()
-    if not value:
-        message = f"{label} is required."
-        raise ValueError(message)
-    return value
-
-
-def _parse_local_datetime(raw: str, label: str, settings: WebSettings) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(raw)
-    except ValueError as exc:
-        message = f"{label} must be a valid date and time."
-        raise ValueError(message) from exc
-    return settings.localize(parsed)
-
-
-def _parse_export_range(form: FormData, settings: WebSettings) -> tuple[datetime, datetime, bool]:
-    mode = str(form.get("range_mode", "full-day"))
-    if mode == "full-day":
-        raw = _required_form_value(form, "day", "Export date")
-        try:
-            selected_day = date.fromisoformat(raw)
-        except ValueError as exc:
-            message = "Export date must be a valid calendar date."
-            raise ValueError(message) from exc
-        start, end = settings.day_bounds(selected_day)
-        return start, end, True
-    if mode != "exact":
-        message = "Choose a full day or an exact time range."
-        raise ValueError(message)
-    start = _parse_local_datetime(_required_form_value(form, "start", "Start time"), "Start time", settings)
-    end = _parse_local_datetime(_required_form_value(form, "end", "End time"), "End time", settings)
-    if end <= start:
-        message = "End time must be after start time."
-        raise ValueError(message)
-    return start, end, False
-
-
-def _parse_speed(form: FormData) -> str:
-    speed = str(form.get("speed", "600x"))
-    if speed not in SPEED_TO_FPS:
-        message = "Choose a supported timelapse speed."
-        raise ValueError(message)
-    return speed
-
-
-def create_app(  # noqa: C901, PLR0915 - route construction stays together for dependency closure
-    settings: WebSettings | None = None,
-    *,
-    state: WebState | None = None,
-) -> FastAPI:
-    """Build an application, allowing isolated state injection in tests."""
-    configured_settings = settings or WebSettings.from_environment()
-    web_state = state or WebState(configured_settings)
-    shutdown_requested = asyncio.Event()
-    session_seconds = configured_settings.web_session_hours * SECONDS_PER_HOUR
-    sessions = _SessionStore(session_seconds)
-    login_throttle = _LoginThrottle()
-    trusted_hosts = _trusted_hosts(configured_settings)
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        if configured_settings.web_password is None and not _is_loopback_host(configured_settings.web_host):
-            message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
-            raise RuntimeError(message)
-        await web_state.start()
-        try:
-            yield
-        finally:
-            await web_state.close()
-
-    application = FastAPI(
-        title="TimeLapse Web",
-        summary="Create UniFi Protect timelapses from a local web interface.",
-        docs_url=None,
-        redoc_url=None,
-        lifespan=lifespan,
-    )
-    application.state.web = web_state
-    application.state.sessions = sessions
-    application.state.shutdown_requested = shutdown_requested
-    application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
-
-    templates = Jinja2Templates(directory=TEMPLATES_DIR)
-    templates.env.filters["bytes"] = format_bytes
-    templates.env.filters["datetime"] = lambda value: _format_datetime(value, configured_settings)
-    templates.env.filters["date"] = _format_date
-    templates.env.filters["job_status"] = _job_status
-    templates.env.filters["next_run"] = lambda schedule: _schedule_next_run(schedule, configured_settings)
-    templates.env.globals["timelapse_version"] = __version__
-    templates.env.globals["app_css_version"] = APP_CSS_VERSION
-
-    @application.middleware("http")
-    async def identify_and_log_requests(
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        request_id = secrets.token_hex(8)
-        request.state.request_id = request_id
-        try:
-            response = await call_next(request)
-        except Exception:
-            _LOGGER.exception(
-                "Unhandled web request failure: request_id=%s method=%s path=%s",
-                request_id,
-                request.method,
-                request.url.path,
-            )
-            return PlainTextResponse(
-                f"Internal server error. Request ID: {request_id}",
-                status_code=500,
-                headers={"X-Request-ID": request_id},
-            )
-        response.headers["X-Request-ID"] = request_id
-        return response
-
-    @application.middleware("http")
-    async def require_web_authentication(  # noqa: PLR0911 - ordered security exits keep the boundary explicit
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        if _hostname(request.headers.get("Host")) not in trusted_hosts:
-            return _add_security_headers(PlainTextResponse("Untrusted host", status_code=400))
-        if configured_settings.web_password is None and not _is_loopback_client(request):
-            return _add_security_headers(PlainTextResponse("Passwordless access is local-only", status_code=403))
-        public = request.url.path in {"/healthz", "/login"} or request.url.path.startswith("/static/")
-        unsafe_request = request.method not in {"GET", "HEAD", "OPTIONS"}
-        if unsafe_request and request.url.path != "/login" and not _is_same_origin(request, trusted_hosts):
-            return _add_security_headers(PlainTextResponse("Cross-origin request rejected", status_code=403))
-        if public or configured_settings.web_password is None:
-            return _add_security_headers(await call_next(request))
-        if not sessions.valid(request.cookies.get(SESSION_COOKIE)):
-            login_url = "/login?next=%2F"
-            if request.headers.get("HX-Request") == "true" or request.url.path.startswith("/api/"):
-                return _add_security_headers(
-                    PlainTextResponse("Login required", status_code=401, headers={"HX-Redirect": login_url})
-                )
-            return _add_security_headers(RedirectResponse(login_url, status_code=303))
-        return _add_security_headers(await call_next(request))
-
-    def message_response(
-        request: Request,
-        message: str,
-        *,
-        kind: str = "success",
-        status_code: int = 200,
-    ) -> HTMLResponse:
-        response = templates.TemplateResponse(
-            request=request,
-            name="partials/message.html",
-            context={"message": message, "kind": kind},
-            status_code=status_code,
-        )
-        response.headers["HX-Trigger"] = "stateChanged"
-        return response
-
-    def login_response(
-        request: Request,
-        *,
-        next_path: str,
-        error: str | None = None,
-        status_code: int = 200,
-    ) -> HTMLResponse:
-        response = templates.TemplateResponse(
-            request=request,
-            name="login.html",
-            context={
-                "error": error,
-                "next_path": next_path,
-                "web_username": configured_settings.web_username,
-            },
-            status_code=status_code,
-        )
-        response.headers["Cache-Control"] = "no-store"
-        return response
-
-    @application.get("/login", response_class=HTMLResponse)
-    async def login_page(request: Request, next_path: NEXT_QUERY = None) -> Response:
-        destination = _safe_return_path(next_path)
-        if configured_settings.web_password is None or sessions.valid(request.cookies.get(SESSION_COOKIE)):
-            return RedirectResponse(destination, status_code=303)
-        return login_response(request, next_path=destination)
-
-    @application.post("/login", response_class=HTMLResponse)
-    async def log_in(request: Request) -> Response:
-        if configured_settings.web_password is None:
-            return RedirectResponse("/", status_code=303)
-        form = await request.form()
-        destination = _safe_return_path(str(form.get("next", "/")))
-        client = _client_key(request)
-        retry_after = login_throttle.retry_after(client)
-        if retry_after:
-            message = f"Too many failed attempts. Try again in {retry_after} seconds."
-            response = login_response(request, next_path=destination, error=message, status_code=429)
-            response.headers["Retry-After"] = str(retry_after)
-            return response
-        username = str(form.get("username", ""))
-        password = str(form.get("password", ""))
-        username_valid = secrets.compare_digest(username, configured_settings.web_username)
-        password_valid = secrets.compare_digest(password, configured_settings.web_password)
-        valid = username_valid and password_valid
-        if not valid:
-            login_throttle.failed(client)
-            return login_response(
-                request,
-                next_path=destination,
-                error="The username or password is incorrect.",
-                status_code=401,
-            )
-        login_throttle.clear(client)
-        token = sessions.create()
-        response = RedirectResponse(destination, status_code=303)
-        response.set_cookie(
-            SESSION_COOKIE,
-            token,
-            max_age=session_seconds,
-            httponly=True,
-            secure=configured_settings.web_cookie_secure or request.url.scheme == "https",
-            samesite="strict",
-            path="/",
-        )
-        return response
-
-    @application.post("/logout")
-    async def log_out(request: Request) -> Response:
-        sessions.revoke(request.cookies.get(SESSION_COOKIE))
-        response = RedirectResponse("/login", status_code=303)
-        response.delete_cookie(SESSION_COOKIE, path="/")
-        return response
-
-    @application.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> Response:
-        now = configured_settings.now()
-        return templates.TemplateResponse(
-            request=request,
-            name="index.html",
-            context={
-                "speeds": SPEED_TO_FPS,
-                "timezone_name": configured_settings.timezone_name,
-                "yesterday": (now.date() - timedelta(days=1)).isoformat(),
-                "today": now.date().isoformat(),
-                "now_local": now.strftime("%Y-%m-%dT%H:%M"),
-                "day_ago_local": (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M"),
-                "authentication_enabled": configured_settings.web_password is not None,
-                "web_username": configured_settings.web_username,
-            },
-        )
-
-    @application.get("/healthz")
-    async def health() -> dict[str, object]:
-        return {
-            "status": "healthy",
-            "connection_configured": configured_settings.connection_ready,
-            "active_jobs": sum(not job.terminal for job in web_state.jobs.values()),
-        }
-
-    @application.get("/partials/status", response_class=HTMLResponse)
-    async def connection_status(request: Request) -> Response:
-        active_jobs = sum(not job.terminal for job in web_state.jobs.values())
-        storage = await asyncio.to_thread(_storage_info, configured_settings.output_dir)
-        return templates.TemplateResponse(
-            request=request,
-            name="partials/status.html",
-            context={"settings": configured_settings, "active_jobs": active_jobs, "storage": storage},
-        )
-
-    @application.get("/partials/cameras", response_class=HTMLResponse)
-    async def cameras(
-        request: Request,
-        refresh: Annotated[bool, Query()] = False,  # noqa: FBT002 - boolean query parameter
-    ) -> Response:
-        camera_error = None
-        status_code = 200
-        loaded_cameras = []
-        try:
-            loaded_cameras = await web_state.cameras(refresh=refresh)
-        except OperationTimeoutError as exc:
-            camera_error = str(exc)
-            status_code = 504
-        except TimelapseError as exc:
-            camera_error = str(exc) or type(exc).__name__
-            status_code = 502
-        except ValueError as exc:
-            camera_error = str(exc)
-            status_code = 400
-        return templates.TemplateResponse(
-            request=request,
-            name="partials/cameras.html",
-            context={"cameras": loaded_cameras, "camera_error": camera_error},
-            status_code=status_code,
-        )
-
-    @application.get("/partials/jobs", response_class=HTMLResponse)
-    async def jobs(request: Request) -> Response:
-        ordered_jobs = sorted(web_state.jobs.values(), key=lambda job: job.created_at, reverse=True)
-        return templates.TemplateResponse(
-            request=request,
-            name="partials/jobs.html",
-            context={"jobs": ordered_jobs, "unlisted_exports": await web_state.unlisted_exports()},
-        )
-
-    @application.get("/partials/automations", response_class=HTMLResponse)
-    async def automations(request: Request) -> Response:
-        ordered_automations = sorted(web_state.automations.values(), key=lambda item: item.created_at, reverse=True)
-        return templates.TemplateResponse(
-            request=request,
-            name="partials/automations.html",
-            context={"automations": ordered_automations},
-        )
-
-    @application.post("/actions/export", response_class=HTMLResponse)
-    async def create_export(request: Request) -> Response:
-        try:
-            form = await request.form()
-            camera_ids = _form_values(form, "camera_ids")
-            start, end, full_day = _parse_export_range(form, configured_settings)
-            speed = _parse_speed(form)
-            created = await web_state.create_jobs(camera_ids, start, end, speed, full_day=full_day)
-        except WebCapacityError as exc:
-            return message_response(request, str(exc), kind="error", status_code=429)
-        except OperationTimeoutError as exc:
-            return message_response(request, str(exc), kind="error", status_code=504)
-        except TimelapseError as exc:
-            return message_response(request, str(exc), kind="error", status_code=502)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=400)
-        noun = "export" if len(created) == 1 else "exports"
-        return message_response(request, f"Started {len(created)} {noun}.")
-
-    @application.post("/actions/automations", response_class=HTMLResponse)
-    async def create_daily_automation(request: Request) -> Response:
-        try:
-            form = await request.form()
-            name = _required_form_value(form, "automation_name", "Automation name")
-            camera_ids = _form_values(form, "camera_ids")
-            speed = _parse_speed(form)
-            automation = await web_state.create_automation(name, camera_ids, speed)
-        except OperationTimeoutError as exc:
-            return message_response(request, str(exc), kind="error", status_code=504)
-        except TimelapseError as exc:
-            return message_response(request, str(exc), kind="error", status_code=502)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=400)
-        count = len(automation.cameras)
-        noun = "camera" if count == 1 else "cameras"
-        return message_response(request, f"Created Daily Automation for {count} {noun}.")
-
-    @application.delete("/actions/jobs/{job_id}", response_class=HTMLResponse)
-    async def cancel_or_remove_job(request: Request, job_id: JOB_ID) -> Response:
-        try:
-            action = await web_state.cancel_or_remove_job(job_id)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=404)
-        message = "Cancellation requested." if action == "cancelled" else "Export deleted."
-        return message_response(request, message)
-
-    @application.delete("/actions/files/{name}", response_class=HTMLResponse)
-    async def delete_unlisted_export(request: Request, name: str) -> Response:
-        try:
-            await web_state.remove_unlisted_export(name)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=404)
-        return message_response(request, "Export deleted.")
-
-    @application.post("/actions/jobs/{job_id}/retry", response_class=HTMLResponse)
-    async def retry_job(request: Request, job_id: JOB_ID) -> Response:
-        try:
-            await web_state.retry_job(job_id)
-        except WebCapacityError as exc:
-            return message_response(request, str(exc), kind="error", status_code=429)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=400)
-        return message_response(request, "Export queued again.")
-
-    @application.post("/actions/automations/{automation_id}/resume", response_class=HTMLResponse)
-    async def resume_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
-        try:
-            await web_state.resume_automation(automation_id)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=400)
-        return message_response(request, "Daily Automation resumed.")
-
-    @application.post("/actions/automations/{automation_id}/stop", response_class=HTMLResponse)
-    async def stop_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
-        try:
-            await web_state.stop_automation(automation_id)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=404)
-        return message_response(request, "Daily Automation stopped.")
-
-    @application.delete("/actions/automations/{automation_id}", response_class=HTMLResponse)
-    async def remove_automation(request: Request, automation_id: SCHEDULE_ID) -> Response:
-        try:
-            await web_state.remove_automation(automation_id)
-        except ValueError as exc:
-            return message_response(request, str(exc), kind="error", status_code=404)
-        return message_response(request, "Daily Automation removed. Existing artifacts were kept.")
-
-    @application.get("/api/thumbnails/{camera_id}")
-    async def thumbnail(camera_id: str, timestamp: TIMESTAMP_QUERY) -> Response:
-        try:
-            requested_time = _parse_local_datetime(timestamp, "Preview time", configured_settings)
-            result = await web_state.thumbnail(camera_id, requested_time)
-        except OperationTimeoutError as exc:
-            return PlainTextResponse(str(exc), status_code=504)
-        except TimelapseError as exc:
-            return PlainTextResponse(str(exc), status_code=502)
-        except ValueError as exc:
-            return PlainTextResponse(str(exc), status_code=400)
-        return Response(
-            content=result.image,
-            media_type="image/jpeg",
-            headers={"X-TimeLapse-Thumbnail-Source": result.source, "Cache-Control": "no-store"},
-        )
-
-    @application.get("/api/events")
-    async def events(request: Request) -> StreamingResponse:
-        async def stream() -> AsyncIterator[str]:
-            last_version = -1
-            idle_ticks = 0
-            while not shutdown_requested.is_set() and not await request.is_disconnected():
-                if web_state.version != last_version:
-                    last_version = web_state.version
-                    idle_ticks = 0
-                    yield f"event: state\ndata: {last_version}\n\n"
-                elif idle_ticks >= SSE_KEEPALIVE_TICKS:
-                    idle_ticks = 0
-                    yield ": keep-alive\n\n"
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(shutdown_requested.wait(), timeout=0.5)
-                idle_ticks += 1
-
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
-
-    def export_file(job_id: str, *, attachment: bool) -> Response:
-        job = web_state.jobs.get(job_id)
-        if job is None or job.status != "completed" or not job.output.is_file():
-            return PlainTextResponse("Export is not available.", status_code=404)
-        return FileResponse(job.output, media_type="video/mp4", filename=job.output.name if attachment else None)
-
-    async def unlisted_file(name: str, *, attachment: bool) -> Response:
-        path = await web_state.unlisted_export_path(name)
-        if path is None:
-            return PlainTextResponse("Export is not available.", status_code=404)
-        return FileResponse(path, media_type="video/mp4", filename=name if attachment else None)
-
-    @application.get("/files/{name}")
-    async def download_unlisted_export(name: str) -> Response:
-        return await unlisted_file(name, attachment=True)
-
-    @application.get("/files/{name}/play")
-    async def play_unlisted_export(name: str) -> Response:
-        return await unlisted_file(name, attachment=False)
-
-    @application.get("/exports/{job_id}")
-    async def download_export(job_id: JOB_ID) -> Response:
-        return export_file(job_id, attachment=True)
-
-    @application.get("/exports/{job_id}/play")
-    async def play_export(job_id: JOB_ID) -> Response:
-        return export_file(job_id, attachment=False)
-
-    return application
-
-
-app = create_app()
-
-
-def main() -> None:
-    """Run the web server using environment-backed host and port settings."""
-    settings = WebSettings.from_environment()
-    host = settings.web_host
-    if not _is_loopback_host(host) and settings.web_password is None:
-        message = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
-        raise SystemExit(message)
-    config = uvicorn.Config(
-        "timelapse.web:app",
-        host=host,
-        port=_environment_port(),
-        proxy_headers=True,
-        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECONDS,
-    )
-    with suppress(KeyboardInterrupt):
-        _ShutdownAwareServer(config, app.state.shutdown_requested).run()
-
-
-def _environment_port() -> int:
-    try:
-        return int(os.environ.get("TIMELAPSE_WEB_PORT", "8000"))
-    except ValueError:
-        return 8000
-
-
-def _is_loopback_host(host: str) -> bool:
-    if host.casefold() == "localhost":
+from fastapi.templating import Jinja2Templates
+
+from timelapse import (
+    CapacityError,
+    ConflictError,
+    InvalidRequestError,
+    NotFoundError,
+    OperationTimeoutError,
+    TimelapseError,
+    __version__,
+)
+from timelapse.daily import DailyRunner, export_run
+from timelapse.jobs import JobQueue
+from timelapse.model import SPEEDS, Camera, ExportRequest, day_bounds, format_bytes
+from timelapse.protect import Protect
+from timelapse.registry import Automation, Registry
+from timelapse.settings import Settings
+from timelapse.storage import MIB, ExportFolder, ensure_writable
+
+LOGGER = logging.getLogger(__name__)
+PACKAGE = Path(__file__).parent
+COOKIE = "timelapse_session"
+LOOPBACK_NAMES = {"localhost", "127.0.0.1", "::1"}
+SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+PUBLIC_PATHS = {"/healthz", "/login"}
+MAX_FAILURES, FAILURE_WINDOW = 5, 60.0
+CAMERA_CACHE_SECONDS = 60.0
+NETWORK_ACCESS_ERROR = "TIMELAPSE_WEB_PASSWORD is required when the web server is accessible over the network."
+WEB_CONNECTION = ("web-environment", "default")
+STATUS_LABELS = {"running": "Exporting", "completed": "Ready", "failed": "Failed", "cancelled": "Cancelled"}
+SECURITY_HEADERS = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+    "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; "
+    "connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+}
+
+
+def http_status(error: Exception) -> int:
+    """Map the error hierarchy to an HTTP status."""
+    for kind, status in (
+        (NotFoundError, 404),
+        (ConflictError, 409),
+        (CapacityError, 429),
+        (InvalidRequestError, 400),
+        (OperationTimeoutError, 504),
+    ):
+        if isinstance(error, kind):
+            return status
+    return 502
+
+
+def is_loopback(host: str) -> bool:
+    """Return whether ``host`` names this machine only."""
+    host = host.strip("[]").lower()
+    if host in LOOPBACK_NAMES:
         return True
     try:
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def split_host(value: str, scheme: str) -> tuple[str, int] | None:
+    """Split a Host header into hostname and port, with the scheme's default port."""
+    try:
+        parts = urlsplit(f"//{value}")
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname:
+        return None
+    return parts.hostname.lower(), port or (443 if scheme == "https" else 80)
+
+
+def safe_next(value: str | None) -> str:
+    """Accept only a local absolute path as a redirect target."""
+    if not value or not value.startswith("/") or value.startswith("//") or "\\" in value:
+        return "/"
+    parts = urlsplit(value)
+    return "/" if parts.scheme or parts.netloc else value
+
+
+def _format_time(value: datetime) -> str:
+    return f"{value:%b} {value.day}, {value.year} · {value.hour % 12 or 12}:{value:%M %p}"
+
+
+class Dashboard:
+    """Everything one web server process owns."""
+
+    def __init__(self, settings: Settings, protect: Any) -> None:
+        self.settings = settings
+        self.protect = protect
+        self.queue = JobQueue(
+            max_active=settings.max_active_exports, history=settings.data_dir / "web-jobs.json", limit=100
+        )
+        self.registry = Registry(settings.data_dir / "web-automations.json")
+        self.folder = ExportFolder(
+            settings.output_dir, quota_mib=settings.storage_quota_mib, retention_days=settings.retention_days
+        )
+        self.runner = DailyRunner(self.registry, self.queue, connect=self.connect, storage_problem=self.daily_problem)
+        self.sessions: dict[str, float] = {}
+        self.failures: dict[str, list[float]] = {}
+        self.camera_cache: tuple[float, list[Camera]] | None = None
+        self.trusted = LOOPBACK_NAMES | settings.trusted_hosts
+        if settings.host not in {"0.0.0.0", "::"}:  # noqa: S104
+            self.trusted = self.trusted | {settings.host.strip("[]").lower()}
+
+    async def start(self) -> None:
+        """Prepare directories, reload jobs, apply retention and start automations."""
+        ensure_writable(self.settings.data_dir)
+        ensure_writable(self.settings.output_dir)
+        if self.protect is None and self.settings.connection is not None:
+            self.protect = Protect(self.settings.connection)
+        self.queue.load(self.settings.output_dir)
+        self.prune()
+        try:
+            self.registry.load()
+        except TimelapseError:
+            LOGGER.exception("Could not load Daily Automations")
+        for automation in self.registry.automations:
+            if automation.status == "active":
+                self.runner.start(automation.id)
+
+    async def stop(self) -> None:
+        """Stop the automation loops, then the queue, then the console client."""
+        await self.runner.close()
+        await self.queue.close()
+        if self.protect is not None:
+            await self.protect.close()
+
+    def incomplete(self) -> InvalidRequestError:
+        """Explain which Protect settings are missing."""
+        names = ", ".join(self.settings.missing_connection_values)
+        return InvalidRequestError(f"Server configuration is incomplete. Set {names} and restart the web server.")
+
+    def connect(self, automation: Automation) -> Any:
+        """Resolve an automation's connection; the web server knows only its own environment."""
+        if automation.connection != WEB_CONNECTION:
+            raise TimelapseError("the web server can only use web-environment connections")
+        return self.connect_web()
+
+    def connect_web(self) -> Any:
+        """Return the console client built from the server environment."""
+        if self.protect is None:
+            raise self.incomplete()
+        return self.protect
+
+    def prune(self) -> None:
+        """Apply retention, keeping the outputs of unfinished jobs."""
+        keep = {job.output.name for job in self.queue.active()}
+        self.queue.forget(self.folder.prune(datetime.now(UTC), keep))
+
+    def daily_problem(self) -> str | None:
+        """Retention runs first, so an expired file can free the quota."""
+        self.prune()
+        return self.folder.full_problem()
+
+    async def cameras(self, *, refresh: bool = False) -> list[Camera]:
+        """Return the camera list, cached for a minute."""
+        protect = self.connect_web()
+        cached = self.camera_cache
+        if refresh or cached is None or time.monotonic() - cached[0] > CAMERA_CACHE_SECONDS:
+            self.camera_cache = cached = (time.monotonic(), await protect.cameras())
+        return cached[1]
+
+    async def selected(self, camera_ids: list[str]) -> list[Camera]:
+        """Return the known cameras among ``camera_ids``, in request order, without duplicates."""
+        if not camera_ids:
+            raise InvalidRequestError("Select at least one available camera.")
+        known = {camera.id: camera for camera in await self.cameras()}
+        chosen = [known[camera_id] for camera_id in dict.fromkeys(camera_ids) if camera_id in known]
+        if not chosen:
+            raise InvalidRequestError("Select at least one available camera.")
+        return chosen
+
+    def submit_manual(self, requests: list[ExportRequest], *, daily: bool = False) -> list[Any]:
+        """Queue manual exports under the queue bound and the storage reservation."""
+        self.prune()
+        settings, active = self.settings, len(self.queue.active())
+        if active + len(requests) > settings.max_active_exports + settings.max_queued_exports:
+            raise CapacityError("The export queue is full. Wait for an active export to finish and try again.")
+        per_job = (settings.connection.max_download_mib if settings.connection else 0) * MIB or self.folder.quota_bytes
+        if self.folder.usage_bytes() + (active + len(requests)) * per_job > self.folder.quota_bytes:
+            raise CapacityError("The configured export storage quota cannot reserve space for this request.")
+        protect = self.connect_web()
+        items = [
+            (request, settings.output_dir / request.filename, export_run(protect, request)) for request in requests
+        ]
+        return self.queue.submit(items, daily=daily)
+
+    def parse_time(self, value: str, label: str) -> datetime:
+        """Read a form or query time; naive values are in the server timezone."""
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError as error:
+            raise InvalidRequestError(f"{label} must be a valid date and time.") from error
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=self.settings.timezone)
+
+    def export_range(self, form: Any) -> tuple[datetime, datetime, bool]:
+        """Validate the requested range."""
+        mode = form.get("range_mode") or "full-day"
+        if mode == "full-day":
+            text = (form.get("day") or "").strip()
+            if not text:
+                raise InvalidRequestError("Export date is required.")
+            try:
+                day = date.fromisoformat(text)
+            except ValueError as error:
+                raise InvalidRequestError("Export date must be a valid calendar date.") from error
+            start, end = day_bounds(day, self.settings.timezone)
+            full_day = True
+        elif mode == "exact":
+            values = {}
+            for field, label in (("start", "Start time"), ("end", "End time")):
+                text = (form.get(field) or "").strip()
+                if not text:
+                    raise InvalidRequestError(f"{label} is required.")
+                values[field] = self.parse_time(text, label)
+            start, end, full_day = values["start"], values["end"], False
+            if end <= start:
+                raise InvalidRequestError("End time must be after start time.")
+        else:
+            raise InvalidRequestError("Choose a full day or an exact time range.")
+        if end.timestamp() - start.timestamp() > self.settings.max_export_hours * 3600:
+            raise InvalidRequestError(f"Exports are limited to {self.settings.max_export_hours} hours.")
+        return start, end, full_day
+
+    def check_login_rate(self, client: str) -> int | None:
+        """Return the seconds to wait when this client failed too often, else None."""
+        now = time.monotonic()
+        recent = [moment for moment in self.failures.get(client, []) if now - moment < FAILURE_WINDOW]
+        self.failures[client] = recent
+        if len(recent) < MAX_FAILURES:
+            return None
+        return max(1, math.ceil(FAILURE_WINDOW - (now - recent[0])))
+
+    def session_valid(self, token: str | None) -> bool:
+        """Return whether the cookie names a live session."""
+        if not token:
+            return False
+        key = hashlib.sha256(token.encode()).hexdigest()
+        expiry = self.sessions.get(key)
+        if expiry is None or expiry < time.time():
+            self.sessions.pop(key, None)
+            return False
+        return True
+
+    def guard(self, request: Request) -> Response | None:  # noqa: PLR0911
+        """Apply the host, network, origin and session rules; return a refusal or None."""
+        settings, headers = self.settings, request.headers
+        scheme = request.url.scheme
+        host = split_host(headers.get("host", ""), scheme)
+        if host is None or host[0].strip("[]") not in self.trusted:
+            return PlainTextResponse("Untrusted host", 400)
+        client = request.client.host if request.client else ""
+        if not settings.password and not is_loopback(client):
+            return PlainTextResponse(NETWORK_ACCESS_ERROR, 403)
+        path = request.url.path
+        if request.method not in SAFE_METHODS and not (request.method == "POST" and path == "/login"):
+            fetch_site = headers.get("sec-fetch-site")
+            origin = headers.get("origin")
+            if fetch_site in {"cross-site", "same-site"}:
+                return PlainTextResponse("Cross-origin request refused", 403)
+            if fetch_site != "same-origin" and origin is not None:
+                parts = urlsplit(origin)
+                own = split_host(parts.netloc, parts.scheme) if parts.scheme in {"http", "https"} else None
+                if own is None or own[0] not in self.trusted or parts.scheme != scheme or own != host:
+                    return PlainTextResponse("Cross-origin request refused", 403)
+        if not settings.password or path in PUBLIC_PATHS or path.startswith("/static/"):
+            return None
+        if self.session_valid(request.cookies.get(COOKIE)):
+            return None
+        target = path + (f"?{request.url.query}" if request.url.query else "")
+        location = "/login?next=" + quote(target if request.method == "GET" else "/", safe="")
+        if headers.get("hx-request") == "true" or path.startswith("/api/"):
+            return PlainTextResponse("Sign in to continue.", 401, headers={"HX-Redirect": location})
+        return RedirectResponse(location, 303)
+
+
+def create_app(settings: Settings, *, protect: Any = None) -> FastAPI:  # noqa: C901, PLR0915
+    """Build the web application; ``protect`` replaces the console client in tests."""
+    if not settings.password and not is_loopback(settings.host):
+        raise RuntimeError(NETWORK_ACCESS_ERROR)
+    board = Dashboard(settings, protect)
+    templates = Jinja2Templates(directory=PACKAGE / "templates")
+    css_version = hashlib.sha256((PACKAGE / "static" / "app.css").read_bytes()).hexdigest()[:12]
+    tz = settings.timezone
+
+    def local(value: datetime | None) -> str:
+        return "—" if value is None else _format_time(value.astimezone(tz))
+
+    def next_run(automation: Automation) -> str:
+        zone = ZoneInfo(automation.timezone)
+        when = automation.next_retry_at
+        if when is None:
+            today = datetime.now(zone).date()
+            when = day_bounds(today, zone)[1]
+        when = when.astimezone(zone)
+        return f"{when:%b} {when.day} at {when.hour % 12 or 12}:{when:%M %p %Z}"
+
+    def job_status(job: Any) -> str:
+        if job.status == "queued":
+            return "Queued — Rate Limited" if job.error else "Queued"
+        return STATUS_LABELS[job.status]
+
+    filters = templates.env.filters
+    filters["bytes"] = format_bytes
+    filters["datetime"] = local
+    filters["date"] = lambda day: "Not Run Yet" if day is None else f"{day:%b} {day.day}, {day.year}"
+    filters["job_status"] = job_status
+    filters["next_run"] = next_run
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        await board.start()
+        try:
+            yield
+        finally:
+            await board.stop()
+
+    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
+    app.state.board = board
+    app.mount("/static", StaticFiles(directory=PACKAGE / "static"), name="static")
+
+    def render(request: Request, name: str, status: int = 200, **context: Any) -> Response:
+        context.setdefault("app_css_version", css_version)
+        return templates.TemplateResponse(request=request, name=name, context=context, status_code=status)
+
+    def message(request: Request, text: str, kind: str = "success", status: int = 200) -> Response:
+        response = render(request, "partials/message.html", status, message=text, kind=kind)
+        response.headers["HX-Trigger"] = "stateChanged"
+        return response
+
+    @app.middleware("http")
+    async def security(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
+        request_id = secrets.token_hex(8)
+        try:
+            response = board.guard(request) or await call_next(request)
+        except Exception:
+            LOGGER.exception("Request %s failed", request_id)
+            response = PlainTextResponse(f"Internal server error. Request ID: {request_id}", 500)
+        response.headers["X-Request-ID"] = request_id
+        response.headers.update(SECURITY_HEADERS)
+        return response
+
+    async def handle_error(request: Request, error: Exception) -> Response:
+        status = http_status(error)
+        path = request.url.path
+        if path.startswith("/actions/"):
+            return message(request, str(error), "error", status)
+        if path == "/partials/cameras":
+            return render(request, "partials/cameras.html", status, cameras=[], camera_error=str(error))
+        return PlainTextResponse(str(error), status)
+
+    app.add_exception_handler(InvalidRequestError, handle_error)
+    app.add_exception_handler(TimelapseError, handle_error)
+
+    @app.get("/")
+    async def index(request: Request) -> Response:
+        now = datetime.now(tz).replace(second=0, microsecond=0)
+        return render(
+            request,
+            "index.html",
+            speeds=list(SPEEDS),
+            timezone_name=str(tz),
+            yesterday=(now.date() - timedelta(days=1)).isoformat(),
+            today=now.date().isoformat(),
+            now_local=f"{now:%Y-%m-%dT%H:%M}",
+            day_ago_local=f"{now - timedelta(days=1):%Y-%m-%dT%H:%M}",
+            authentication_enabled=bool(settings.password),
+            web_username=settings.username,
+        )
+
+    @app.get("/healthz")
+    async def healthz() -> JSONResponse:
+        return JSONResponse(
+            {
+                "status": "healthy",
+                "connection_configured": settings.connection_ready,
+                "active_jobs": len(board.queue.active()),
+            }
+        )
+
+    @app.get("/partials/status")
+    async def status_partial(request: Request) -> Response:
+        return render(
+            request,
+            "partials/status.html",
+            active_jobs=len(board.queue.active()),
+            timelapse_version=__version__,
+            settings=settings,
+            storage=board.folder.host_storage(),
+        )
+
+    @app.get("/partials/cameras")
+    async def cameras_partial(request: Request, refresh: bool = False) -> Response:  # noqa: FBT001, FBT002
+        cameras = await board.cameras(refresh=refresh)
+        return render(request, "partials/cameras.html", cameras=cameras, camera_error=None)
+
+    @app.get("/partials/jobs")
+    async def jobs_partial(request: Request) -> Response:
+        jobs = list(reversed(board.queue.jobs.values()))
+        listed = {job.output.name for job in jobs if job.status in {"queued", "running", "completed"}}
+        older = [video for video in board.folder.videos() if video.name not in listed]
+        return render(request, "partials/jobs.html", jobs=jobs, unlisted_exports=older)
+
+    @app.get("/partials/automations")
+    async def automations_partial(request: Request) -> Response:
+        automations = sorted(board.registry.automations, key=lambda item: item.created_at, reverse=True)
+        return render(request, "partials/automations.html", automations=automations)
+
+    @app.post("/actions/export")
+    async def export_action(request: Request) -> Response:
+        form = await request.form()
+        speed = str(form.get("speed") or "600x")
+        start, end, full_day = board.export_range(form)
+        if speed not in SPEEDS:
+            raise InvalidRequestError("Choose a supported timelapse speed.")
+        cameras = await board.selected([str(value) for value in form.getlist("camera_ids")])
+        jobs = board.submit_manual([ExportRequest(camera, start, end, speed, full_day) for camera in cameras])
+        return message(request, f"Started {len(jobs)} export(s).")
+
+    @app.post("/actions/automations")
+    async def create_automation(request: Request) -> Response:
+        form = await request.form()
+        name = str(form.get("automation_name") or "").strip()
+        if not name:
+            raise InvalidRequestError("Automation name is required.")
+        speed = str(form.get("speed") or "600x")
+        if speed not in SPEEDS:
+            raise InvalidRequestError("Choose a supported timelapse speed.")
+        cameras = await board.selected([str(value) for value in form.getlist("camera_ids")])
+        automation = board.registry.add(
+            name=name,
+            cameras=cameras,
+            connection=WEB_CONNECTION,
+            speed=speed,
+            output_directory=settings.output_dir,
+            timezone=str(tz),
+        )
+        board.runner.start(automation.id)
+        return message(request, f"Created Daily Automation for {len(automation.cameras)} camera(s).")
+
+    @app.delete("/actions/jobs/{job_id}")
+    async def delete_job(request: Request, job_id: str) -> Response:
+        job = board.queue.jobs.get(job_id)
+        if job is None:
+            raise NotFoundError("That export is no longer in the job list.")
+        if not job.terminal:
+            await board.queue.cancel(job_id)
+            return message(request, "Cancellation requested.")
+        board.queue.remove(job_id)
+        return message(request, "Export deleted.")
+
+    @app.post("/actions/jobs/{job_id}/retry")
+    async def retry_job(request: Request, job_id: str) -> Response:
+        job = board.queue.jobs.get(job_id)
+        if job is None:
+            raise NotFoundError("That export is no longer in the job list.")
+        if job.status not in {"failed", "cancelled"}:
+            raise InvalidRequestError("Only failed or cancelled exports can be retried.")
+        board.submit_manual([job.request], daily=job.daily)
+        return message(request, "Export queued again.")
+
+    def older_export(name: str) -> Path:
+        if name not in {video.name for video in board.folder.videos()}:
+            raise NotFoundError("That export is no longer on the server.")
+        return settings.output_dir / name
+
+    @app.delete("/actions/files/{name}")
+    async def delete_file(request: Request, name: str) -> Response:
+        older_export(name).unlink(missing_ok=True)
+        return message(request, "Export deleted.")
+
+    def automation_or_404(automation_id: str) -> Automation:
+        automation = board.registry.get(automation_id)
+        if automation is None:
+            raise NotFoundError("That Daily Automation no longer exists.")
+        return automation
+
+    @app.post("/actions/automations/{automation_id}/stop")
+    async def stop_automation(request: Request, automation_id: str) -> Response:
+        board.registry.put(automation_or_404(automation_id).stopped())
+        return message(request, "Daily Automation stopped.")
+
+    @app.post("/actions/automations/{automation_id}/resume")
+    async def resume_automation(request: Request, automation_id: str) -> Response:
+        board.registry.put(automation_or_404(automation_id).resumed())
+        board.runner.start(automation_id)
+        return message(request, "Daily Automation started.")
+
+    @app.delete("/actions/automations/{automation_id}")
+    async def delete_automation(request: Request, automation_id: str) -> Response:
+        board.registry.delete(automation_or_404(automation_id).id)
+        return message(request, "Daily Automation removed. Existing artifacts were kept.")
+
+    @app.get("/api/thumbnails/{camera_id}")
+    async def thumbnail(camera_id: str, timestamp: str = "") -> Response:
+        if not 10 <= len(timestamp) <= 40:
+            raise InvalidRequestError("Preview time must be a valid date and time.")
+        at = board.parse_time(timestamp, "Preview time")
+        camera = next((camera for camera in await board.cameras() if camera.id == camera_id), None)
+        if camera is None:
+            raise InvalidRequestError(
+                "The selected camera is no longer available. Refresh the camera list and try again."
+            )
+        data, source = await board.connect_web().thumbnail(camera, at)
+        headers = {"X-TimeLapse-Thumbnail-Source": source, "Cache-Control": "no-store"}
+        return Response(data, media_type="image/jpeg", headers=headers)
+
+    def video(path: Path | None, *, inline: bool) -> Response:
+        if path is None or not path.is_file():
+            return PlainTextResponse("Export is not available.", 404)
+        disposition = "inline" if inline else "attachment"
+        return FileResponse(path, media_type="video/mp4", filename=path.name, content_disposition_type=disposition)
+
+    def job_video(job_id: str) -> Path | None:
+        job = board.queue.jobs.get(job_id)
+        return job.output if job is not None and job.status == "completed" else None
+
+    def file_video(name: str) -> Path | None:
+        return settings.output_dir / name if name in {video.name for video in board.folder.videos()} else None
+
+    @app.get("/exports/{job_id}/play")
+    async def play_export(job_id: str) -> Response:
+        return video(job_video(job_id), inline=True)
+
+    @app.get("/exports/{job_id}")
+    async def download_export(job_id: str) -> Response:
+        return video(job_video(job_id), inline=False)
+
+    @app.get("/files/{name}/play")
+    async def play_file(name: str) -> Response:
+        return video(file_video(name), inline=True)
+
+    @app.get("/files/{name}")
+    async def download_file(name: str) -> Response:
+        return video(file_video(name), inline=False)
+
+    def login_page(request: Request, next_path: str, error: str | None = None, status: int = 200) -> Response:
+        response = render(
+            request, "login.html", status, next_path=next_path, error=error, web_username=settings.username
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.get("/login")
+    async def login_form(request: Request, next: str = "/") -> Response:  # noqa: A002
+        target = safe_next(next)
+        if not settings.password or board.session_valid(request.cookies.get(COOKIE)):
+            return RedirectResponse(target, 303)
+        return login_page(request, target)
+
+    @app.post("/login")
+    async def login(request: Request) -> Response:
+        form = await request.form()
+        target = safe_next(str(form.get("next") or "/"))
+        client = request.client.host if request.client else ""
+        if wait := board.check_login_rate(client):
+            response = login_page(request, target, f"Too many failed attempts. Try again in {wait} seconds.", 429)
+            response.headers["Retry-After"] = str(wait)
+            return response
+        username, password = str(form.get("username") or ""), str(form.get("password") or "")
+        user_ok = hmac.compare_digest(username.encode(), settings.username.encode())
+        password_ok = hmac.compare_digest(password.encode(), (settings.password or "").encode())
+        if not (user_ok and password_ok and settings.password):
+            board.failures.setdefault(client, []).append(time.monotonic())
+            return login_page(request, target, "The username or password is incorrect.", 401)
+        board.failures.pop(client, None)
+        token = secrets.token_urlsafe(32)
+        board.sessions[hashlib.sha256(token.encode()).hexdigest()] = time.time() + settings.session_hours * 3600
+        response = RedirectResponse(target, 303)
+        response.set_cookie(
+            COOKIE,
+            token,
+            max_age=settings.session_hours * 3600,
+            path="/",
+            httponly=True,
+            samesite="strict",
+            secure=settings.cookie_secure or request.url.scheme == "https",
+        )
+        return response
+
+    @app.post("/logout")
+    async def logout(request: Request) -> Response:
+        token = request.cookies.get(COOKIE)
+        if token:
+            board.sessions.pop(hashlib.sha256(token.encode()).hexdigest(), None)
+        response = RedirectResponse("/login", 303)
+        response.delete_cookie(COOKIE, path="/")
+        return response
+
+    return app
+
+
+def main() -> None:
+    """Run the web server with settings from the environment and ``./.env``."""
+    import uvicorn  # noqa: PLC0415
+    from dotenv import load_dotenv  # noqa: PLC0415
+
+    load_dotenv(Path.cwd() / ".env", override=False)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    try:
+        settings = Settings.from_env()
+        app = create_app(settings)
+    except (ValueError, RuntimeError) as error:
+        sys.exit(f"Error: {error}")
+    uvicorn.run(app, host=settings.host, port=settings.port, proxy_headers=True, timeout_graceful_shutdown=1)
 
 
 if __name__ == "__main__":
