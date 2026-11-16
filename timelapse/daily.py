@@ -68,7 +68,7 @@ class DailyRunner:
         return await self._run_day(automation_id, automation.next_day, advance=True)
 
     async def reexport(self, automation_id: str, day: date) -> bool:
-        """Export ``day`` again for cameras whose artifact is missing or invalid."""
+        """Export ``day`` again where an artifact is missing or invalid; return False when none is."""
         automation = self.registry.get(automation_id)
         if automation is None:
             raise NotFoundError(f"automation does not exist: {automation_id}")
@@ -82,7 +82,10 @@ class DailyRunner:
             valid = valid and is_valid_mp4(path)
         if valid:
             return False
-        return await self._run_day(automation_id, day, advance=False)
+        if not await self._run_day(automation_id, day, advance=False):
+            current = self.registry.get(automation_id)
+            raise TimelapseError(f"The re-export did not finish: {current.last_error if current else 'removed'}")
+        return True
 
     def _artifacts(self, automation: Automation, day: date) -> list[tuple[ExportRequest, Path]]:
         start, end = day_bounds(day, ZoneInfo(automation.timezone))
