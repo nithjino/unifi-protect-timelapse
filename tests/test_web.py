@@ -687,3 +687,17 @@ def test_settings_from_env(tmp_path):
     )  # fmt: skip
     with pytest.raises(ValueError, match="valid IANA timezone"):
         Settings.from_env({"TZ": "Nowhere/City"})
+
+
+def test_assets_use_root_relative_links(tmp_path):
+    # Absolute http:// links break behind an HTTPS reverse proxy (mixed content).
+    with serve(tmp_path, password=PASSWORD) as client:
+        pages = [client.get("/login").text]
+        login(client)
+        pages.append(client.get("/", headers={"X-Forwarded-Proto": "https"}).text)
+        for page in pages:
+            links = re.findall(r'(?:href|src)="([^"]*/static/[^"]*)"', page)
+            assert links
+            assert all(link.startswith("/static/") for link in links), links
+            for link in links:
+                assert client.get(link).status_code == 200
