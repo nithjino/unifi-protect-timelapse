@@ -21,6 +21,11 @@ LOGGER = logging.getLogger(__name__)
 MAX_ATTEMPTS = 5
 
 
+def export_run(protect: Any, request: ExportRequest) -> Run:
+    """Return the job body that exports ``request`` through ``protect``."""
+    return lambda output, progress: protect.export(request, output, progress)
+
+
 class _Paused(Exception):  # noqa: N818
     """The automation was paused; the day stops here."""
 
@@ -148,7 +153,7 @@ class DailyRunner:
             if path.exists() and not is_valid_mp4(path):
                 raise self._pause(automation.id, f"Invalid artifact collision requires review: {path}")
             if not path.exists():
-                missing.append((request, path, self._export(protect, request)))
+                missing.append((request, path, export_run(protect, request)))
         if not missing:
             return None
         if self.storage_problem is not None and (problem := self.storage_problem()):
@@ -165,10 +170,6 @@ class DailyRunner:
             return None
         details = "; ".join(f"{job.request.camera.name}: {job.error or 'the artifact is not valid'}" for job in failed)
         return f"{len(failed)} Export Job(s) failed: {details}"
-
-    @staticmethod
-    def _export(protect: Any, request: ExportRequest) -> Run:
-        return lambda output, progress: protect.export(request, output, progress)
 
     def start(self, automation_id: str) -> None:
         """Start the background loop for an automation, or wake one that is waiting for midnight."""

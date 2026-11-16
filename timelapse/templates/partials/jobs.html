@@ -10,12 +10,12 @@
       <article class="job-card status-{{ job.status }}">
         <div class="job-topline">
           <div class="job-title-row">
-            <strong>{{ job.camera.name }}</strong>
+            <strong>{{ job.request.camera.name }}</strong>
             {% if job.daily %}<span class="mini-chip">Daily</span>{% endif %}
           </div>
           <span class="status-badge">{{ job | job_status }}</span>
-          <p class="job-range">{{ job.start | datetime }} — {{ job.end | datetime }}</p>
-          {% set file_size = job.display_file_size %}
+          <p class="job-range">{{ job.request.start | datetime }} — {{ job.request.end | datetime }}</p>
+          {% set file_size = job.file_size %}
           {% if file_size is not none %}
             <small class="job-file-size">{{ file_size | bytes }}</small>
           {% endif %}
@@ -38,7 +38,7 @@
         {% endif %}
 
         <div class="job-footer">
-          <span>{{ job.speed }} · {{ job.output.name }}</span>
+          <span>{{ job.request.speed }} · {{ job.output.name }}</span>
           <div class="job-actions">
             {% if job.status == 'completed' %}
               <a class="small-button primary" href="/exports/{{ job.id }}">Download</a>
@@ -48,12 +48,12 @@
               type="button"
               {% if job.status == 'completed' %}
                 data-video-url="/exports/{{ job.id }}/play"
-                data-video-title="{{ job.camera.name }} · {{ job.start | datetime }}"
-                aria-label="Play {{ job.camera.name }} export"
+                data-video-title="{{ job.request.camera.name }} · {{ job.request.start | datetime }}"
+                aria-label="Play {{ job.request.camera.name }} export"
               {% else %}
                 disabled
                 title="Available when the export is ready"
-                aria-label="Play {{ job.camera.name }} export (available when ready)"
+                aria-label="Play {{ job.request.camera.name }} export (available when ready)"
               {% endif %}
             >Play</button>
             {% if job.status == 'completed' %}

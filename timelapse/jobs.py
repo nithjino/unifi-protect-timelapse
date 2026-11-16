@@ -169,7 +169,7 @@ class JobQueue:
 
     def load(self, output_dir: Path) -> None:
         """Read the history file; interrupted and vanished exports are marked as such."""
-        if self.history is None:
+        if self.history is None or not self.history.exists():
             return
         try:
             entries = json.loads(self.history.read_text(encoding="utf-8"))["jobs"]
