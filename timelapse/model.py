@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
 SPEEDS: dict[str, int | None] = {"1x": None, "60x": 4, "120x": 8, "300x": 20, "600x": 40}
@@ -80,3 +85,19 @@ def format_bytes(n: float | None) -> str:
         if value < 1024:
             return f"{value:.1f} {unit}"
     return f"{value / 1024:.1f} TiB"
+
+
+def write_json(path: Path, data: Any, *, ensure_ascii: bool = True) -> None:
+    """Write JSON atomically: a temporary file in the same directory, fsync, then rename."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=2, sort_keys=True, ensure_ascii=ensure_ascii)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        Path(temporary).replace(path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise

@@ -238,7 +238,7 @@
               <div
                 id="jobs-list"
                 hx-get="/partials/jobs"
-                hx-trigger="load, stateChanged from:body, every 10s"
+                hx-trigger="load, stateChanged from:body, every 2s"
                 hx-swap="innerHTML"
               >
                 <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Jobs…</div>
@@ -254,7 +254,7 @@
               <div
                 id="automations-list"
                 hx-get="/partials/automations"
-                hx-trigger="load, stateChanged from:body, every 30s"
+                hx-trigger="load, stateChanged from:body, every 5s"
                 hx-swap="innerHTML"
               >
                 <div class="loading-block"><span class="spinner" aria-hidden="true"></span>Loading Daily Automations…</div>
